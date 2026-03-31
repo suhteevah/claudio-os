@@ -65,8 +65,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // ── Phase 0: Enable SSE/SSE2 — required for crypto crates (AES-NI, SHA) ──
-    // The bootloader may or may not enable SSE. We ensure it's on.
+    // ── Phase 0: Enable SSE/SSE2/AVX — required for crypto + memchr ──
+    // memchr uses runtime CPUID to detect AVX2 and will crash if AVX
+    // isn't enabled in the OS. We enable the full SSE+AVX stack.
     unsafe {
         // CR0: clear EM (bit 2), set MP (bit 1) — enable FPU/SSE
         let mut cr0: u64;
@@ -75,11 +76,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         cr0 |= 1 << 1;    // set MP
         core::arch::asm!("mov cr0, {}", in(reg) cr0);
 
-        // CR4: set OSFXSR (bit 9) + OSXMMEXCPT (bit 10) — enable SSE instructions
+        // CR4: set OSFXSR (bit 9) + OSXMMEXCPT (bit 10) — enable SSE
         let mut cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4);
         cr4 |= (1 << 9) | (1 << 10);
-        core::arch::asm!("mov cr4, {}", in(reg) cr4);
+
+        // Check if XSAVE is supported (CPUID.01H:ECX bit 26)
+        // If so, enable OSXSAVE in CR4 and set XCR0 for AVX
+        // CPUID leaf 1: check XSAVE (ECX bit 26) and AVX (ECX bit 28)
+        let cpuid_result = core::arch::x86_64::__cpuid(1).ecx;
+        let xsave_supported = (cpuid_result & (1 << 26)) != 0;
+        let avx_supported = (cpuid_result & (1 << 28)) != 0;
+
+        if xsave_supported && avx_supported {
+            cr4 |= 1 << 18; // OSXSAVE
+            core::arch::asm!("mov cr4, {}", in(reg) cr4);
+
+            // XCR0: enable x87 (bit 0) + SSE (bit 1) + AVX (bit 2)
+            let xcr0: u64 = (1 << 0) | (1 << 1) | (1 << 2);
+            core::arch::asm!(
+                "xsetbv",
+                in("ecx") 0u32,
+                in("edx") (xcr0 >> 32) as u32,
+                in("eax") xcr0 as u32,
+            );
+        } else {
+            core::arch::asm!("mov cr4, {}", in(reg) cr4);
+        }
     }
 
     // ── Phase 0a: Serial debug output (available immediately) ─────────
@@ -352,13 +375,32 @@ async fn main_async() {
                         log::info!("[tls-test] Model: claude-3-haiku-20240307 (max_tokens: 10)");
                         log::info!("[tls-test] This will: DNS resolve -> TCP connect -> TLS 1.3 handshake -> HTTP POST -> recv response");
 
-                        // Native TLS has a null-deref bug in embedded-tls v0.17 during
-                        // the ECDHE key exchange. Skip the test for now — the dashboard
-                        // agent_loop uses the TLS proxy as fallback.
-                        // TODO: Fix embedded-tls null deref (CR2=0 during open())
-                        let native_tls_ok = false;
-                        log::warn!("[tls] native TLS skipped (embedded-tls v0.17 null deref bug)");
-                        log::info!("[tls] dashboard will use TLS proxy fallback");
+                        // Test native TLS — the AVX fix should resolve the memchr null deref
+                        log::info!("[tls-test] testing native TLS to api.anthropic.com...");
+                        let tls_body = br#"{"model":"claude-haiku-4-5-20251001","max_tokens":10,"messages":[{"role":"user","content":"Say hi"}]}"#;
+                        let tls_req = claudio_net::http::HttpRequest::post(
+                            "api.anthropic.com", "/v1/messages", tls_body.to_vec(),
+                        )
+                        .header("Content-Type", "application/json")
+                        .header("x-api-key", api_key)
+                        .header("anthropic-version", "2023-06-01")
+                        .header("Connection", "close");
+                        let seed = interrupts::tick_count();
+                        let native_tls_ok = match claudio_net::https_request(
+                            &mut stack, "api.anthropic.com", 443, &tls_req.to_bytes(), now, seed,
+                        ) {
+                            Ok(resp) => {
+                                log::info!("[tls-test] !! NATIVE TLS SUCCESS !! {} bytes", resp.len());
+                                if let Ok(s) = core::str::from_utf8(&resp[..resp.len().min(300)]) {
+                                    log::info!("[tls-test] {}", s);
+                                }
+                                true
+                            }
+                            Err(e) => {
+                                log::error!("[tls-test] native TLS failed: {:?}", e);
+                                false
+                            }
+                        };
 
                         if native_tls_ok {
                             log::info!("[tls-test] ============================================");

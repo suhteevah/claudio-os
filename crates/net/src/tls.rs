@@ -574,33 +574,12 @@ pub struct DevRng {
 impl DevRng {
     /// Create a new DevRng seeded from the given value.
     pub fn new(seed: u64) -> Self {
-        // Try RDRAND for real hardware entropy, fall back to seed
-        let state = {
-            let mut val: u64 = 0;
-            let got_rdrand = unsafe {
-                core::arch::x86_64::_rdrand64_step(&mut val)
-            };
-            if got_rdrand == 1 && val != 0 {
-                log::debug!("[rng] using RDRAND hardware entropy");
-                val
-            } else {
-                log::debug!("[rng] RDRAND unavailable, using seed {}", seed);
-                if seed == 0 { 0xDEAD_BEEF_CAFE_BABEu64 } else { seed }
-            }
-        };
+        let state = if seed == 0 { 0xDEAD_BEEF_CAFE_BABEu64 } else { seed };
         Self { state }
     }
 
-    /// Advance the internal state and return the next pseudo-random u64.
     fn next(&mut self) -> u64 {
-        // Try RDRAND first for each call
-        let mut val: u64 = 0;
-        let ok = unsafe { core::arch::x86_64::_rdrand64_step(&mut val) };
-        if ok == 1 && val != 0 {
-            self.state = val;
-            return val;
-        }
-        // Fallback: xorshift64*
+        // xorshift64* — RDRAND removed (crashes on QEMU default CPU)
         let mut x = self.state;
         x ^= x >> 12;
         x ^= x << 25;
