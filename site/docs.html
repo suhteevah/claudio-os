@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClaudioOS -- Documentation</title>
+  <meta name="description" content="Technical documentation for ClaudioOS bare-metal AI agent operating system.">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark-dimmed.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/rust.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/x86asm.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+  <script>hljs.highlightAll();</script>
+</head>
+<body>
+
+<nav>
+  <a href="index.html">Home</a>
+  <a href="docs.html" class="active">Docs</a>
+  <a href="https://github.com/suhteevah/claudio-os">GitHub</a>
+</nav>
+
+<div class="container">
+  <div class="docs-layout">
+
+    <!-- Sidebar -->
+    <aside class="docs-sidebar">
+      <div class="section-label">Architecture</div>
+      <ul>
+        <li><a href="#system-overview">System Overview</a></li>
+        <li><a href="#address-space">Virtual Address Space</a></li>
+        <li><a href="#boot-sequence">Boot Sequence</a></li>
+        <li><a href="#heap-stack-switch">Heap Stack Switch</a></li>
+        <li><a href="#async-executor">Async Executor</a></li>
+        <li><a href="#crate-graph">Crate Dependency Graph</a></li>
+      </ul>
+      <div class="section-label">Kernel Internals</div>
+      <ul>
+        <li><a href="#gdt-tss">GDT and TSS</a></li>
+        <li><a href="#data-segment-bug">The Data Segment Bug</a></li>
+        <li><a href="#memory-mgmt">Memory Management</a></li>
+        <li><a href="#interrupt-system">Interrupt System</a></li>
+        <li><a href="#serial-uart">Serial UART</a></li>
+        <li><a href="#framebuffer">Framebuffer</a></li>
+        <li><a href="#pci">PCI Enumeration</a></li>
+      </ul>
+      <div class="section-label">Terminal</div>
+      <ul>
+        <li><a href="#terminal-overview">Overview</a></li>
+        <li><a href="#font-rendering">Font Rendering</a></li>
+        <li><a href="#vte-parser">VTE Parser</a></li>
+        <li><a href="#split-pane">Split-Pane Layout</a></li>
+        <li><a href="#color-system">Color System</a></li>
+      </ul>
+      <div class="section-label">Networking</div>
+      <ul>
+        <li><a href="#net-architecture">Stack Architecture</a></li>
+        <li><a href="#virtio-net">VirtIO-net Driver</a></li>
+        <li><a href="#smoltcp">smoltcp Integration</a></li>
+        <li><a href="#dns">DNS Resolution</a></li>
+        <li><a href="#tls">TLS Strategy</a></li>
+        <li><a href="#http">HTTP/1.1 Client</a></li>
+        <li><a href="#sse">SSE Parser</a></li>
+      </ul>
+      <div class="section-label">API &amp; Auth</div>
+      <ul>
+        <li><a href="#messages-api">Messages API</a></li>
+        <li><a href="#streaming">SSE Streaming</a></li>
+        <li><a href="#tool-use">Tool Use Protocol</a></li>
+        <li><a href="#oauth">OAuth Device Flow</a></li>
+        <li><a href="#token-persist">Token Persistence</a></li>
+      </ul>
+      <div class="section-label">Building</div>
+      <ul>
+        <li><a href="#prerequisites">Prerequisites</a></li>
+        <li><a href="#build-process">Build Process</a></li>
+        <li><a href="#qemu">Running in QEMU</a></li>
+        <li><a href="#troubleshooting">Troubleshooting</a></li>
+        <li><a href="#env-vars">Environment Variables</a></li>
+      </ul>
+      <div class="section-label">Contributing</div>
+      <ul>
+        <li><a href="#dev-workflow">Dev Workflow</a></li>
+        <li><a href="#conventions">Code Conventions</a></li>
+        <li><a href="#testing">Testing</a></li>
+        <li><a href="#pitfalls">Common Pitfalls</a></li>
+      </ul>
+    </aside>
+
+    <!-- Content -->
+    <div class="docs-content">
+
+<!-- ============================================================ -->
+<!--                      ARCHITECTURE                             -->
+<!-- ============================================================ -->
+
+<h2 id="system-overview">System Overview</h2>
+
+<p>ClaudioOS is a single-address-space, bare-metal Rust application that boots via UEFI
+and runs entirely in Ring 0. There is no kernel/user boundary, no syscalls, and no
+process isolation. Every agent session is a cooperatively-scheduled async task driven
+by hardware interrupts.</p>
+
+<p><strong>Source entry point:</strong> <code>kernel/src/main.rs</code></p>
+
+<pre><code class="language-plaintext">+-----------------------------------------------------+
+|                  Agent Dashboard                     |
+|  +----------+ +----------+ +----------+             |
+|  | Agent 1  | | Agent 2  | | Agent 3  |  ...       |
+|  | (pane)   | | (pane)   | | (pane)   |             |
+|  +----------+ +----------+ +----------+             |
++-----------------------------------------------------+
+|              Agent Session Manager                   |
+|         (async tasks, one per agent)                 |
++--------------+--------------+-----------------------+
+|  API Client  |     Auth     |   Terminal Renderer   |
+|  (Messages   |  (OAuth      |   (framebuffer +      |
+|   API + SSE) |   device     |    ANSI + split       |
+|              |   flow)      |    panes)             |
++--------------+--------------+-----------------------+
+|              Async Executor (interrupt-driven)       |
++-----------------------------------------------------+
+|     Net (smoltcp + TLS)    |    FS (FAT32 persist)  |
++----------------------------+------------------------+
+|   NIC Driver (virtio-net / e1000)  |  PS/2 Keyboard |
++------------------------------------+----------------+
+|              x86_64 Kernel Core                      |
+|   (paging, heap, GDT/IDT, interrupts, PCI)          |
++-----------------------------------------------------+
+|              UEFI Boot (bootloader crate v0.11)      |
++-----------------------------------------------------+</code></pre>
+
+<h2 id="address-space">Virtual Address Space Map</h2>
+
+<p>The bootloader (v0.11) sets up the initial page tables before handing control to
+<code>kernel_main</code>.</p>
+
+<pre><code class="language-plaintext">Virtual Address Space (x86_64, 48-bit canonical addresses)
+==========================================================
+
+0x0000_0000_0000_0000 +----------------------------------+
+                       |  (unmapped / guard)              |
+                       +----------------------------------+
+                       |  Kernel code + data + rodata     |
+                       |  (identity-mapped by bootloader) |
+                       +----------------------------------+
+                       |  Physical memory offset mapping  |
+                       |  (ALL physical RAM accessible    |
+                       |   at phys + phys_mem_offset)     |
+                       +----------------------------------+
+0x0000_4444_4444_0000  |  Kernel Heap (1 MiB)             |
+                       |  HEAP_START = 0x4444_4444_0000   |
+                       |  HEAP_SIZE  = 1 MiB (1048576)    |
+                       |  Managed by linked_list_allocator|
+0x0000_4444_4454_0000  +----------------------------------+
+                       |  (available for heap growth)     |
+                       +----------------------------------+
+                       |  Bootloader kernel stack (128K)  |
+                       +----------------------------------+
+                       |  Heap-allocated stack (256 KiB)  |
+                       |  (runtime stack after switch)    |
+                       +----------------------------------+
+                       |  GOP Framebuffer                 |
+                       |  (accessed via phys_mem_offset)  |
+                       +----------------------------------+
+                       |  IST stacks (static .bss)        |
+                       |  IST[0]: 20 KiB double-fault     |
+                       |  IST[1]: 16 KiB timer interrupt  |
+                       +----------------------------------+</code></pre>
+
+<p><strong>Heap at 0x4444_4444_0000</strong>: Chosen to be far from the kernel's identity-mapped
+region and the bootloader's physical memory mapping. The heap virtual pages are
+backed by physical frames allocated from the UEFI memory map.</p>
+
+<p><strong>Two kernel stacks</strong>: The bootloader provides a 128 KiB stack, but this is nearly
+exhausted after init. Phase 6 allocates a fresh 256 KiB stack on the heap and
+switches to it.</p>
+
+<h2 id="boot-sequence">Boot Sequence</h2>
+
+<p>All phases execute in <code>kernel_main()</code> at <code>kernel/src/main.rs</code>.</p>
+
+<pre><code class="language-plaintext">UEFI Firmware
+    |
+    v
+bootloader crate (v0.11)
+    - Sets up page tables, GOP framebuffer, UEFI memory map
+    - Jumps to kernel entry point
+    |
+    v
+kernel_main(boot_info)
+    |-- Phase -1: Proof of life (raw serial write)
+    |-- Phase 0:  serial::init() + logger::init()
+    |-- Phase 1:  gdt::init() (GDT + TSS + data segment)
+    |-- Phase 2:  memory::init() (page tables, heap)
+    |-- Phase 3:  interrupts::init() (APIC disable, PIC, IDT)
+    |-- Phase 3b: keyboard::init()
+    |-- Phase 4:  framebuffer::init()
+    |-- Phase 5:  pci::enumerate()
+    |-- Phase 6:  Heap stack switch + executor start
+    v
+  executor::run() never returns</code></pre>
+
+<p><strong>Critical ordering</strong>: Heap before interrupts (IDT may allocate). Interrupts not
+enabled until executor is ready. APIC disabled before PIC init.</p>
+
+<h2 id="heap-stack-switch">The Heap Stack Switch</h2>
+
+<p>The bootloader's 128 KiB stack is nearly exhausted after init (log formatting is
+extremely stack-heavy). Phase 6 allocates a fresh 256 KiB stack on the heap and
+switches to it:</p>
+
+<pre><code class="language-rust">const NEW_STACK_SIZE: usize = 256 * 1024;
+let new_stack = alloc::vec![0u8; NEW_STACK_SIZE];
+let new_stack_top = new_stack.as_ptr() as u64 + NEW_STACK_SIZE as u64;
+core::mem::forget(new_stack);  // Leak -- kernel stack must never be freed
+
+unsafe {
+    core::arch::asm!(
+        "mov rsp, {stack}",
+        "call {entry}",
+        stack = in(reg) new_stack_top,
+        entry = in(reg) post_stack_switch as *const (),
+        options(noreturn)
+    );
+}</code></pre>
+
+<p>The Vec is leaked with <code>mem::forget</code> because the stack memory must never be freed.
+<code>post_stack_switch()</code> enables interrupts and starts the executor.</p>
+
+<h2 id="async-executor">Async Executor Architecture</h2>
+
+<p>The executor is a cooperative, single-threaded scheduler where hardware interrupts
+serve as the sole source of wake-ups.</p>
+
+<pre><code class="language-plaintext">+------------------+     +-----------------+     +------------------+
+|   ISR Handlers   |     |   READY_QUEUE   |     |    Executor      |
+|                  |     |   (Mutex&lt;Vec&gt;)  |     |    run() loop    |
+|  keyboard_handler| --> | [TaskId(0),     | --> |                  |
+|  timer_handler   |     |  TaskId(2), ...]|     | 1. drain queue   |
+|  nic_handler     |     +-----------------+     | 2. poll tasks    |
++------------------+           ^                 | 3. hlt if empty  |
+                               |                 +------------------+
+                      +--------+--------+
+                      |   TaskWaker     |
+                      |   wake() pushes |
+                      |   to READY_QUEUE|
+                      +-----------------+</code></pre>
+
+<p><strong>Two separate locks</strong> prevent deadlocks: <code>READY_QUEUE</code> (task IDs only, locked briefly
+by ISRs) and <code>EXECUTOR</code> (full task map, never locked by ISRs).</p>
+
+<p><strong>HLT race fix</strong>: Interrupts are disabled before checking if the queue is empty.
+<code>enable_and_hlt</code> atomically enables interrupts and halts so no work is missed.</p>
+
+<h2 id="crate-graph">Crate Dependency Graph</h2>
+
+<pre><code class="language-plaintext">                    kernel (binary, #![no_std] #![no_main])
+                   /   |    |    \    \     \
+                  v    v    v     v    v     v
+            terminal  net  auth  agent  fs   image-builder
+            (active) (Ph2) (Ph3) (Ph4) (Ph3) (host-side)
+               |       |    |     |     |
+               v       v    v     v     v
+          alloc + core (all #![no_std])</code></pre>
+
+<!-- ============================================================ -->
+<!--                    KERNEL INTERNALS                           -->
+<!-- ============================================================ -->
+
+<h2 id="gdt-tss">GDT and TSS</h2>
+
+<p><strong>Source:</strong> <code>kernel/src/gdt.rs</code></p>
+
+<p>Even in 64-bit long mode, x86_64 requires a valid GDT. The bootloader sets one up,
+but ClaudioOS replaces it with a custom GDT containing a TSS (for IST stacks) and
+a kernel data segment.</p>
+
+<pre><code class="language-plaintext">GDT Entry Map:
+  Entry 0:   Null descriptor (required by x86)
+  Entry 1:   Kernel code segment (64-bit, Execute/Read, DPL=0)
+  Entry 2:   Kernel data segment (64-bit, Read/Write, DPL=0)
+  Entry 3-4: TSS descriptor (16 bytes, spans two GDT entries)
+
+IST Stack Allocations:
+  IST[0] = Double-fault handler (20 KiB, static .bss)
+  IST[1] = Timer interrupt handler (16 KiB, static .bss)</code></pre>
+
+<h2 id="data-segment-bug">The Data Segment Bug (Critical Phase 1 Fix)</h2>
+
+<p>This was the single hardest bug in Phase 1. After enabling interrupts, the first
+hardware interrupt caused an immediate double fault.</p>
+
+<p><strong>Root cause</strong>: The bootloader's GDT has no data segment, so <code>SS = 0</code>. When an
+interrupt fires, the CPU pushes SS onto the stack. On <code>iretq</code>, loading
+<code>SS = 0x0</code> triggers a #GP fault, which cascades into a double fault.</p>
+
+<pre><code class="language-rust">// The fix: GDT must include a kernel data segment
+let data_selector = gdt.append(Descriptor::kernel_data_segment());
+
+// And all data segment registers must be loaded
+DS::set_reg(GDT.1.data_selector);
+ES::set_reg(GDT.1.data_selector);
+SS::set_reg(GDT.1.data_selector);</code></pre>
+
+<p><strong>Lesson</strong>: In long mode, SS is still used by the interrupt frame push/pop cycle.
+A valid, non-null SS selector is mandatory.</p>
+
+<h2 id="memory-mgmt">Memory Management</h2>
+
+<p><strong>Source:</strong> <code>kernel/src/memory.rs</code></p>
+
+<p>Two-tier system: a physical frame bump allocator (<code>BootInfoFrameAllocator</code>) doles
+out 4 KiB frames from the UEFI memory map, and <code>linked_list_allocator</code> manages the
+kernel heap at <code>0x4444_4444_0000</code>.</p>
+
+<pre><code class="language-plaintext">Heap Init:
+  1. Read CR3 -> active L4 page table
+  2. Create OffsetPageTable mapper
+  3. For each 4 KiB page in [HEAP_START, HEAP_START + HEAP_SIZE):
+     - Allocate physical frame
+     - Map virtual page -> physical frame (PRESENT | WRITABLE)
+  4. Initialize linked_list_allocator
+  -> Box, Vec, String, BTreeMap now work</code></pre>
+
+<h2 id="interrupt-system">Interrupt System</h2>
+
+<p><strong>Source:</strong> <code>kernel/src/interrupts.rs</code></p>
+
+<p>ClaudioOS uses the dual 8259 PIC. The Local APIC is explicitly disabled to prevent
+conflicting timer delivery.</p>
+
+<pre><code class="language-plaintext">PIC Configuration:
+  PIC1: offset 32, PIC2: offset 40
+  Unmasked: IRQ0 (timer, vec 32), IRQ1 (keyboard, vec 33)
+  All others masked
+
+IDT Entries:
+  Vec 3:  breakpoint   (raw serial write, no log)
+  Vec 8:  double_fault (IST[0], 20 KiB stack)
+  Vec 14: page_fault   (reads CR2, logs, halts)
+  Vec 32: timer        (EOI only, no logging)
+  Vec 33: keyboard     (read port 0x60, push scancode, wake async)</code></pre>
+
+<h2 id="serial-uart">Serial UART</h2>
+
+<p><strong>Source:</strong> <code>kernel/src/serial.rs</code></p>
+
+<p>16550 UART at I/O base 0x3F8 (COM1). 115200 baud, 8N1. The <code>_print()</code> function
+disables interrupts while holding the serial lock to prevent deadlocks.</p>
+
+<p><code>force_println!</code> is used in the panic handler -- it calls <code>force_unlock()</code> to break
+any held lock, which is safe because the panic handler never returns.</p>
+
+<h2 id="framebuffer">Framebuffer</h2>
+
+<p><strong>Source:</strong> <code>kernel/src/framebuffer.rs</code></p>
+
+<p>The UEFI GOP framebuffer is accessed indirectly: the kernel walks the page table to
+find the physical address, then accesses it through the <code>phys_mem_offset</code> mapping
+which is guaranteed PRESENT + WRITABLE. BGR pixel format, 4 bytes per pixel.</p>
+
+<h2 id="pci">PCI Enumeration</h2>
+
+<p><strong>Source:</strong> <code>kernel/src/pci.rs</code></p>
+
+<p>Legacy I/O port PCI config space access (ports 0xCF8/0xCFC). Scans bus 0, devices
+0-31. Identifies VirtIO-net (1AF4:1000), e1000 (8086:100E), enables bus mastering
+for DMA-capable devices.</p>
+
+<!-- ============================================================ -->
+<!--                       TERMINAL                                -->
+<!-- ============================================================ -->
+
+<h2 id="terminal-overview">Terminal Overview</h2>
+
+<p><strong>Source:</strong> <code>crates/terminal/src/</code></p>
+
+<p>The terminal crate is <code>#![no_std]</code> with <code>extern crate alloc</code>. It renders through a
+<code>DrawTarget</code> trait:</p>
+
+<pre><code class="language-rust">pub trait DrawTarget {
+    fn put_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8);
+    fn width(&self) -> usize;
+    fn height(&self) -> usize;
+}</code></pre>
+
+<p>Data flow: raw bytes -> VTE parser -> cell grid -> noto-sans-mono-bitmap glyphs ->
+<code>DrawTarget::put_pixel()</code> -> framebuffer.</p>
+
+<h2 id="font-rendering">Font Rendering Pipeline</h2>
+
+<p><strong>Source:</strong> <code>crates/terminal/src/render.rs</code></p>
+
+<p>Characters are rendered using pre-rasterized bitmap glyphs from
+<code>noto-sans-mono-bitmap</code>. No font file loading, no TrueType parsing. Binary threshold
+at intensity 128 (foreground if > 128, background otherwise).</p>
+
+<p>Font height: 16 pixels. Width: compile-time computed from the font crate.</p>
+
+<h2 id="vte-parser">VTE Parser Integration</h2>
+
+<p><strong>Source:</strong> <code>crates/terminal/src/pane.rs</code></p>
+
+<p>Each Pane contains a <code>vte::Parser</code> (v0.15) that classifies incoming bytes as
+printable characters, control codes, or escape sequences. The parser ownership
+uses <code>mem::replace</code> to avoid double-mutable-borrow.</p>
+
+<p>Supported: SGR colors (standard, bright, 256-color basic, truecolor RGB), cursor
+positioning (CUP, CUU/D/F/B, CHA, VPA), erase (ED, EL), scroll (SU), line
+insert/delete (IL, DL), control codes (LF, CR, BS, HT, BEL).</p>
+
+<h2 id="split-pane">Split-Pane Layout Tree</h2>
+
+<p><strong>Source:</strong> <code>crates/terminal/src/layout.rs</code></p>
+
+<p>The layout is a binary tree: leaf nodes contain a pane ID and viewport, split nodes
+contain a direction (Vertical/Horizontal), ratio, and two children.</p>
+
+<pre><code class="language-plaintext">Example: Three panes
+
+           Split(Vertical, 0.5)
+          /                     \
+    Leaf(pane 0)         Split(Horizontal, 0.5)
+                         /                      \
+                    Leaf(pane 1)           Leaf(pane 2)
+
++------------------+--+------------------+
+|                  |  |     Pane 1       |
+|     Pane 0       |  +--+--------------+
+|                  |  |     Pane 2       |
++------------------+--+------------------+</code></pre>
+
+<p>Separators are 2 pixels wide, rendered in BRIGHT_BLACK. Viewports are recomputed
+top-down on split/close. Focus wraps cyclically.</p>
+
+<h2 id="color-system">Color System</h2>
+
+<p>16-color CGA-derived palette (SGR 30-37 standard, 90-97 bright). 256-color mode
+maps indices 0-15 to the palette; 16-255 are ignored. Truecolor
+(<code>38;2;r;g;b</code> / <code>48;2;r;g;b</code>) is fully supported.</p>
+
+<p>Default foreground: (204, 204, 204). Default background: (16, 16, 16) -- not pure
+black, to distinguish from unused framebuffer regions.</p>
+
+<!-- ============================================================ -->
+<!--                      NETWORKING                               -->
+<!-- ============================================================ -->
+
+<h2 id="net-architecture">Networking Stack Architecture</h2>
+
+<p><strong>Source:</strong> <code>crates/net/src/</code></p>
+
+<pre><code class="language-plaintext">HTTP client (http.rs)
+    |
+    v  raw bytes over TLS
+TLS stream (tls.rs)
+    |
+    v  encrypted TLS records
+TCP socket (smoltcp)
+    |
+    v  TCP segments
+IP / Ethernet (smoltcp)
+    |
+    v  Ethernet frames
+NIC driver (nic.rs) -- VirtIO virtqueues (DMA)
+    |
+    v
+Hardware / QEMU SLIRP</code></pre>
+
+<h2 id="virtio-net">VirtIO-net Driver</h2>
+
+<p><strong>Source:</strong> <code>crates/net/src/nic.rs</code> (~757 lines)</p>
+
+<p>Legacy VirtIO (0.9.5) PCI driver. Initialization: reset, acknowledge, negotiate
+features (MAC + STATUS), read MAC address, set up RX queue (256 descriptors with
+2048-byte DMA buffers) and TX queue, then DRIVER_OK.</p>
+
+<p>TX flow: reclaim completed descriptors from used ring, allocate descriptor, write
+10-byte VirtIO-net header (all zeros) + Ethernet frame, push to available ring,
+notify device. RX flow: check used ring, strip 10-byte header, copy frame, recycle
+descriptor.</p>
+
+<p><code>virt_to_phys()</code> performs a full 4-level page table walk for DMA address translation
+of heap-allocated buffers.</p>
+
+<h2 id="smoltcp">smoltcp Integration</h2>
+
+<p><strong>Source:</strong> <code>crates/net/src/stack.rs</code></p>
+
+<p><code>SmoltcpDevice</code> wraps <code>VirtioNet</code> and implements smoltcp's <code>Device</code> trait. MTU 1514,
+medium Ethernet. <code>NetworkStack</code> owns the smoltcp Interface, SocketSet, and device.
+DHCP via smoltcp's built-in DHCPv4 socket -- QEMU SLIRP provides 10.0.2.x.</p>
+
+<h2 id="dns">DNS Resolution</h2>
+
+<p><strong>Source:</strong> <code>crates/net/src/dns.rs</code></p>
+
+<p>Synchronous DNS via smoltcp's DNS socket. Creates A record query, polls network
+stack in a loop (up to 10,000 iterations), returns first IPv4 address. Uses
+DHCP-provided DNS server addresses.</p>
+
+<h2 id="tls">TLS Strategy</h2>
+
+<p><strong>Source:</strong> <code>crates/net/src/tls.rs</code></p>
+
+<p>TLS in <code>#![no_std]</code> is one of the hardest parts. Current plan: <code>embedded-tls</code> 0.17
+(designed for no_std, but triggers LLVM codegen crashes). Fallback: <code>rustls</code> no_std
+port. TCP helpers (<code>tcp_connect</code>, <code>tcp_send</code>, <code>tcp_recv</code>) are functional; TLS
+handshake methods contain <code>todo!()</code> markers.</p>
+
+<h2 id="http">HTTP/1.1 Client</h2>
+
+<p><strong>Source:</strong> <code>crates/net/src/http.rs</code> (~564 lines)</p>
+
+<p>Minimal HTTP/1.1: request building with headers, response parsing (status line,
+headers, body via Content-Length), chunked transfer encoding decoder, and
+pre-configured helpers for Anthropic API and OAuth requests. Host-side unit tested.</p>
+
+<h2 id="sse">SSE Parser</h2>
+
+<p>Server-Sent Events parser for Anthropic's streaming API. <code>parse_sse_events(data)</code>
+returns complete events and bytes consumed; incomplete events are preserved for the
+next read cycle. Each <code>SseEvent</code> has an event type and data (JSON payload).</p>
+
+<!-- ============================================================ -->
+<!--                     API & AUTH                                -->
+<!-- ============================================================ -->
+
+<h2 id="messages-api">Messages API</h2>
+
+<p><strong>Source:</strong> <code>crates/api-client/src/lib.rs</code></p>
+
+<p>POST to <code>https://api.anthropic.com/v1/messages</code> with JSON body. Required headers:
+<code>Content-Type</code>, <code>anthropic-version</code>, <code>x-api-key</code> or <code>Authorization: Bearer</code>,
+<code>Accept: text/event-stream</code>. Raw HTTP/1.1 bytes over TLS -- no reqwest, no hyper.</p>
+
+<pre><code class="language-rust">pub fn anthropic_messages_request(api_key: &str, body_json: &[u8]) -> HttpRequest {
+    HttpRequest::post("api.anthropic.com", "/v1/messages", body_json.to_vec())
+        .header("Content-Type", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Accept", "text/event-stream")
+        .header("Connection", "close")
+}</code></pre>
+
+<h2 id="streaming">SSE Streaming Protocol</h2>
+
+<p>When <code>"stream": true</code>, the API responds with SSE events: <code>message_start</code>,
+<code>content_block_start</code>, <code>content_block_delta</code> (repeated, contains text chunks),
+<code>content_block_stop</code>, <code>message_delta</code> (stop_reason, usage), <code>message_stop</code>.</p>
+
+<p>Text deltas are written directly to the agent's terminal pane as they arrive.
+Tool use blocks accumulate <code>input_json_delta</code> fragments until <code>content_block_stop</code>.</p>
+
+<h2 id="tool-use">Tool Use Protocol</h2>
+
+<p>When Claude requests a tool, the SSE stream contains <code>tool_use</code> content blocks with
+incremental JSON input. After accumulating and parsing, ClaudioOS executes the tool
+and sends a <code>tool_result</code> message in the next conversation turn.</p>
+
+<p>Available tools are restricted to file I/O on FAT32 (<code>read_file</code>, <code>write_file</code>,
+<code>list_files</code>). No shell execution -- ClaudioOS has no subprocess capability.</p>
+
+<h2 id="oauth">OAuth 2.0 Device Authorization Grant</h2>
+
+<p><strong>Source:</strong> <code>crates/auth/src/lib.rs</code></p>
+
+<p>RFC 8628 device flow: POST to <code>/oauth/device/code</code>, display user code on
+framebuffer, user authorizes on phone/laptop, ClaudioOS polls for token. Tokens
+persisted to FAT32. Background async task refreshes before expiry.
+<code>CLAUDIO_API_KEY</code> env var bypasses OAuth for development.</p>
+
+<pre><code class="language-rust">pub enum Credentials {
+    ApiKey(String),
+    OAuth {
+        access_token: String,
+        refresh_token: String,
+        expires_at: u64,
+    },
+}</code></pre>
+
+<h2 id="token-persist">Token Persistence</h2>
+
+<p>FAT32 layout via the <code>fatfs</code> crate:</p>
+
+<pre><code class="language-plaintext">/claudio/
+    config.json
+    auth/
+        token.json     (access + refresh tokens)
+        api_key.txt    (optional dev key)
+    agents/
+        session_0.json (conversation history)
+    logs/
+        boot.log</code></pre>
+
+<!-- ============================================================ -->
+<!--                       BUILDING                                -->
+<!-- ============================================================ -->
+
+<h2 id="prerequisites">Prerequisites</h2>
+
+<p>Nightly Rust (auto-installed via <code>rust-toolchain.toml</code>), QEMU, and OVMF (for UEFI
+boot). Windows needs MSVC Build Tools for the image builder.</p>
+
+<pre><code class="language-bash"># Linux
+sudo apt install qemu-system-x86 ovmf
+
+# macOS
+brew install qemu
+
+# Windows: install QEMU + Visual Studio Build Tools</code></pre>
+
+<h2 id="build-process">Two-Step Build Process</h2>
+
+<pre><code class="language-bash"># Step 1: Compile the kernel
+cargo build
+
+# Step 2: Create bootable disk images
+cargo run --manifest-path tools/image-builder/Cargo.toml -- \
+    target/x86_64-unknown-none/debug/claudio-os</code></pre>
+
+<p>The image builder is a host-side binary excluded from the workspace to avoid
+inheriting the <code>x86_64-unknown-none</code> target. It produces both UEFI and BIOS disk
+images.</p>
+
+<h2 id="qemu">Running in QEMU</h2>
+
+<pre><code class="language-bash"># BIOS boot (simplest)
+qemu-system-x86_64 \
+    -drive format=raw,file=target/x86_64-unknown-none/debug/claudio-os-bios.img \
+    -serial stdio -m 512M
+
+# UEFI boot
+qemu-system-x86_64 \
+    -bios /usr/share/OVMF/OVMF_CODE.fd \
+    -drive format=raw,file=target/x86_64-unknown-none/debug/claudio-os-uefi.img \
+    -serial stdio -m 512M
+
+# With VirtIO networking
+qemu-system-x86_64 \
+    -bios /usr/share/OVMF/OVMF_CODE.fd \
+    -drive format=raw,file=target/x86_64-unknown-none/debug/claudio-os-uefi.img \
+    -device virtio-net-pci,netdev=net0 \
+    -netdev user,id=net0 \
+    -serial stdio -m 512M -smp 4</code></pre>
+
+<h2 id="troubleshooting">Troubleshooting</h2>
+
+<h3>Double Fault After Enabling Interrupts</h3>
+<ul>
+  <li><strong>Missing data segment</strong>: SS must be loaded with a valid selector. See <a href="#data-segment-bug">The Data Segment Bug</a>.</li>
+  <li><strong>APIC not disabled</strong>: Clear bit 11 of IA32_APIC_BASE MSR before PIC init.</li>
+  <li><strong>Stack overflow</strong>: The bootloader's 128 KiB stack is exhausted. The heap stack switch fixes this.</li>
+</ul>
+
+<h3>Windows MSVC Linker Errors</h3>
+<p>Install "Desktop development with C++" in Visual Studio. Set <code>LIB</code> environment
+variable if libraries are not found.</p>
+
+<h3>embedded-tls LLVM Crashes</h3>
+<p>Set <code>opt-level = 1</code> in <code>[profile.dev]</code> or <code>codegen-units = 1</code>.</p>
+
+<h2 id="env-vars">Environment Variables</h2>
+
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>CLAUDIO_API_KEY</code></td><td>(none)</td><td>Baked-in API key, skips OAuth (dev only)</td></tr>
+    <tr><td><code>CLAUDIO_LOG_LEVEL</code></td><td>info</td><td>Log level: trace/debug/info/warn/error</td></tr>
+    <tr><td><code>CLAUDIO_QEMU</code></td><td>0</td><td>QEMU-friendly defaults (VirtIO, SLIRP)</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<!--                     CONTRIBUTING                              -->
+<!-- ============================================================ -->
+
+<h2 id="dev-workflow">Development Workflow</h2>
+
+<pre><code class="language-bash"># Edit -> Build -> Image -> QEMU
+cargo build && \
+cargo run --manifest-path tools/image-builder/Cargo.toml -- \
+    target/x86_64-unknown-none/debug/claudio-os && \
+qemu-system-x86_64 \
+    -drive format=raw,file=target/x86_64-unknown-none/debug/claudio-os-bios.img \
+    -serial stdio -m 512M -no-reboot</code></pre>
+
+<h2 id="conventions">Code Conventions</h2>
+
+<ul>
+  <li>All crates are <code>#![no_std]</code> with <code>extern crate alloc</code></li>
+  <li>Use <code>log</code> crate macros with <code>[module]</code> prefix for all output</li>
+  <li><code>spin::Mutex</code> for shared state, <code>spin::Lazy</code> for lazy init</li>
+  <li>Disable interrupts while holding locks (<code>without_interrupts</code>)</li>
+  <li><code>panic = "abort"</code> -- no unwinding, no catch_unwind</li>
+  <li>Unsafe code with <code>// SAFETY:</code> comments</li>
+</ul>
+
+<h2 id="testing">Testing</h2>
+
+<p>Pure logic crates can be tested on the host:</p>
+
+<pre><code class="language-bash">cd crates/net && cargo test     # HTTP/SSE parser tests
+cd crates/terminal && cargo test  # terminal logic tests</code></pre>
+
+<p>Kernel testing is manual in QEMU: boot, watch serial output, verify no panics,
+type on keyboard.</p>
+
+<h2 id="pitfalls">Common Pitfalls</h2>
+
+<ul>
+  <li><strong>Stack overflow in ISR handlers</strong>: No <code>log::*</code> calls. Send EOI, push to queue, return.</li>
+  <li><strong>Deadlock from lock ordering</strong>: Use <code>without_interrupts</code>. Keep ISR locks separate.</li>
+  <li><strong>Forgetting EOI</strong>: System hangs if interrupt handler skips End-of-Interrupt.</li>
+  <li><strong>Physical vs virtual addresses</strong>: DMA devices need physical. Use page table walks for heap.</li>
+  <li><strong>Framebuffer not writable</strong>: Access through phys_mem_offset, not bootloader mapping.</li>
+  <li><strong>mem::forget for long-lived allocations</strong>: Heap stack must be leaked.</li>
+</ul>
+
+    </div><!-- docs-content -->
+  </div><!-- docs-layout -->
+</div><!-- container -->
+
+<footer>
+  <div class="container">
+    <p>
+      ClaudioOS &middot;
+      <a href="https://github.com/suhteevah/claudio-os">Source on GitHub</a> &middot;
+      AGPL-3.0-or-later &middot;
+      Ridge Cell Repair LLC
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

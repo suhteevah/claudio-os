@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClaudioOS -- Bare Metal AI Agent OS</title>
+  <meta name="description" content="A bare-metal Rust operating system for running AI coding agents. No Linux, no POSIX, no JavaScript. Just Rust, UEFI, and Claude.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav>
+  <a href="index.html" class="active">Home</a>
+  <a href="docs.html">Docs</a>
+  <a href="https://github.com/suhteevah/claudio-os">GitHub</a>
+</nav>
+
+<header class="hero">
+  <div class="container">
+    <h1>ClaudioOS</h1>
+    <p class="tagline">
+      No Linux. No POSIX. No JavaScript.<br>
+      <strong>Just Rust, UEFI, and Claude.</strong><span class="cursor"></span>
+    </p>
+    <div class="badge-row">
+      <span class="badge green">Phase 1: Boot to Terminal</span>
+      <span class="badge">Rust nightly</span>
+      <span class="badge">x86_64</span>
+      <span class="badge">AGPL-3.0-or-later</span>
+    </div>
+    <p style="font-size: 0.85rem; color: var(--text-dim);">
+      A bare-metal operating system purpose-built for running multiple
+      <a href="https://www.anthropic.com/">Anthropic Claude</a> coding agents simultaneously.
+      Boots via UEFI, speaks HTTP/1.1 + TLS directly from Ring 0, renders a split-pane
+      terminal on the GOP framebuffer.
+    </p>
+  </div>
+</header>
+
+<main class="container">
+
+  <!-- Architecture -->
+  <section id="architecture">
+    <h2>// Architecture</h2>
+    <div class="diagram-block">
+<pre>
++-----------------------------------------------------+
+|                  Agent Dashboard                     |
+|  +----------+ +----------+ +----------+             |
+|  | Agent 1  | | Agent 2  | | Agent 3  |  ...       |
+|  | (pane)   | | (pane)   | | (pane)   |             |
+|  +----------+ +----------+ +----------+             |
++-----------------------------------------------------+
+|              Agent Session Manager                   |
+|         (async tasks, one per agent)                 |
++--------------+--------------+-----------------------+
+|  API Client  |     Auth     |   Terminal Renderer   |
+|  (Messages   |  (OAuth      |   (framebuffer +      |
+|   API + SSE) |   device     |    ANSI + split       |
+|              |   flow)      |    panes)             |
++--------------+--------------+-----------------------+
+|              Async Executor (interrupt-driven)       |
++-----------------------------------------------------+
+|     Net (smoltcp + TLS)    |    FS (FAT32 persist)  |
++----------------------------+------------------------+
+|   NIC Driver (virtio-net / e1000)  |  PS/2 Keyboard |
++------------------------------------+----------------+
+|              x86_64 Kernel Core                      |
+|   (paging, heap, GDT/IDT, interrupts, PCI)          |
++-----------------------------------------------------+
+|              UEFI Boot (bootloader crate v0.11)      |
++-----------------------------------------------------+
+</pre>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section id="features">
+    <h2>// Features</h2>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="label">Networking</div>
+        <h3>Native VirtIO + smoltcp</h3>
+        <p>Custom VirtIO-net driver with DMA virtqueues. smoltcp provides TCP/IP, DHCP, and DNS. No Linux networking stack.</p>
+      </div>
+      <div class="feature-card">
+        <div class="label">Security</div>
+        <h3>Bare-Metal TLS</h3>
+        <p>TLS handshake and encrypted streams from Ring 0. HTTPS POST directly to api.anthropic.com with no OS intermediary.</p>
+      </div>
+      <div class="feature-card">
+        <div class="label">Display</div>
+        <h3>Split-Pane Terminal</h3>
+        <p>Binary split tree layout over the GOP framebuffer. VTE parser for full ANSI escape sequences. Truecolor support.</p>
+      </div>
+      <div class="feature-card">
+        <div class="label">AI</div>
+        <h3>Anthropic Tool Use</h3>
+        <p>SSE streaming parser for Claude's Messages API. Tool use protocol with file I/O on FAT32. Multi-agent sessions.</p>
+      </div>
+      <div class="feature-card">
+        <div class="label">Auth</div>
+        <h3>OAuth Device Flow</h3>
+        <p>RFC 8628 device authorization at boot. Display code on framebuffer, authorize from your phone. Token refresh in background.</p>
+      </div>
+      <div class="feature-card">
+        <div class="label">Runtime</div>
+        <h3>Async Executor</h3>
+        <p>Interrupt-driven cooperative scheduler. Hardware IRQs wake futures. HLT when idle. No polling, no wasted cycles.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Boot Sequence -->
+  <section id="boot-sequence">
+    <h2>// Boot Sequence</h2>
+    <div class="timeline">
+      <div class="timeline-item">
+        <div class="phase">Phase -1</div>
+        <h3>Proof of Life</h3>
+        <p>Raw serial write to port 0x3F8. Bytes hit the wire before anything else initializes.</p>
+      </div>
+      <div class="timeline-item">
+        <div class="phase">Phase 0</div>
+        <h3>Serial + Logger</h3>
+        <p>16550 UART initialization (115200 8N1). Log crate wired to serial output.</p>
+      </div>
+      <div class="timeline-item">
+        <div class="phase">Phase 1</div>
+        <h3>GDT + TSS</h3>
+        <p>Global Descriptor Table with kernel code, data, and TSS segments. IST stacks for double-fault and timer handlers.</p>
+      </div>
+      <div class="timeline-item">
+        <div class="phase">Phase 2</div>
+        <h3>Memory</h3>
+        <p>OffsetPageTable from CR3. 1 MiB heap mapped at 0x4444_4444_0000. linked_list_allocator as global allocator.</p>
+      </div>
+      <div class="timeline-item">
+        <div class="phase">Phase 3</div>
+        <h3>Interrupts</h3>
+        <p>APIC disabled. 8259 PIC initialized (ICW1-4). IDT loaded. IRQ0 (timer) + IRQ1 (keyboard) unmasked. STI deferred.</p>
+      </div>
+      <div class="timeline-item">
+        <div class="phase">Phase 4</div>
+        <h3>Framebuffer</h3>
+        <p>GOP framebuffer physical address resolved via page table walk. Writable access through phys_mem_offset mapping.</p>
+      </div>
+      <div class="timeline-item">
+        <div class="phase">Phase 5</div>
+        <h3>PCI Enumeration</h3>
+        <p>Bus 0 scan. VirtIO-net, e1000 detected. Bus mastering enabled for DMA devices.</p>
+      </div>
+      <div class="timeline-item">
+        <div class="phase">Phase 6</div>
+        <h3>Stack Switch + Executor</h3>
+        <p>256 KiB heap stack allocated and leaked. RSP switched via inline ASM. Interrupts enabled. Executor runs forever.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tech Stack -->
+  <section id="tech">
+    <h2>// Crate Dependencies</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Crate</th>
+          <th>Version</th>
+          <th>Purpose</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>bootloader / bootloader_api</td><td>0.11</td><td>UEFI + BIOS boot, framebuffer, memory map</td></tr>
+        <tr><td>x86_64</td><td>0.15</td><td>Page tables, GDT, IDT, MSRs, port I/O</td></tr>
+        <tr><td>smoltcp</td><td>0.12</td><td>TCP/IP, DHCP, DNS (no_std)</td></tr>
+        <tr><td>vte</td><td>0.15</td><td>VT100/VT220 escape sequence parser</td></tr>
+        <tr><td>noto-sans-mono-bitmap</td><td>0.3</td><td>Compile-time bitmap font glyphs</td></tr>
+        <tr><td>pc-keyboard</td><td>0.8</td><td>PS/2 scancode decoder</td></tr>
+        <tr><td>linked_list_allocator</td><td>0.10</td><td>Kernel heap allocator</td></tr>
+        <tr><td>spin</td><td>0.9</td><td>Spinlock Mutex + Lazy (no_std sync)</td></tr>
+        <tr><td>embedded-tls</td><td>0.17</td><td>TLS 1.2/1.3 for bare-metal</td></tr>
+        <tr><td>serde_json</td><td>1.x</td><td>JSON (no_std, alloc feature)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- Design Decisions -->
+  <section id="design">
+    <h2>// Design Decisions</h2>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <h3>No JavaScript Runtime</h3>
+        <p>Call the Anthropic API directly via raw HTTP/1.1 + SSE over TLS. Eliminates 50+ syscalls worth of compatibility shims.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Single Address Space</h3>
+        <p>No kernel/user boundary. No syscalls. No process isolation. Every agent session is an async task. We trust our own code.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Interrupt-Driven Async</h3>
+        <p>Hardware interrupts (NIC RX, keyboard, timer) wake futures. HLT when idle for power savings. No busy-loop polling.</p>
+      </div>
+      <div class="feature-card">
+        <h3>FAT32 Persistence</h3>
+        <p>No ext4, no journaling. Tokens, config, conversation logs, and agent state persisted to a simple FAT32 partition.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Getting Started -->
+  <section id="build">
+    <h2>// Build &amp; Run</h2>
+<pre>
+<span style="color: var(--text-dim);"># Build the kernel</span>
+cargo build
+
+<span style="color: var(--text-dim);"># Create bootable disk images (UEFI + BIOS)</span>
+cargo run --manifest-path tools/image-builder/Cargo.toml -- \
+    target/x86_64-unknown-none/debug/claudio-os
+
+<span style="color: var(--text-dim);"># Run in QEMU (BIOS mode, simplest)</span>
+qemu-system-x86_64 \
+    -drive format=raw,file=target/x86_64-unknown-none/debug/claudio-os-bios.img \
+    -serial stdio -m 512M
+
+<span style="color: var(--text-dim);"># With VirtIO networking (Phase 2+)</span>
+qemu-system-x86_64 \
+    -bios /usr/share/OVMF/OVMF_CODE.fd \
+    -drive format=raw,file=target/x86_64-unknown-none/debug/claudio-os-uefi.img \
+    -device virtio-net-pci,netdev=net0 \
+    -netdev user,id=net0 \
+    -serial stdio -m 512M -smp 4
+</pre>
+  </section>
+
+</main>
+
+<footer>
+  <div class="container">
+    <p>
+      ClaudioOS &middot;
+      <a href="https://github.com/suhteevah/claudio-os">Source on GitHub</a> &middot;
+      AGPL-3.0-or-later &middot;
+      Ridge Cell Repair LLC
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
