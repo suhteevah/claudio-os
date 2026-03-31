@@ -65,7 +65,10 @@ use crate::entity::SecondaryMap;
 use crate::inst_predicates::visit_block_succs;
 use crate::ir::{Block, Function, Inst, Opcode};
 use crate::{machinst::*, trace};
-use rustc_hash::{FxHashMap, FxHashSet};
+#[cfg(feature = "std")]
+use crate::fx::{FxHashMap, FxHashSet};
+#[cfg(not(feature = "std"))]
+use crate::fx::{FxHashMap, FxHashSet};
 
 /// Mapping from CLIF BBs to VCode BBs.
 #[derive(Debug)]

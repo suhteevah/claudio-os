@@ -5,6 +5,7 @@ use crate::machinst::Reg;
 use crate::result::CodegenResult;
 use crate::{binemit::CodeOffset, CodegenError};
 use alloc::vec::Vec;
+#[cfg(feature = "unwind")]
 use gimli::write::{Address, FrameDescriptionEntry};
 
 #[cfg(feature = "enable-serde")]

@@ -107,11 +107,17 @@ use crate::CodegenError;
 use crate::{ir, isa};
 use crate::{machinst::*, trace};
 use regalloc2::{MachineEnv, PReg, PRegSet};
-use rustc_hash::FxHashMap;
+#[cfg(feature = "std")]
+use crate::fx::FxHashMap;
+#[cfg(not(feature = "std"))]
+use crate::fx::FxHashMap;
 use smallvec::smallvec;
+#[cfg(feature = "std")]
 use std::collections::HashMap;
-use std::marker::PhantomData;
-use std::mem;
+#[cfg(not(feature = "std"))]
+use crate::HashMap;
+use core::marker::PhantomData;
+use core::mem;
 
 /// A small vector of instructions (with some reasonable size); appropriate for
 /// a small fixed sequence implementing one operation.

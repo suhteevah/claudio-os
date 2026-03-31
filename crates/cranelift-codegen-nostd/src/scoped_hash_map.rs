@@ -5,13 +5,11 @@
 //! values inserted while inside a scope aren't visible outside the scope.
 
 use core::hash::Hash;
-use rustc_hash::FxHashMap;
+#[cfg(feature = "std")]
+use crate::fx::FxHashMap;
+#[cfg(not(feature = "std"))]
+use crate::fx::FxHashMap;
 use smallvec::{smallvec, SmallVec};
-
-#[cfg(not(feature = "std"))]
-use crate::fx::FxHasher;
-#[cfg(not(feature = "std"))]
-type Hasher = core::hash::BuildHasherDefault<FxHasher>;
 
 struct Val<V> {
     value: V,

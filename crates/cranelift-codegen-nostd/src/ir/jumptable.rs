@@ -114,7 +114,7 @@ mod tests {
     use crate::entity::EntityRef;
     use crate::ir::instructions::ValueListPool;
     use crate::ir::{Block, BlockCall, Value};
-    use std::string::ToString;
+    #[cfg(test)] use std::string::ToString;
 
     #[test]
     fn empty() {

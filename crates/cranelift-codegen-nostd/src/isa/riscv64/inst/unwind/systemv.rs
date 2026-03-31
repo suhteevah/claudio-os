@@ -3,11 +3,13 @@
 use crate::isa::riscv64::inst::regs;
 use crate::isa::unwind::systemv::RegisterMappingError;
 use crate::machinst::Reg;
+#[cfg(feature = "unwind")]
 use gimli::{write::CommonInformationEntry, Encoding, Format, Register};
 use regalloc2::RegClass;
 
 /// Creates a new riscv64 common information entry (CIE).
 pub fn create_cie() -> CommonInformationEntry {
+    #[cfg(feature = "unwind")]
     use gimli::write::CallFrameInstruction;
 
     let mut entry = CommonInformationEntry::new(
@@ -68,6 +70,7 @@ mod tests {
     use crate::isa::{lookup, CallConv};
     use crate::settings::{builder, Flags};
     use crate::Context;
+    #[cfg(feature = "unwind")]
     use gimli::write::Address;
     use target_lexicon::triple;
 

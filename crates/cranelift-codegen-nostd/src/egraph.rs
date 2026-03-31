@@ -21,9 +21,12 @@ use core::cmp::Ordering;
 use cranelift_control::ControlPlane;
 use cranelift_entity::packed_option::ReservedValue;
 use cranelift_entity::SecondaryMap;
-use rustc_hash::FxHashSet;
+#[cfg(feature = "std")]
+use crate::fx::FxHashSet;
+#[cfg(not(feature = "std"))]
+use crate::fx::FxHashSet;
 use smallvec::SmallVec;
-use std::hash::Hasher;
+use core::hash::Hasher;
 
 mod cost;
 mod elaborate;

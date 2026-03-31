@@ -2,7 +2,7 @@ use crate::ir::{BlockCall, Value, ValueList};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use smallvec::SmallVec;
-use std::cell::Cell;
+use core::cell::Cell;
 
 pub use super::MachLabel;
 use super::RetPair;
@@ -680,7 +680,7 @@ macro_rules! isle_lower_prelude_methods {
             &mut self,
             targets: &MachLabelSlice,
         ) -> Option<(MachLabel, BoxVecMachLabel)> {
-            use std::boxed::Box;
+            use alloc::boxed::Box;
             if targets.is_empty() {
                 return None;
             }

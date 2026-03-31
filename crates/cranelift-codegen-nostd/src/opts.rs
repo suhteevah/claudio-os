@@ -15,7 +15,7 @@ use crate::machinst::isle::*;
 use crate::trace;
 use cranelift_entity::packed_option::ReservedValue;
 use smallvec::{smallvec, SmallVec};
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 #[allow(dead_code)]
 pub type Unit = ();

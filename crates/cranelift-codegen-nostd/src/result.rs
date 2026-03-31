@@ -4,7 +4,7 @@ use regalloc2::checker::CheckerErrors;
 
 use crate::ir::pcc::PccError;
 use crate::{ir::Function, verifier::VerifierErrors};
-use std::string::String;
+use alloc::string::String;
 
 /// A compilation error.
 ///

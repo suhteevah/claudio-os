@@ -3,10 +3,12 @@
 use crate::isa::aarch64::inst::regs;
 use crate::isa::unwind::systemv::RegisterMappingError;
 use crate::machinst::{Reg, RegClass};
+#[cfg(feature = "unwind")]
 use gimli::{write::CommonInformationEntry, Encoding, Format, Register};
 
 /// Creates a new aarch64 common information entry (CIE).
 pub fn create_cie() -> CommonInformationEntry {
+    #[cfg(feature = "unwind")]
     use gimli::write::CallFrameInstruction;
 
     let mut entry = CommonInformationEntry::new(
@@ -73,6 +75,7 @@ mod tests {
     use crate::isa::{lookup, CallConv};
     use crate::settings::{builder, Flags};
     use crate::Context;
+    #[cfg(feature = "unwind")]
     use gimli::write::Address;
     use target_lexicon::triple;
 

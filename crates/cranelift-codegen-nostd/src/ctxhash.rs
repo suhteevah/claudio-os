@@ -5,7 +5,7 @@
 //! an array or pool of shared data).
 
 use hashbrown::raw::RawTable;
-use std::hash::{Hash, Hasher};
+use core::hash::{Hash, Hasher};
 
 /// Trait that allows for equality comparison given some external
 /// context.
@@ -76,7 +76,10 @@ fn compute_hash<Ctx, K>(ctx: &Ctx, k: &K) -> u32
 where
     Ctx: CtxHash<K>,
 {
+    #[cfg(feature = "std")]
     let mut hasher = rustc_hash::FxHasher::default();
+    #[cfg(not(feature = "std"))]
+    let mut hasher = crate::fx::FxHasher::default();
     ctx.ctx_hash(&mut hasher, k);
     hasher.finish() as u32
 }
@@ -94,7 +97,7 @@ impl<K, V> CtxHashMap<K, V> {
         }) {
             Some(bucket) => {
                 let data = unsafe { bucket.as_mut() };
-                Some(std::mem::replace(&mut data.v, v))
+                Some(core::mem::replace(&mut data.v, v))
             }
             None => {
                 let data = BucketData { hash, k, v };

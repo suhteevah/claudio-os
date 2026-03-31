@@ -29,13 +29,16 @@ use regalloc2::{
     Edit, Function as RegallocFunction, InstOrEdit, InstRange, MachineEnv, Operand,
     OperandConstraint, OperandKind, PRegSet, RegClass,
 };
-use rustc_hash::FxHashMap;
+#[cfg(feature = "std")]
+use crate::fx::FxHashMap;
+#[cfg(not(feature = "std"))]
+use crate::fx::FxHashMap;
 
 use core::mem::take;
 use cranelift_entity::{entity_impl, Keys};
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-use std::fmt;
+use crate::hash_map::Entry;
+use crate::HashMap;
+use core::fmt;
 
 /// Index referring to an instruction in VCode.
 pub type InsnIndex = regalloc2::Inst;

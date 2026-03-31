@@ -272,7 +272,7 @@ impl ConstantPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::string::ToString;
+    #[cfg(test)] use std::string::ToString;
 
     #[test]
     fn empty() {

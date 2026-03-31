@@ -73,6 +73,8 @@ mod constant_hash;
 mod context;
 mod ctxhash;
 mod egraph;
+#[cfg(not(feature = "std"))]
+pub(crate) mod fx;
 mod inst_predicates;
 mod isle_prelude;
 mod iterators;

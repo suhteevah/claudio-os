@@ -3,10 +3,15 @@
 //! This modules provides facilities for timing the execution of individual compilation passes.
 
 use core::fmt;
+#[cfg(feature = "std")]
 use std::any::Any;
+#[cfg(feature = "std")]
 use std::boxed::Box;
+#[cfg(feature = "std")]
 use std::cell::RefCell;
+#[cfg(feature = "std")]
 use std::mem;
+#[cfg(feature = "std")]
 use std::time::Duration;
 
 // Each pass that can be timed is predefined with the `define_passes!` macro. Each pass has a
@@ -37,8 +42,18 @@ macro_rules! define_passes {
         $(
             #[doc=$desc]
             #[must_use]
+            #[cfg(feature = "std")]
             pub fn $pass() -> Box<dyn Any> {
                 start_pass(Pass::$pass)
+            }
+        )+
+
+        $(
+            #[doc=$desc]
+            #[must_use]
+            #[cfg(not(feature = "std"))]
+            pub fn $pass() -> u8 {
+                0
             }
         )+
     }
@@ -100,6 +115,7 @@ impl fmt::Display for Pass {
 }
 
 /// A profiler.
+#[cfg(feature = "std")]
 pub trait Profiler {
     /// Start a profiling pass.
     ///
@@ -111,6 +127,7 @@ pub trait Profiler {
 }
 
 // Information about passes in a single thread.
+#[cfg(feature = "std")]
 thread_local! {
     static PROFILER: RefCell<Box<dyn Profiler>> = RefCell::new(Box::new(DefaultProfiler));
 }
@@ -118,6 +135,7 @@ thread_local! {
 /// Set the profiler for the current thread.
 ///
 /// Returns the old profiler.
+#[cfg(feature = "std")]
 pub fn set_thread_profiler(new_profiler: Box<dyn Profiler>) -> Box<dyn Profiler> {
     PROFILER.with(|profiler| std::mem::replace(&mut *profiler.borrow_mut(), new_profiler))
 }
@@ -125,11 +143,13 @@ pub fn set_thread_profiler(new_profiler: Box<dyn Profiler>) -> Box<dyn Profiler>
 /// Start timing `pass` as a child of the currently running pass, if any.
 ///
 /// This function is called by the publicly exposed pass functions.
+#[cfg(feature = "std")]
 fn start_pass(pass: Pass) -> Box<dyn Any> {
     PROFILER.with(|profiler| profiler.borrow().start_pass(pass))
 }
 
 /// Accumulated timing information for a single pass.
+#[cfg(feature = "std")]
 #[derive(Default, Copy, Clone)]
 struct PassTime {
     /// Total time spent running this pass including children.
@@ -140,10 +160,12 @@ struct PassTime {
 }
 
 /// Accumulated timing for all passes.
+#[cfg(feature = "std")]
 pub struct PassTimes {
     pass: [PassTime; NUM_PASSES],
 }
 
+#[cfg(feature = "std")]
 impl PassTimes {
     /// Add `other` to the timings of this `PassTimes`.
     pub fn add(&mut self, other: &Self) {
@@ -159,6 +181,7 @@ impl PassTimes {
     }
 }
 
+#[cfg(feature = "std")]
 impl Default for PassTimes {
     fn default() -> Self {
         Self {
@@ -167,6 +190,7 @@ impl Default for PassTimes {
     }
 }
 
+#[cfg(feature = "std")]
 impl fmt::Display for PassTimes {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "======== ========  ==================================")?;
@@ -197,16 +221,19 @@ impl fmt::Display for PassTimes {
 }
 
 // Information about passes in a single thread.
+#[cfg(feature = "std")]
 thread_local! {
     static PASS_TIME: RefCell<PassTimes> = RefCell::new(Default::default());
 }
 
 /// The default profiler. You can get the results using [`take_current`].
+#[cfg(feature = "std")]
 pub struct DefaultProfiler;
 
 /// Take the current accumulated pass timings and reset the timings for the current thread.
 ///
 /// Only applies when [`DefaultProfiler`] is used.
+#[cfg(feature = "std")]
 pub fn take_current() -> PassTimes {
     PASS_TIME.with(|rc| mem::take(&mut *rc.borrow_mut()))
 }
@@ -270,7 +297,7 @@ mod enabled {
     }
 }
 
-#[cfg(not(feature = "timing"))]
+#[cfg(all(not(feature = "timing"), feature = "std"))]
 mod disabled {
     use super::{DefaultProfiler, Pass, Profiler};
     use std::any::Any;
