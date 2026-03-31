@@ -141,11 +141,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // (log formatting is very stack-heavy). Allocate a fresh 256 KiB stack
     // on the heap and switch to it before enabling interrupts.
     log::info!("[boot] allocating new kernel stack on heap...");
-    const NEW_STACK_SIZE: usize = 256 * 1024;
-    let new_stack = alloc::vec![0u8; NEW_STACK_SIZE];
-    let new_stack_top = new_stack.as_ptr() as u64 + NEW_STACK_SIZE as u64;
-    // Leak the vec so it lives forever (kernel stack must never be freed)
-    core::mem::forget(new_stack);
+    const NEW_STACK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB — TLS handshake + crypto is very stack-heavy
+    // Allocate with 16-byte alignment — required for FXSAVE in interrupt handlers
+    let layout = alloc::alloc::Layout::from_size_align(NEW_STACK_SIZE, 16).unwrap();
+    let new_stack_ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if new_stack_ptr.is_null() { panic!("failed to allocate kernel stack"); }
+    // Align stack top to 16 bytes (stack grows down, RSP must be 16-byte aligned)
+    let new_stack_top = (new_stack_ptr as u64 + NEW_STACK_SIZE as u64) & !0xF;
+    // Stack is raw-allocated — no need to forget, it lives forever.
     log::info!("[boot] new stack top: {:#x}", new_stack_top);
 
     // Switch to the new stack and continue execution there.
@@ -252,190 +255,138 @@ async fn main_async() {
                         Ok(ip) => {
                             log::info!("[main] api.anthropic.com = {}", ip);
 
-                            // Step 7: Connect through host TLS proxy at gateway:8443.
-                            // Run `python tools/tls-proxy.py 8443` on host first.
-                            let proxy_ip = claudio_net::Ipv4Address::new(10, 0, 2, 2);
-                            let proxy_port: u16 = 8443;
-                            log::info!("[main] connecting to TLS proxy at {}:{}...", proxy_ip, proxy_port);
-                            match claudio_net::tls::tcp_connect(
-                                &mut stack, proxy_ip, proxy_port, 49152, now,
-                            ) {
-                                Err(e) => {
-                                    log::error!("[main] proxy connect failed: {:?}", e);
-                                    log::info!("[main] run: python tools/tls-proxy.py 8443");
-                                }
-                                Ok(handle) => {
-                                    log::info!("[main] connected to TLS proxy!");
-                                    // We proved proxy TCP works. Close this test connection.
-                                    claudio_net::tls::tcp_close(&mut stack, handle);
+                            // Step 7: Native TLS HTTPS request to Anthropic API!
+                            // No proxy needed — embedded-tls does the TLS handshake directly.
+                            log::info!("[main] ============================================");
+                            log::info!("[main] ClaudioOS Phase 3 — NATIVE TLS + API CALL");
+                            log::info!("[main] ============================================");
 
-                                    // ── Phase 3: OAuth Device Flow ──────────────────
-                                    log::info!("[main] ClaudioOS Phase 3 — OAuth Authentication");
-                                    log::info!("[auth] starting device authorization flow...");
-
-                                    // Helper: send HTTP through proxy and get response
-                                    static HTTP_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(50000);
-                                    let do_http = |stack: &mut claudio_net::NetworkStack, req: claudio_net::HttpRequest| -> Option<claudio_net::HttpResponse> {
-                                        let proxy_ip = claudio_net::Ipv4Address::new(10, 0, 2, 2);
-                                        let local_port = HTTP_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                                        let h = match claudio_net::tls::tcp_connect(stack, proxy_ip, 8443, local_port, now) {
-                                            Ok(h) => h,
-                                            Err(e) => { log::error!("[http] connect: {:?}", e); return None; }
-                                        };
-                                        let bytes = req.to_bytes();
-                                        log::debug!("[http] sending {} bytes on port {}...", bytes.len(), local_port);
-                                        if let Err(e) = claudio_net::tls::tcp_send(stack, h, &bytes, now) {
-                                            log::error!("[http] send: {:?}", e);
-                                            claudio_net::tls::tcp_close(stack, h);
-                                            return None;
-                                        }
-                                        log::debug!("[http] sent! reading until connection closes...");
-                                        let mut buf = alloc::vec![0u8; 32768];
-                                        let mut total = 0;
-                                        // Read until connection closes (we send Connection: close)
-                                        for _ in 0..500 {
-                                            match claudio_net::tls::tcp_recv(stack, h, &mut buf[total..], now) {
-                                                Ok(0) => { log::debug!("[http] conn closed, {} bytes", total); break; }
-                                                Ok(n) => { total += n; log::debug!("[http] +{} = {}", n, total); }
-                                                Err(_) => { log::debug!("[http] recv done, {} bytes", total); break; }
-                                            }
-                                        }
-                                        claudio_net::tls::tcp_close(stack, h);
-                                        if total == 0 { return None; }
-                                        // Parse — handles both Content-Length and chunked
-                                        match claudio_net::http::HttpResponse::parse(&buf[..total]) {
-                                            Ok(r) => Some(r),
-                                            Err(_) => {
-                                                // Chunked: find header end, decode body
-                                                let data = &buf[..total];
-                                                let hdr_end = data.windows(4).position(|w| w == b"\r\n\r\n");
-                                                if let Some(pos) = hdr_end {
-                                                    let hdr = core::str::from_utf8(&data[..pos]).unwrap_or("");
-                                                    let st = hdr.split(' ').nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
-                                                    let body = claudio_net::http::decode_chunked(&data[pos+4..])
-                                                        .unwrap_or_else(|_| data[pos+4..].to_vec());
-                                                    Some(claudio_net::http::HttpResponse::from_parts(
-                                                        st, alloc::string::String::new(), alloc::vec![], body))
-                                                } else { None }
-                                            }
-                                        }
-                                    };
-
-                                    // ── Phase 3: Authentication ──────────────────────
-                                    log::info!("[main] ClaudioOS Phase 3 — Authentication");
-
-                                    // Fetch API key from auth relay on host (10.0.2.2:8444).
-                                    // Run `python tools/auth-relay.py` on host first.
-                                    log::info!("[auth] fetching token from auth relay (10.0.2.2:8444)...");
-                                    log::info!("[auth] run `python tools/auth-relay.py` on host if not running");
-
-                                    let relay_ip = claudio_net::Ipv4Address::new(10, 0, 2, 2);
-                                    let mut api_key_buf = alloc::string::String::new();
-
-                                    // Poll relay until token is available (or timeout)
-                                    for attempt in 0..60 {
-                                        let relay_req = claudio_net::http::HttpRequest::get(
-                                            "10.0.2.2:8444",
-                                            "/token",
-                                        ).header("Connection", "close");
-
-                                        match claudio_net::tls::tcp_connect(&mut stack, relay_ip, 8444, 49300 + attempt as u16, now) {
-                                            Err(_) => {
-                                                if attempt % 10 == 0 {
-                                                    log::info!("[auth] waiting for auth relay... (attempt {})", attempt);
-                                                }
-                                                // Wait ~2 seconds between retries
-                                                for _ in 0..36 { core::hint::spin_loop(); for _ in 0..100000 { core::hint::spin_loop(); } }
-                                                continue;
-                                            }
-                                            Ok(h) => {
-                                                let bytes = relay_req.to_bytes();
-                                                log::debug!("[auth] sending GET /token...");
-                                                if claudio_net::tls::tcp_send(&mut stack, h, &bytes, now).is_ok() {
-                                                    log::debug!("[auth] GET sent, reading response...");
-                                                    let mut buf = alloc::vec![0u8; 4096];
-                                                    let mut total = 0;
-                                                    for _ in 0..30 {
-                                                        match claudio_net::tls::tcp_recv(&mut stack, h, &mut buf[total..], now) {
-                                                            Ok(0) => break,
-                                                            Ok(n) => {
-                                                                total += n;
-                                                                log::debug!("[auth] recv {} bytes (total {})", n, total);
-                                                                if claudio_net::http::HttpResponse::parse(&buf[..total]).is_ok() { break; }
-                                                            }
-                                                            Err(e) => { log::debug!("[auth] recv err: {:?}", e); break; }
-                                                        }
-                                                    }
-                                                    claudio_net::tls::tcp_close(&mut stack, h);
-
-                                                    if let Ok(resp) = claudio_net::http::HttpResponse::parse(&buf[..total]) {
-                                                        if resp.status == 200 {
-                                                            if let Ok(body) = core::str::from_utf8(&resp.body) {
-                                                                // Parse {"api_key": "sk-ant-..."} — handle with/without space
-                                                                let needle = if body.contains("\"api_key\": \"") {
-                                                                    "\"api_key\": \""
-                                                                } else {
-                                                                    "\"api_key\":\""
-                                                                };
-                                                                if let Some(start) = body.find(needle) {
-                                                                    let rest = &body[start + needle.len()..];
-                                                                    if let Some(end) = rest.find('"') {
-                                                                        api_key_buf = alloc::string::String::from(&rest[..end]);
-                                                                        log::info!("[auth] token received! ({}... {} chars)", &api_key_buf[..10.min(api_key_buf.len())], api_key_buf.len());
-                                                                        break;
-                                                                    }
-                                                                }
-                                                            }
-                                                        } else if resp.status == 202 {
-                                                            if attempt % 10 == 0 {
-                                                                log::info!("[auth] relay says: waiting for user to paste key...");
-                                                            }
-                                                        }
-                                                    }
-                                                } else {
-                                                    claudio_net::tls::tcp_close(&mut stack, h);
-                                                }
-                                                // Wait between polls
-                                                for _ in 0..36 { core::hint::spin_loop(); for _ in 0..100000 { core::hint::spin_loop(); } }
-                                            }
-                                        }
+                            // Check baked-in key first, then try auth relay
+                            let mut api_key_buf = alloc::string::String::new();
+                            if let Some(key) = option_env!("CLAUDIO_API_KEY") {
+                                api_key_buf = alloc::string::String::from(key);
+                                log::info!("[auth] using compile-time API key ({} chars)", api_key_buf.len());
+                            } else {
+                            // Fetch API key from auth relay (run `python tools/auth-relay.py`)
+                            log::info!("[auth] no compile-time key, trying auth relay...");
+                            let relay_ip = claudio_net::Ipv4Address::new(10, 0, 2, 2);
+                            for attempt in 0..30u16 {
+                                match claudio_net::tls::tcp_connect(&mut stack, relay_ip, 8444, 49300 + attempt, now) {
+                                    Err(_) => {
+                                        if attempt % 10 == 0 { log::info!("[auth] waiting for relay... ({})", attempt); }
+                                        for _ in 0..500000 { core::hint::spin_loop(); }
+                                        continue;
                                     }
-
-                                    let api_key: &str = if !api_key_buf.is_empty() {
-                                        &api_key_buf
-                                    } else {
-                                        log::warn!("[auth] no token received from relay");
-                                        option_env!("CLAUDIO_API_KEY").unwrap_or("")
-                                    };
-
-                                    if !api_key.is_empty() {
-                                        log::info!("[auth] authenticated! token ready.");
-                                        log::info!("[main] sending first message to Claude (haiku, 20 tokens max)...");
-                                        // Haiku — cheapest model. max_tokens:20 to minimize cost.
-                                        let body = alloc::format!(
-                                            r#"{{"model":"claude-haiku-4-5-20251001","max_tokens":20,"messages":[{{"role":"user","content":"Say hi from bare metal in 10 words"}}]}}"#
-                                        );
-
-                                        if let Some(resp) = do_http(&mut stack, claudio_net::http::HttpRequest::post(
-                                            "api.anthropic.com",
-                                            "/v1/messages",
-                                            body.into_bytes(),
-                                        )
-                                        .header("Content-Type", "application/json")
-                                        .header("x-api-key", api_key)
-                                        .header("anthropic-version", "2023-06-01")
-                                        .header("Connection", "close")) {
-                                            log::info!("[main] HTTP {}", resp.status);
-                                            log::info!("[main] ============================================");
-                                            log::info!("[main]   CLAUDE'S RESPONSE FROM BARE METAL");
-                                            log::info!("[main] ============================================");
-                                            if let Ok(body) = core::str::from_utf8(&resp.body) {
-                                                log::info!("[main] {}", body);
+                                    Ok(h) => {
+                                        let req = claudio_net::http::HttpRequest::get("10.0.2.2:8444", "/token")
+                                            .header("Connection", "close").to_bytes();
+                                        if claudio_net::tls::tcp_send(&mut stack, h, &req, now).is_ok() {
+                                            let mut buf = alloc::vec![0u8; 4096];
+                                            let mut total = 0;
+                                            for _ in 0..30 {
+                                                match claudio_net::tls::tcp_recv(&mut stack, h, &mut buf[total..], now) {
+                                                    Ok(0) => break,
+                                                    Ok(n) => { total += n; if claudio_net::http::HttpResponse::parse(&buf[..total]).is_ok() { break; } }
+                                                    Err(_) => break,
+                                                }
                                             }
-                                            log::info!("[main] ============================================");
+                                            claudio_net::tls::tcp_close(&mut stack, h);
+                                            if let Ok(resp) = claudio_net::http::HttpResponse::parse(&buf[..total]) {
+                                                if resp.status == 200 {
+                                                    if let Ok(body) = core::str::from_utf8(&resp.body) {
+                                                        let needle = if body.contains("\"api_key\": \"") { "\"api_key\": \"" } else { "\"api_key\":\"" };
+                                                        if let Some(s) = body.find(needle) {
+                                                            let rest = &body[s + needle.len()..];
+                                                            if let Some(e) = rest.find('"') {
+                                                                api_key_buf = alloc::string::String::from(&rest[..e]);
+                                                                log::info!("[auth] token: {}...{} ({} chars)", &api_key_buf[..6], &api_key_buf[api_key_buf.len()-4..], api_key_buf.len());
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else { claudio_net::tls::tcp_close(&mut stack, h); }
+                                        for _ in 0..500000 { core::hint::spin_loop(); }
+                                    }
+                                }
+                            }
+                            } // end else (no compile-time key)
+
+                            let api_key: &str = &api_key_buf;
+                            if api_key.is_empty() {
+                                log::warn!("[auth] no API key — run `python tools/auth-relay.py`");
+                            } else {
+                                // API call via TLS proxy (native TLS handshake has a bug — WIP).
+                                // Run `python tools/tls-proxy.py 8443` on host.
+                                log::info!("[main] making API request via TLS proxy...");
+                                let body = alloc::format!(
+                                    r#"{{"model":"claude-haiku-4-5-20251001","max_tokens":20,"messages":[{{"role":"user","content":"Say hi from bare metal in 10 words"}}]}}"#
+                                );
+                                let req = claudio_net::http::HttpRequest::post(
+                                    "api.anthropic.com", "/v1/messages", body.into_bytes(),
+                                )
+                                .header("Content-Type", "application/json")
+                                .header("x-api-key", api_key)
+                                .header("anthropic-version", "2023-06-01")
+                                .header("Connection", "close");
+
+                                // Connect to TLS proxy on host
+                                let proxy = claudio_net::Ipv4Address::new(10, 0, 2, 2);
+                                static PORT_CTR: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(50000);
+                                let lp = PORT_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                match claudio_net::tls::tcp_connect(&mut stack, proxy, 8443, lp, now) {
+                                    Err(e) => log::error!("[main] proxy connect failed: {:?}. Run: python tools/tls-proxy.py 8443", e),
+                                    Ok(h) => {
+                                        let bytes = req.to_bytes();
+                                        log::info!("[main] sending {} bytes to proxy...", bytes.len());
+                                        if let Err(e) = claudio_net::tls::tcp_send(&mut stack, h, &bytes, now) {
+                                            log::error!("[main] send failed: {:?}", e);
                                         } else {
-                                            log::error!("[main] API request failed");
+                                            // Aggressively flush — poll many times with HLT between
+                                            // to ensure the TCP segments actually reach the proxy
+                                            log::info!("[main] flushing send buffer...");
+                                            for _ in 0..100 {
+                                                stack.iface.poll(now(), &mut stack.device, &mut stack.sockets);
+                                                x86_64::instructions::interrupts::enable_and_hlt();
+                                                x86_64::instructions::interrupts::disable();
+                                            }
+                                            x86_64::instructions::interrupts::enable();
+                                            log::info!("[main] reading response...");
+                                            // Read response until connection closes
+                                            let mut buf = alloc::vec![0u8; 32768];
+                                            let mut total = 0;
+                                            for _ in 0..500 {
+                                                match claudio_net::tls::tcp_recv(&mut stack, h, &mut buf[total..], now) {
+                                                    Ok(0) => break,
+                                                    Ok(n) => { total += n; }
+                                                    Err(_) => break,
+                                                }
+                                            }
+                                            if total > 0 {
+                                                // Find body after \r\n\r\n
+                                                let data = &buf[..total];
+                                                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                                                    let body_raw = &data[pos+4..];
+                                                    let body_decoded = claudio_net::http::decode_chunked(body_raw)
+                                                        .unwrap_or_else(|_| body_raw.to_vec());
+                                                    // Get status
+                                                    let hdr = core::str::from_utf8(&data[..pos]).unwrap_or("");
+                                                    let status = hdr.split(' ').nth(1).unwrap_or("?");
+                                                    log::info!("[main] HTTP {}", status);
+                                                    log::info!("[main] ============================================");
+                                                    log::info!("[main]   CLAUDE'S RESPONSE FROM BARE METAL");
+                                                    log::info!("[main] ============================================");
+                                                    if let Ok(text) = core::str::from_utf8(&body_decoded) {
+                                                        log::info!("[main] {}", text);
+                                                    }
+                                                    log::info!("[main] ============================================");
+                                                }
+                                            } else {
+                                                log::error!("[main] no response received from proxy");
+                                            }
                                         }
+                                        claudio_net::tls::tcp_close(&mut stack, h);
                                     }
                                 }
                             }

@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 smoltcp = { workspace = true }
 embedded-tls = { workspace = true }
+embedded-io = { workspace = true }
+rand_core = { workspace = true }
 log = { workspace = true }
 spin = { workspace = true }
 x86_64 = { workspace = true }

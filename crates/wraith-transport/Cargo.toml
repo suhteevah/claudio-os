@@ -1,0 +1,9 @@
+[package]
+name = "wraith-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+claudio-net = { path = "../net" }
+smoltcp = { workspace = true }
+log = { workspace = true }

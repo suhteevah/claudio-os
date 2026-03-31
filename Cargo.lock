@@ -170,8 +170,10 @@ dependencies = [
 name = "claudio-net"
 version = "0.1.0"
 dependencies = [
+ "embedded-io",
  "embedded-tls",
  "log",
+ "rand_core",
  "smoltcp",
  "spin",
  "x86_64",

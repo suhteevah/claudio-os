@@ -34,7 +34,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 
     // CPU exceptions
     idt.breakpoint.set_handler_fn(breakpoint_handler);
-    idt.page_fault.set_handler_fn(page_fault_handler);
+    idt.page_fault.set_handler_fn(page_fault_debug);
     unsafe {
         idt.double_fault
             .set_handler_fn(double_fault_handler)
@@ -239,6 +239,27 @@ extern "x86-interrupt" fn page_fault_handler(
         error_code,
         stack_frame,
     );
+    crate::halt_loop();
+}
+
+extern "x86-interrupt" fn page_fault_debug(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    use x86_64::registers::control::Cr2;
+    // Raw serial to avoid stack overflow from log formatting
+    unsafe {
+        let mut port = x86_64::instructions::port::Port::<u8>::new(0x3F8);
+        for &b in b"\r\n!!! PAGE FAULT !!!\r\nCR2=" {
+            port.write(b);
+        }
+        let addr = Cr2::read().unwrap_or(x86_64::VirtAddr::new(0)).as_u64();
+        for i in (0..16).rev() {
+            let nibble = ((addr >> (i * 4)) & 0xF) as u8;
+            port.write(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        }
+        for &b in b"\r\n" { port.write(b); }
+    }
     crate::halt_loop();
 }
 

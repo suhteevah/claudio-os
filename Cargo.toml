@@ -8,6 +8,10 @@ members = [
     "crates/auth",
     "crates/agent",
     "crates/fs-persist",
+    # Wraith port — WIP, excluded until compilation issues fixed
+    # "crates/wraith-transport",
+    # "crates/wraith-dom",
+    # "crates/wraith-render",
 ]
 exclude = [
     "tools/image-builder",  # Host-side tool, must NOT inherit x86_64-unknown-none target
@@ -45,6 +49,8 @@ smoltcp = { version = "0.12", default-features = false, features = [
 
 # TLS / Crypto
 embedded-tls = { version = "0.17", default-features = false }
+embedded-io = "0.6"
+rand_core = { version = "0.6", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["no_std"] }
 
 # Terminal

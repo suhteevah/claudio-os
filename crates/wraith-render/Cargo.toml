@@ -1,0 +1,8 @@
+[package]
+name = "wraith-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wraith-dom = { path = "../wraith-dom" }
+log.workspace = true

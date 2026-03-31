@@ -105,7 +105,7 @@ pub use dns::DnsError;
 pub use http::{HttpError, HttpRequest, HttpResponse, SseEvent};
 pub use nic::VirtioNet;
 pub use stack::NetworkStack;
-pub use tls::{TcpError, TlsError, TlsStream};
+pub use tls::{TcpError, TlsError, TlsStream, https_request};
 
 /// Re-export smoltcp's Instant type so the kernel can construct timestamps
 /// without depending on smoltcp directly.
