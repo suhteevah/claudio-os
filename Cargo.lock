@@ -195,6 +195,7 @@ dependencies = [
  "log",
  "noto-sans-mono-bitmap",
  "pc-keyboard",
+ "serde_json",
  "spin",
  "vte",
  "x86_64",

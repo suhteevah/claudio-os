@@ -34,6 +34,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 
     // CPU exceptions
     idt.breakpoint.set_handler_fn(breakpoint_handler);
+    idt.general_protection_fault.set_handler_fn(general_protection_handler);
     idt.page_fault.set_handler_fn(page_fault_debug);
     unsafe {
         idt.double_fault
@@ -221,6 +222,53 @@ extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) 
     }
 }
 
+extern "x86-interrupt" fn general_protection_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    // #GP (General Protection) fault.  Common causes:
+    //   - Unaligned memory access with SSE instructions (MOVAPS on non-16B addr)
+    //   - Segment violations
+    //   - Privileged instruction in user mode
+    //
+    // For SSE alignment faults, error_code is 0 and RIP points to the
+    // faulting instruction.  Print diagnostics via raw serial to avoid
+    // any chance of faulting again during log formatting.
+    unsafe {
+        let mut port = x86_64::instructions::port::Port::<u8>::new(0x3F8);
+        for &b in b"\r\n!!! GENERAL PROTECTION FAULT !!!\r\nerror_code=" {
+            port.write(b);
+        }
+        for i in (0..16).rev() {
+            let nibble = ((error_code >> (i * 4)) & 0xF) as u8;
+            port.write(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        }
+        for &b in b"\r\nRIP=" {
+            port.write(b);
+        }
+        let rip = stack_frame.instruction_pointer.as_u64();
+        for i in (0..16).rev() {
+            let nibble = ((rip >> (i * 4)) & 0xF) as u8;
+            port.write(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        }
+        for &b in b"\r\nRSP=" {
+            port.write(b);
+        }
+        let rsp = stack_frame.stack_pointer.as_u64();
+        for i in (0..16).rev() {
+            let nibble = ((rsp >> (i * 4)) & 0xF) as u8;
+            port.write(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        }
+        for &b in b"\r\n" { port.write(b); }
+    }
+    log::error!(
+        "[int] GENERAL PROTECTION FAULT (error_code={:#x})\n{:#?}",
+        error_code,
+        stack_frame,
+    );
+    crate::halt_loop();
+}
+
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
@@ -267,6 +315,40 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
+    use x86_64::registers::control::Cr2;
+    // Print CR2 (faulting address), RSP, and RIP via raw serial FIRST,
+    // before any formatting that might itself fault.  A double fault
+    // during TLS handshake is often caused by a #GP from unaligned SSE
+    // access, which doesn't set CR2, but if it's a page fault escalation
+    // then CR2 tells us exactly which address was inaccessible.
+    unsafe {
+        let mut port = x86_64::instructions::port::Port::<u8>::new(0x3F8);
+        for &b in b"\r\n!!! DOUBLE FAULT !!!\r\nCR2=" {
+            port.write(b);
+        }
+        let addr = Cr2::read().unwrap_or(x86_64::VirtAddr::new(0)).as_u64();
+        for i in (0..16).rev() {
+            let nibble = ((addr >> (i * 4)) & 0xF) as u8;
+            port.write(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        }
+        for &b in b"\r\nRSP=" {
+            port.write(b);
+        }
+        let rsp = stack_frame.stack_pointer.as_u64();
+        for i in (0..16).rev() {
+            let nibble = ((rsp >> (i * 4)) & 0xF) as u8;
+            port.write(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        }
+        for &b in b"\r\nRIP=" {
+            port.write(b);
+        }
+        let rip = stack_frame.instruction_pointer.as_u64();
+        for i in (0..16).rev() {
+            let nibble = ((rip >> (i * 4)) & 0xF) as u8;
+            port.write(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        }
+        for &b in b"\r\n" { port.write(b); }
+    }
     log::error!("[int] DOUBLE FAULT\n{:#?}", stack_frame);
     crate::halt_loop();
 }

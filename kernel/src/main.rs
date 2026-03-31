@@ -12,6 +12,8 @@
 
 extern crate alloc;
 
+mod agent_loop;
+mod dashboard;
 mod executor;
 mod framebuffer;
 mod gdt;
@@ -21,6 +23,7 @@ mod logger;
 mod memory;
 mod pci;
 mod serial;
+mod terminal;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
@@ -184,6 +187,95 @@ fn now() -> claudio_net::Instant {
     claudio_net::Instant::from_millis(interrupts::millis_since_boot())
 }
 
+/// Decode complete HTTP chunks from `chunk_buf`, feed the decoded payload
+/// bytes into the SSE `StreamParser`, and process resulting events through
+/// the `StreamAccumulator`.  For each `TextDelta` event the text is printed
+/// immediately to serial so the user sees tokens as they arrive.
+///
+/// Any incomplete chunk data is left in `chunk_buf` for the next call.
+/// Sets `stream_done = true` when a `MessageStop` event is received.
+fn decode_and_feed_chunks(
+    chunk_buf: &mut alloc::vec::Vec<u8>,
+    parser: &mut claudio_api::streaming::StreamParser,
+    accumulator: &mut claudio_api::streaming::StreamAccumulator,
+    stream_done: &mut bool,
+) {
+    use claudio_api::streaming::{StreamEvent, Delta};
+
+    // Process all complete HTTP chunks in the buffer.
+    // Chunk format: <hex-size>\r\n<data>\r\n
+    loop {
+        // Find the chunk size line ending (\r\n)
+        let crlf_pos = match chunk_buf.windows(2).position(|w| w == b"\r\n") {
+            Some(pos) => pos,
+            None => break, // Need more data
+        };
+
+        // Parse the hex chunk size
+        let size_str = match core::str::from_utf8(&chunk_buf[..crlf_pos]) {
+            Ok(s) => s.trim(),
+            Err(_) => break,
+        };
+        // Chunk size may have extensions after `;` — ignore them
+        let size_hex = size_str.split(';').next().unwrap_or("").trim();
+        let chunk_size = match usize::from_str_radix(size_hex, 16) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+
+        // Terminal chunk (size 0) means end of chunked stream
+        if chunk_size == 0 {
+            log::debug!("[stream] received terminal chunk");
+            break;
+        }
+
+        // Check if we have the full chunk: size_line + \r\n + data + \r\n
+        let total_needed = crlf_pos + 2 + chunk_size + 2;
+        if chunk_buf.len() < total_needed {
+            break; // Need more data
+        }
+
+        // Extract the chunk payload
+        let payload_start = crlf_pos + 2;
+        let payload = chunk_buf[payload_start..payload_start + chunk_size].to_vec();
+
+        // Consume this chunk from the buffer
+        *chunk_buf = chunk_buf[total_needed..].to_vec();
+
+        // Feed the decoded payload into the SSE stream parser
+        let events = parser.feed(&payload);
+        for event in &events {
+            accumulator.process(event);
+            match event {
+                StreamEvent::MessageStart { message_id, model } => {
+                    log::info!("[stream] message started: id={} model={}", message_id, model);
+                }
+                StreamEvent::ContentBlockDelta { delta: Delta::TextDelta { text }, .. } => {
+                    // Print each text token immediately to serial — this is the
+                    // key streaming UX: the user sees tokens as they arrive.
+                    crate::serial_print!("{}", text);
+                }
+                StreamEvent::MessageStop => {
+                    log::debug!("[stream] received MessageStop");
+                    *stream_done = true;
+                }
+                StreamEvent::Error { error_type, message } => {
+                    log::error!("[stream] SSE error [{}]: {}", error_type, message);
+                    *stream_done = true;
+                }
+                StreamEvent::Ping => {
+                    log::trace!("[stream] ping");
+                }
+                _ => {}
+            }
+        }
+
+        if *stream_done {
+            break;
+        }
+    }
+}
+
 /// The main async entry point — runs inside the cooperative executor.
 ///
 /// Phase 1 goal: boot to a working terminal with keyboard input echoed
@@ -317,11 +409,11 @@ async fn main_async() {
                             if api_key.is_empty() {
                                 log::warn!("[auth] no API key — run `python tools/auth-relay.py`");
                             } else {
-                                // API call via TLS proxy (native TLS handshake has a bug — WIP).
+                                // Streaming API call via TLS proxy.
                                 // Run `python tools/tls-proxy.py 8443` on host.
-                                log::info!("[main] making API request via TLS proxy...");
+                                log::info!("[main] making STREAMING API request via TLS proxy...");
                                 let body = alloc::format!(
-                                    r#"{{"model":"claude-haiku-4-5-20251001","max_tokens":20,"messages":[{{"role":"user","content":"Say hi from bare metal in 10 words"}}]}}"#
+                                    r#"{{"model":"claude-haiku-4-5-20251001","max_tokens":256,"stream":true,"messages":[{{"role":"user","content":"Say hi from bare metal in 10 words"}}]}}"#
                                 );
                                 let req = claudio_net::http::HttpRequest::post(
                                     "api.anthropic.com", "/v1/messages", body.into_bytes(),
@@ -329,6 +421,7 @@ async fn main_async() {
                                 .header("Content-Type", "application/json")
                                 .header("x-api-key", api_key)
                                 .header("anthropic-version", "2023-06-01")
+                                .header("Accept", "text/event-stream")
                                 .header("Connection", "close");
 
                                 // Connect to TLS proxy on host
@@ -343,57 +436,135 @@ async fn main_async() {
                                         if let Err(e) = claudio_net::tls::tcp_send(&mut stack, h, &bytes, now) {
                                             log::error!("[main] send failed: {:?}", e);
                                         } else {
-                                            // tcp_send now handles flushing internally — it waits
-                                            // until the TX buffer is fully drained (data ACKed).
-                                            // No need for additional manual flush loops.
-                                            log::info!("[main] send complete, reading response...");
+                                            log::info!("[main] send complete, reading streaming response...");
                                             log::info!("[main] (proxy is doing TLS upstream to api.anthropic.com — this takes a few seconds)");
 
-                                            // Read response until connection closes or complete
-                                            let mut buf = alloc::vec![0u8; 32768];
-                                            let mut total = 0;
-                                            for attempt in 0..500 {
-                                                match claudio_net::tls::tcp_recv(&mut stack, h, &mut buf[total..], now) {
-                                                    Ok(0) => {
-                                                        log::debug!("[main] recv returned 0 (EOF) after {} bytes, attempt {}", total, attempt);
-                                                        break;
-                                                    }
+                                            // Phase 1: Read until we have the full HTTP headers
+                                            let mut header_buf = alloc::vec![0u8; 4096];
+                                            let mut header_total = 0usize;
+                                            let mut headers_parsed = false;
+                                            let mut body_start = 0usize;
+                                            let mut http_status = 0u16;
+
+                                            for _ in 0..200 {
+                                                match claudio_net::tls::tcp_recv(&mut stack, h, &mut header_buf[header_total..], now) {
+                                                    Ok(0) => break,
                                                     Ok(n) => {
-                                                        total += n;
-                                                        log::debug!("[main] recv got {} bytes (total: {})", n, total);
+                                                        header_total += n;
+                                                        // Check if we have the full header block (\r\n\r\n)
+                                                        if let Some(pos) = header_buf[..header_total].windows(4).position(|w| w == b"\r\n\r\n") {
+                                                            body_start = pos + 4;
+                                                            // Parse status from first line
+                                                            let hdr_str = core::str::from_utf8(&header_buf[..pos]).unwrap_or("");
+                                                            http_status = hdr_str.split(' ').nth(1)
+                                                                .and_then(|s| s.parse::<u16>().ok())
+                                                                .unwrap_or(0);
+                                                            log::info!("[stream] HTTP status: {}", http_status);
+                                                            headers_parsed = true;
+                                                            break;
+                                                        }
                                                     }
                                                     Err(e) => {
-                                                        log::warn!("[main] recv error after {} bytes: {:?}", total, e);
+                                                        log::error!("[stream] recv error reading headers: {:?}", e);
                                                         break;
                                                     }
                                                 }
                                             }
-                                            if total > 0 {
-                                                // Find body after \r\n\r\n
-                                                let data = &buf[..total];
-                                                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-                                                    let body_raw = &data[pos+4..];
-                                                    let body_decoded = claudio_net::http::decode_chunked(body_raw)
-                                                        .unwrap_or_else(|_| body_raw.to_vec());
-                                                    // Get status
-                                                    let hdr = core::str::from_utf8(&data[..pos]).unwrap_or("");
-                                                    let status = hdr.split(' ').nth(1).unwrap_or("?");
-                                                    log::info!("[main] HTTP {}", status);
-                                                    log::info!("[main] ============================================");
-                                                    log::info!("[main]   CLAUDE'S RESPONSE FROM BARE METAL");
-                                                    log::info!("[main] ============================================");
-                                                    if let Ok(text) = core::str::from_utf8(&body_decoded) {
-                                                        log::info!("[main] {}", text);
-                                                    }
-                                                    log::info!("[main] ============================================");
+
+                                            if !headers_parsed {
+                                                log::error!("[stream] failed to receive HTTP headers");
+                                            } else if http_status != 200 {
+                                                // Non-200: read the rest as error body
+                                                let error_body = &header_buf[body_start..header_total];
+                                                if let Ok(text) = core::str::from_utf8(error_body) {
+                                                    log::error!("[stream] API error (HTTP {}): {}", http_status, text);
                                                 }
                                             } else {
-                                                log::error!("[main] no response received from proxy");
+                                                // Phase 2: Stream SSE events token-by-token
+                                                log::info!("[stream] ============================================");
+                                                log::info!("[stream]   STREAMING CLAUDE'S RESPONSE (token by token)");
+                                                log::info!("[stream] ============================================");
+
+                                                use claudio_api::streaming::{StreamParser, StreamAccumulator, StreamEvent, Delta};
+                                                let mut parser = StreamParser::new();
+                                                let mut accumulator = StreamAccumulator::new();
+                                                let mut stream_done = false;
+
+                                                // Buffer for raw chunked-encoded bytes not yet decoded
+                                                let mut chunk_buf = alloc::vec::Vec::<u8>::new();
+
+                                                // Seed with any body bytes already read with headers
+                                                if header_total > body_start {
+                                                    chunk_buf.extend_from_slice(&header_buf[body_start..header_total]);
+                                                }
+
+                                                // Process any complete chunks already buffered
+                                                decode_and_feed_chunks(&mut chunk_buf, &mut parser, &mut accumulator, &mut stream_done);
+
+                                                // Phase 3: Read more data incrementally from the TCP stream
+                                                let mut recv_buf = [0u8; 4096];
+                                                if !stream_done {
+                                                    for _ in 0..2000 {
+                                                        match claudio_net::tls::tcp_recv(&mut stack, h, &mut recv_buf, now) {
+                                                            Ok(0) => {
+                                                                log::debug!("[stream] connection closed (EOF)");
+                                                                break;
+                                                            }
+                                                            Ok(n) => {
+                                                                chunk_buf.extend_from_slice(&recv_buf[..n]);
+                                                                decode_and_feed_chunks(&mut chunk_buf, &mut parser, &mut accumulator, &mut stream_done);
+                                                                if stream_done { break; }
+                                                            }
+                                                            Err(e) => {
+                                                                log::warn!("[stream] recv error: {:?}", e);
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                // Drain any remaining data in the parser buffer
+                                                let final_events = parser.finish();
+                                                for event in &final_events {
+                                                    accumulator.process(event);
+                                                    if let StreamEvent::ContentBlockDelta { delta: Delta::TextDelta { text }, .. } = event {
+                                                        crate::serial_print!("{}", text);
+                                                    }
+                                                }
+
+                                                crate::serial_print!("\r\n");
+                                                log::info!("[stream] ============================================");
+                                                log::info!("[stream] stream complete — stop_reason: {:?}", accumulator.stop_reason);
+                                                log::info!("[stream] output tokens: {}", accumulator.output_tokens);
+                                                log::info!("[stream] full text: {}", accumulator.text);
+                                                log::info!("[stream] ============================================");
                                             }
                                         }
                                         claudio_net::tls::tcp_close(&mut stack, h);
                                     }
                                 }
+                                // ── Phase 4: Multi-agent dashboard ───────────────
+                                log::info!("[main] ============================================");
+                                log::info!("[main] ClaudioOS Phase 4 — MULTI-AGENT DASHBOARD");
+                                log::info!("[main] ============================================");
+                                log::info!("[main] Ctrl+B prefix for pane commands:");
+                                log::info!("[main]   \" = split horizontal");
+                                log::info!("[main]   %% = split vertical");
+                                log::info!("[main]   n = focus next, p = focus prev");
+                                log::info!("[main]   c = new agent, x = close pane");
+
+                                let fb_w = framebuffer::width();
+                                let fb_h = framebuffer::height();
+                                dashboard::run_dashboard(
+                                    &mut stack,
+                                    api_key,
+                                    fb_w,
+                                    fb_h,
+                                    now,
+                                ).await;
+
+                                // run_dashboard never returns in normal operation,
+                                // but if it does, fall through to the simple loop.
                             }
                         }
                     }
@@ -402,19 +573,47 @@ async fn main_async() {
         }
     }
 
-    // Auth is handled inside the networking block above (needs TCP).
-    // TODO: Move to separate function once networking refactored.
+    // ── Fallback: simple keyboard echo loop (no networking) ──────────
+    log::info!("[main] falling back to simple keyboard echo loop");
 
-    // ── Keyboard input loop ──────────────────────────────────────────
-    log::info!("[main] keyboard input active, type away!");
+    let fb_w = framebuffer::width();
+    let fb_h = framebuffer::height();
+    log::info!("[main] setting up terminal layout ({}x{} pixels)", fb_w, fb_h);
+
+    let mut draw_target = terminal::FramebufferDrawTarget;
+    let mut layout = claudio_terminal::Layout::new(fb_w, fb_h);
+
+    {
+        let pane = layout.focused_pane_mut();
+        pane.write_str("\x1b[96mClaudioOS v0.1.0\x1b[0m — \x1b[93mBare Metal AI Agent Terminal\x1b[0m\r\n");
+        pane.write_str("\x1b[90m────────────────────────────────────────────────────\x1b[0m\r\n");
+        pane.write_str("\r\n");
+        pane.write_str("  \x1b[32mPhase 1\x1b[0m: Boot to terminal ............. \x1b[92mOK\x1b[0m\r\n");
+        pane.write_str("  \x1b[33mPhase 2\x1b[0m: Networking ................... \x1b[91mN/A\x1b[0m\r\n");
+        pane.write_str("\r\n");
+        pane.write_str("\x1b[90mNo network/API key — keyboard echo mode.\x1b[0m\r\n");
+        pane.write_str("\x1b[97m$ \x1b[0m");
+    }
+
+    layout.render_all(&mut draw_target);
 
     let stream = keyboard::ScancodeStream::new();
-
     loop {
         let key = stream.next_key().await;
         match key {
             pc_keyboard::DecodedKey::Unicode(c) => {
                 crate::serial_print!("{}", c);
+                let pane = layout.focused_pane_mut();
+                if c == '\n' {
+                    pane.write_str("\r\n\x1b[97m$ \x1b[0m");
+                } else if c == '\u{8}' {
+                    pane.write_str("\x08 \x08");
+                } else {
+                    let mut buf = [0u8; 4];
+                    let s = c.encode_utf8(&mut buf);
+                    pane.write_str(s);
+                }
+                layout.render_all(&mut draw_target);
             }
             pc_keyboard::DecodedKey::RawKey(k) => {
                 log::trace!("[kbd] raw key: {:?}", k);

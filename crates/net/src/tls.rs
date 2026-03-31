@@ -638,6 +638,41 @@ fn next_local_port() -> u16 {
 const TLS_RECORD_BUF_SIZE: usize = 16640;
 
 // ---------------------------------------------------------------------------
+// 16-byte aligned buffer allocation for SSE/AES-NI
+// ---------------------------------------------------------------------------
+
+/// Allocate a heap buffer with 16-byte alignment, required for AES-NI/SSE
+/// instructions used by embedded-tls's AES-128-GCM cipher.
+///
+/// `vec![0u8; N]` only guarantees 1-byte alignment (align_of::<u8>()).
+/// AES-NI instructions like AESENC/AESDEC and SSE moves (MOVAPS) require
+/// 16-byte aligned operands.  If the allocator returns a non-16-byte-aligned
+/// address, these instructions trigger a #GP (general protection) fault,
+/// which escalates to a double fault.
+fn alloc_aligned_buf(size: usize) -> Box<[u8]> {
+    let layout = alloc::alloc::Layout::from_size_align(size, 16)
+        .expect("[tls] invalid aligned buffer layout");
+    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    assert!(!ptr.is_null(), "[tls] failed to allocate aligned TLS buffer");
+    log::debug!(
+        "[tls] allocated {} byte TLS buffer at {:p} (alignment: {})",
+        size, ptr, 16
+    );
+    // Verify alignment
+    debug_assert!(
+        ptr as usize % 16 == 0,
+        "[tls] buffer allocation not 16-byte aligned: {:p}",
+        ptr
+    );
+    // SAFETY: We allocated `size` bytes with alignment 16 via alloc_zeroed.
+    // Box<[u8]>::drop will deallocate with Layout { size, align: 1 }, which
+    // is technically a mismatch.  This is sound with linked_list_allocator
+    // because it tracks allocations by address and size only — alignment is
+    // not stored or checked on dealloc.  The pointer and size are correct.
+    unsafe { Box::from_raw(core::slice::from_raw_parts_mut(ptr, size)) }
+}
+
+// ---------------------------------------------------------------------------
 // TlsStream — the main public type
 // ---------------------------------------------------------------------------
 
@@ -746,11 +781,62 @@ impl TlsStream {
         // Create the socket adapter.  We pass a raw pointer to the stack
         // because TlsConnection needs to own the socket, but we also need
         // the stack pointer to stay valid.
-        let socket = unsafe { SmoltcpSocket::new(stack as *mut NetworkStack, tcp_handle, now) };
+        let mut socket = unsafe { SmoltcpSocket::new(stack as *mut NetworkStack, tcp_handle, now) };
 
-        // Heap-allocate TLS record buffers.
-        let mut read_buf: Box<[u8]> = vec![0u8; TLS_RECORD_BUF_SIZE].into_boxed_slice();
-        let mut write_buf: Box<[u8]> = vec![0u8; TLS_RECORD_BUF_SIZE].into_boxed_slice();
+        // -----------------------------------------------------------
+        // Pre-handshake socket validation: verify the SmoltcpSocket's
+        // Read/Write impls work before handing control to embedded-tls.
+        // If the raw pointer dereference or network polling is broken,
+        // we'll get a clear error here instead of a double-fault inside
+        // the TLS handshake.
+        // -----------------------------------------------------------
+        {
+            use embedded_io::Write;
+            log::debug!("[tls] pre-handshake: verifying SmoltcpSocket write works...");
+            // Don't actually send data (that would confuse the TLS peer),
+            // but verify that write(empty) and flush() don't fault.
+            match socket.write(&[]) {
+                Ok(0) => log::debug!("[tls] pre-handshake: write(empty) OK"),
+                Ok(n) => log::warn!("[tls] pre-handshake: write(empty) returned {}", n),
+                Err(e) => {
+                    log::error!("[tls] pre-handshake: write(empty) failed: {:?}", e);
+                    tcp_close(stack, tcp_handle);
+                    return Err(TlsError::Io);
+                }
+            }
+            match socket.flush() {
+                Ok(()) => log::debug!("[tls] pre-handshake: flush OK"),
+                Err(e) => {
+                    log::error!("[tls] pre-handshake: flush failed: {:?}", e);
+                    tcp_close(stack, tcp_handle);
+                    return Err(TlsError::Io);
+                }
+            }
+            log::debug!("[tls] pre-handshake: SmoltcpSocket validated successfully");
+        }
+
+        // Heap-allocate TLS record buffers with 16-byte alignment.
+        //
+        // CRITICAL: AES-NI instructions (AESENC, AESDEC, etc.) and SSE
+        // operations (MOVAPS, PXOR on XMM registers) require 16-byte
+        // aligned memory.  Our target (x86_64-claudio.json) enables
+        // +sse,+sse2,+aes,+pclmulqdq, so LLVM will emit these instructions
+        // for the AES-128-GCM cipher.
+        //
+        // vec![0u8; N] uses Layout { align: 1 } because align_of::<u8>() == 1.
+        // linked_list_allocator may return addresses that are NOT 16-byte
+        // aligned, causing a #GP fault on the first SSE-aligned memory access
+        // inside embedded-tls, which escalates to a double fault.
+        let mut read_buf: Box<[u8]> = alloc_aligned_buf(TLS_RECORD_BUF_SIZE);
+        let mut write_buf: Box<[u8]> = alloc_aligned_buf(TLS_RECORD_BUF_SIZE);
+
+        log::debug!(
+            "[tls] record buffers: read={:p} write={:p} (both 16-byte aligned: {}, {})",
+            read_buf.as_ptr(),
+            write_buf.as_ptr(),
+            read_buf.as_ptr() as usize % 16 == 0,
+            write_buf.as_ptr() as usize % 16 == 0,
+        );
 
         // SAFETY: We transmute the mutable slice references to 'static.
         // This is sound because:
@@ -763,14 +849,32 @@ impl TlsStream {
         let write_buf_ref: &'static mut [u8] =
             unsafe { core::mem::transmute(write_buf.as_mut() as &mut [u8]) };
 
-        // Create the TLS connection (not yet handshaked).
-        let mut conn: TlsConnection<'static, SmoltcpSocket, Aes128GcmSha256> =
+        // Create the TLS connection on the heap immediately.
+        //
+        // CRITICAL: TlsConnection contains AES round key arrays and cipher
+        // state that LLVM may access with aligned SSE instructions.  If
+        // TlsConnection lives on the stack, the stack frame alignment may
+        // not satisfy SSE requirements (the stack is typically 16-byte
+        // aligned on x86_64, but nested function calls or large frames can
+        // break this).  By Boxing immediately, we ensure the TlsConnection
+        // struct is heap-allocated (where alloc_aligned_buf guarantees 16B
+        // alignment for the buffers, and the global allocator typically
+        // returns 8/16-byte aligned memory for large allocations).
+        //
+        // More importantly, TlsConnection is a LARGE struct (contains cipher
+        // state, handshake transcript, etc.).  Keeping it on the stack during
+        // the open() handshake puts enormous pressure on the stack frame.
+        // Boxing it moves the bulk of the data to the heap.
+        let conn: TlsConnection<'static, SmoltcpSocket, Aes128GcmSha256> =
             TlsConnection::new(socket, read_buf_ref, write_buf_ref);
 
+        let mut tls_state = Box::new(TlsState {
+            conn,
+            _read_buf: read_buf,
+            _write_buf: write_buf,
+        });
+
         // Configure TLS: set server name for SNI.
-        // We need the hostname to live long enough for the config.
-        // TlsConfig borrows the server name string, so we create a
-        // heap-allocated copy that outlives the handshake.
         let hostname_owned: String = String::from(hostname);
 
         // SAFETY: We transmute the &str to 'static. The String is owned
@@ -787,20 +891,21 @@ impl TlsStream {
         let context = TlsContext::new(&tls_config, &mut rng);
 
         log::info!("[tls] starting TLS 1.3 handshake with {}", hostname);
-        // Perform the TLS handshake.
-        conn.open::<'_, _, NoVerify>(context).map_err(|e| {
+        // Perform the TLS handshake on the heap-allocated TlsConnection.
+        // The conn is inside Box<TlsState>, so the handshake crypto
+        // (AES-GCM key expansion, ECDHE, etc.) operates on heap memory
+        // with proper alignment, not on the stack.
+        if let Err(e) = tls_state.conn.open::<_, NoVerify>(context) {
             log::error!("[tls] handshake failed: {:?}", e);
+            // Drop tls_state before closing the TCP socket to ensure the
+            // TlsConnection (which holds a SmoltcpSocket with a raw pointer
+            // to the stack) is dropped while the stack is still valid.
+            drop(tls_state);
             tcp_close(stack, tcp_handle);
-            TlsError::Tls(e)
-        })?;
+            return Err(TlsError::Tls(e));
+        }
 
         log::info!("[tls] handshake complete with {}", hostname);
-
-        let tls_state = Box::new(TlsState {
-            conn,
-            _read_buf: read_buf,
-            _write_buf: write_buf,
-        });
 
         Ok(Self {
             tcp_handle,

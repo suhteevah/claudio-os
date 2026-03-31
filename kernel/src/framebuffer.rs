@@ -88,6 +88,16 @@ pub fn init(fb: &'static mut FrameBuffer, phys_mem_offset: u64) {
     log::info!("[fb] framebuffer ready");
 }
 
+/// Return the framebuffer width in pixels, or 0 if not initialised.
+pub fn width() -> usize {
+    FB.lock().as_ref().map_or(0, |fb| fb.width)
+}
+
+/// Return the framebuffer height in pixels, or 0 if not initialised.
+pub fn height() -> usize {
+    FB.lock().as_ref().map_or(0, |fb| fb.height)
+}
+
 /// Draw a single pixel. Used by terminal renderer.
 #[inline]
 pub fn put_pixel(x: usize, y: usize, r: u8, g: u8, b: u8) {
