@@ -81,6 +81,7 @@ strip = true
 
 
 [patch.crates-io]
+cranelift-frontend = { path = "crates/cranelift-frontend-nostd" }
 cranelift-codegen = { path = "crates/cranelift-codegen-nostd" }
 cranelift-codegen-shared = { path = "crates/cranelift-codegen-shared-nostd" }
 cranelift-control = { path = "crates/cranelift-control-nostd" }

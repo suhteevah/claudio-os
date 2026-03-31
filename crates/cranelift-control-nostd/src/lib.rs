@@ -21,8 +21,8 @@ impl ControlPlane {
     pub fn shuffle<T>(&mut self, _slice: &mut [T]) {}
 
     /// Return an iterator that yields items in the original order (no shuffling).
-    pub fn shuffled<I: Iterator>(&mut self, iter: I) -> alloc::vec::Vec<I::Item> {
-        iter.collect()
+    pub fn shuffled<T>(&mut self, iter: impl Iterator<Item = T>) -> impl Iterator<Item = T> {
+        iter
     }
 
     /// Get a boolean decision (always returns false in this stub).

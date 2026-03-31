@@ -163,7 +163,7 @@ impl BlockLoweringOrder {
         let mut block_succs: SmallVec<[LoweredBlock; 128]> = SmallVec::new();
         let mut block_succ_range = SecondaryMap::with_default(0..0);
 
-        let mut indirect_branch_target_clif_blocks = FxHashSet::default();
+        let mut indirect_branch_target_clif_blocks: hashbrown::HashSet<_> = FxHashSet::default();
 
         for block in f.layout.blocks() {
             let start = block_succs.len();
@@ -224,7 +224,7 @@ impl BlockLoweringOrder {
             }
         }
 
-        let lb_to_bindex = FxHashMap::from_iter(
+        let lb_to_bindex: hashbrown::HashMap<_, _> = FxHashMap::from_iter(
             lowered_order
                 .iter()
                 .enumerate()

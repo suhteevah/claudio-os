@@ -86,6 +86,38 @@ fn main() {
         }
     }
 
+    // Post-process: replace std:: with core:: in generated files for no_std compat
+    for entry in std::fs::read_dir(out_dir).expect("read OUT_DIR") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        if path.extension().map_or(false, |e| e == "rs") {
+            let content = std::fs::read_to_string(&path).expect("read generated file");
+            if content.contains("std::") {
+                // Just replace std:: with core:: for everything.
+                // Vec/String/Box are imported via the crate's #[macro_use] extern crate alloc;
+                // and are available as just Vec, String, Box without path prefix.
+                // The generated code uses std::vec::Vec etc. as full paths — replace with
+                // the crate's own re-exported types.
+                let patched = content
+                    .replace("std::vec::Vec", "::alloc::vec::Vec")
+                    .replace("std::string::String", "::alloc::string::String")
+                    .replace("std::boxed::Box", "::alloc::boxed::Box")
+                    .replace("std::slice", "core::slice")
+                    .replace("std::fmt", "core::fmt")
+                    .replace("std::cmp", "core::cmp")
+                    .replace("std::convert", "core::convert")
+                    .replace("std::ops", "core::ops")
+                    .replace("std::mem", "core::mem")
+                    .replace("std::hash", "core::hash")
+                    .replace("std::marker", "core::marker")
+                    .replace("std::iter", "core::iter")
+                    .replace("std::borrow", "::alloc::borrow")
+                    .replace("std::collections", "::alloc::collections");
+                std::fs::write(&path, patched).expect("write patched file");
+            }
+        }
+    }
+
     if env::var("CRANELIFT_VERBOSE").is_ok() {
         for isa in &isas {
             println!("cargo:warning=Includes support for {} ISA", isa.to_string());

@@ -208,7 +208,7 @@ impl<'a> AliasAnalysis<'a> {
 
     fn compute_block_input_states(&mut self, func: &Function) {
         let mut queue = vec![];
-        let mut queue_set = FxHashSet::default();
+        let mut queue_set: hashbrown::HashSet<_> = FxHashSet::default();
         let entry = func.layout.entry_block().unwrap();
         queue.push(entry);
         queue_set.insert(entry);

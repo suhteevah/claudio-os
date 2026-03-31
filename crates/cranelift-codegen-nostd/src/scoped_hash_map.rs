@@ -43,7 +43,7 @@ enum InsertLoc<'a, K: 'a, V: 'a> {
     Occupied(super::hash_map::OccupiedEntry<'a, K, Val<V>>),
 }
 
-impl<'a, K, V> VacantEntry<'a, K, V> {
+impl<'a, K: core::hash::Hash, V> VacantEntry<'a, K, V> {
     /// Sets the value of the entry with the `VacantEntry`'s key.
     pub fn insert(self, value: V) {
         let val = Val {

@@ -3,6 +3,7 @@
 
 /// Helper macro to define methods in `prelude.isle` within `impl Context for
 /// ...` for each backend. These methods are shared amongst all backends.
+use crate::float_compat::{F32Ext, F64Ext};
 #[macro_export]
 #[doc(hidden)]
 macro_rules! isle_common_prelude_methods {

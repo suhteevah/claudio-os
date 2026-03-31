@@ -83,9 +83,13 @@ features = [
 optional = true
 default-features = false
 
+[dependencies.libm]
+version = "0.2"
+default-features = false
+
 [dependencies.hashbrown]
 version = "0.14"
-features = ["raw"]
+features = ["raw", "ahash"]
 default-features = false
 
 [dependencies.log]
