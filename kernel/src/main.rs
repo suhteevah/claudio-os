@@ -62,12 +62,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // ── Phase 0: Enable SSE/SSE2 — required for crypto crates (AES-NI, SHA) ──
+    // The bootloader may or may not enable SSE. We ensure it's on.
+    unsafe {
+        // CR0: clear EM (bit 2), set MP (bit 1) — enable FPU/SSE
+        let mut cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0);
+        cr0 &= !(1 << 2); // clear EM
+        cr0 |= 1 << 1;    // set MP
+        core::arch::asm!("mov cr0, {}", in(reg) cr0);
+
+        // CR4: set OSFXSR (bit 9) + OSXMMEXCPT (bit 10) — enable SSE instructions
+        let mut cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4);
+        cr4 |= (1 << 9) | (1 << 10);
+        core::arch::asm!("mov cr4, {}", in(reg) cr4);
+    }
+
     // ── Phase 0a: Serial debug output (available immediately) ─────────
     serial::init();
 
     // ── Phase 0b: Logger (so all subsequent log::* calls produce output) ──
     logger::init();
     log::info!("[boot] ClaudioOS v{} starting", env!("CARGO_PKG_VERSION"));
+    log::info!("[boot] SSE/SSE2 enabled");
     log::info!("[boot] bootloader handed off control");
 
     // ── Phase 1: CPU structures ──────────────────────────────────────
@@ -271,22 +289,36 @@ async fn main_async() {
                                             claudio_net::tls::tcp_close(stack, h);
                                             return None;
                                         }
-                                        log::debug!("[http] request sent, reading response...");
-                                        let mut buf = alloc::vec![0u8; 16384];
+                                        log::debug!("[http] sent! reading until connection closes...");
+                                        let mut buf = alloc::vec![0u8; 32768];
                                         let mut total = 0;
-                                        for attempt in 0..100 {
+                                        // Read until connection closes (we send Connection: close)
+                                        for _ in 0..500 {
                                             match claudio_net::tls::tcp_recv(stack, h, &mut buf[total..], now) {
-                                                Ok(0) => { log::debug!("[http] connection closed after {} bytes", total); break; }
-                                                Ok(n) => {
-                                                    log::debug!("[http] recv {} bytes (total {})", n, total + n);
-                                                    total += n;
-                                                    if claudio_net::http::HttpResponse::parse(&buf[..total]).is_ok() { break; }
-                                                }
-                                                Err(_) => break,
+                                                Ok(0) => { log::debug!("[http] conn closed, {} bytes", total); break; }
+                                                Ok(n) => { total += n; log::debug!("[http] +{} = {}", n, total); }
+                                                Err(_) => { log::debug!("[http] recv done, {} bytes", total); break; }
                                             }
                                         }
                                         claudio_net::tls::tcp_close(stack, h);
-                                        claudio_net::http::HttpResponse::parse(&buf[..total]).ok()
+                                        if total == 0 { return None; }
+                                        // Parse — handles both Content-Length and chunked
+                                        match claudio_net::http::HttpResponse::parse(&buf[..total]) {
+                                            Ok(r) => Some(r),
+                                            Err(_) => {
+                                                // Chunked: find header end, decode body
+                                                let data = &buf[..total];
+                                                let hdr_end = data.windows(4).position(|w| w == b"\r\n\r\n");
+                                                if let Some(pos) = hdr_end {
+                                                    let hdr = core::str::from_utf8(&data[..pos]).unwrap_or("");
+                                                    let st = hdr.split(' ').nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                                                    let body = claudio_net::http::decode_chunked(&data[pos+4..])
+                                                        .unwrap_or_else(|_| data[pos+4..].to_vec());
+                                                    Some(claudio_net::http::HttpResponse::from_parts(
+                                                        st, alloc::string::String::new(), alloc::vec![], body))
+                                                } else { None }
+                                            }
+                                        }
                                     };
 
                                     // ── Phase 3: Authentication ──────────────────────

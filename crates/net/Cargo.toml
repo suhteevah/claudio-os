@@ -5,8 +5,7 @@ edition.workspace = true
 
 [dependencies]
 smoltcp = { workspace = true }
-# embedded-tls needs SSE target features — requires FPU/SSE init in kernel first
-# Using host-side TLS proxy for development (tools/tls-proxy.py)
+embedded-tls = { workspace = true }
 log = { workspace = true }
 spin = { workspace = true }
 x86_64 = { workspace = true }

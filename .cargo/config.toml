@@ -1,11 +1,12 @@
 [build]
-target = "x86_64-unknown-none"
+target = "x86_64-claudio.json"
 
 [unstable]
 build-std = ["core", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true
 
-[target.x86_64-unknown-none]
+[target.x86_64-claudio]
 runner = """qemu-system-x86_64 \
     -bios /usr/share/OVMF/OVMF_CODE.fd \
     -device virtio-net-pci,netdev=net0 \

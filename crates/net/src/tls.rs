@@ -169,6 +169,12 @@ pub fn tcp_send(
             let sent = socket.send_slice(&data[offset..]).map_err(|_| TcpError::Other)?;
             offset += sent;
             if offset >= data.len() {
+                // Flush: poll a few more times to actually transmit the buffered data
+                for _ in 0..50 {
+                    let ts2 = now();
+                    stack.iface.poll(ts2, &mut stack.device, &mut stack.sockets);
+                    for _ in 0..1000 { core::hint::spin_loop(); }
+                }
                 return Ok(());
             }
         }
@@ -200,7 +206,7 @@ pub fn tcp_recv(
         }
 
         if !socket.is_active() {
-            // Connection closed gracefully.
+            // Connection closed gracefully — return what we have.
             return Ok(0);
         }
     }
