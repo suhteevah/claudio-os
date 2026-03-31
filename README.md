@@ -181,3 +181,15 @@ Physical hardware boot, e1000/I219-V NIC drivers, USB keyboard via xHCI, encrypt
 ## License
 
 AGPL-3.0-or-later -- [Ridge Cell Repair LLC](https://github.com/suhteevah)
+
+---
+
+## Support This Project
+
+If you find this project useful, consider buying me a coffee! Your support helps me keep building and sharing open-source tools.
+
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?logo=paypal)](https://www.paypal.me/baal_hosting)
+
+**PayPal:** [baal_hosting@live.com](https://paypal.me/baal_hosting)
+
+Every donation, no matter how small, is greatly appreciated and motivates continued development. Thank you!

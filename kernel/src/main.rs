@@ -256,24 +256,29 @@ async fn main_async() {
                                     log::info!("[auth] starting device authorization flow...");
 
                                     // Helper: send HTTP through proxy and get response
+                                    static HTTP_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(50000);
                                     let do_http = |stack: &mut claudio_net::NetworkStack, req: claudio_net::HttpRequest| -> Option<claudio_net::HttpResponse> {
                                         let proxy_ip = claudio_net::Ipv4Address::new(10, 0, 2, 2);
-                                        let h = match claudio_net::tls::tcp_connect(stack, proxy_ip, 8443, 49200, now) {
+                                        let local_port = HTTP_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                        let h = match claudio_net::tls::tcp_connect(stack, proxy_ip, 8443, local_port, now) {
                                             Ok(h) => h,
                                             Err(e) => { log::error!("[http] connect: {:?}", e); return None; }
                                         };
                                         let bytes = req.to_bytes();
+                                        log::debug!("[http] sending {} bytes on port {}...", bytes.len(), local_port);
                                         if let Err(e) = claudio_net::tls::tcp_send(stack, h, &bytes, now) {
                                             log::error!("[http] send: {:?}", e);
                                             claudio_net::tls::tcp_close(stack, h);
                                             return None;
                                         }
+                                        log::debug!("[http] request sent, reading response...");
                                         let mut buf = alloc::vec![0u8; 16384];
                                         let mut total = 0;
-                                        for _ in 0..50 {
+                                        for attempt in 0..100 {
                                             match claudio_net::tls::tcp_recv(stack, h, &mut buf[total..], now) {
-                                                Ok(0) => break,
+                                                Ok(0) => { log::debug!("[http] connection closed after {} bytes", total); break; }
                                                 Ok(n) => {
+                                                    log::debug!("[http] recv {} bytes (total {})", n, total + n);
                                                     total += n;
                                                     if claudio_net::http::HttpResponse::parse(&buf[..total]).is_ok() { break; }
                                                 }
@@ -313,14 +318,20 @@ async fn main_async() {
                                             }
                                             Ok(h) => {
                                                 let bytes = relay_req.to_bytes();
+                                                log::debug!("[auth] sending GET /token...");
                                                 if claudio_net::tls::tcp_send(&mut stack, h, &bytes, now).is_ok() {
+                                                    log::debug!("[auth] GET sent, reading response...");
                                                     let mut buf = alloc::vec![0u8; 4096];
                                                     let mut total = 0;
-                                                    for _ in 0..10 {
+                                                    for _ in 0..30 {
                                                         match claudio_net::tls::tcp_recv(&mut stack, h, &mut buf[total..], now) {
                                                             Ok(0) => break,
-                                                            Ok(n) => { total += n; if claudio_net::http::HttpResponse::parse(&buf[..total]).is_ok() { break; } }
-                                                            Err(_) => break,
+                                                            Ok(n) => {
+                                                                total += n;
+                                                                log::debug!("[auth] recv {} bytes (total {})", n, total);
+                                                                if claudio_net::http::HttpResponse::parse(&buf[..total]).is_ok() { break; }
+                                                            }
+                                                            Err(e) => { log::debug!("[auth] recv err: {:?}", e); break; }
                                                         }
                                                     }
                                                     claudio_net::tls::tcp_close(&mut stack, h);
@@ -328,9 +339,14 @@ async fn main_async() {
                                                     if let Ok(resp) = claudio_net::http::HttpResponse::parse(&buf[..total]) {
                                                         if resp.status == 200 {
                                                             if let Ok(body) = core::str::from_utf8(&resp.body) {
-                                                                // Parse {"api_key": "sk-ant-..."}
-                                                                if let Some(start) = body.find("\"api_key\":\"") {
-                                                                    let rest = &body[start + 11..];
+                                                                // Parse {"api_key": "sk-ant-..."} — handle with/without space
+                                                                let needle = if body.contains("\"api_key\": \"") {
+                                                                    "\"api_key\": \""
+                                                                } else {
+                                                                    "\"api_key\":\""
+                                                                };
+                                                                if let Some(start) = body.find(needle) {
+                                                                    let rest = &body[start + needle.len()..];
                                                                     if let Some(end) = rest.find('"') {
                                                                         api_key_buf = alloc::string::String::from(&rest[..end]);
                                                                         log::info!("[auth] token received! ({}... {} chars)", &api_key_buf[..10.min(api_key_buf.len())], api_key_buf.len());
@@ -362,23 +378,7 @@ async fn main_async() {
 
                                     if !api_key.is_empty() {
                                         log::info!("[auth] authenticated! token ready.");
-                                        log::info!("[main] ========================================");
-                                        log::info!("[main] Press ENTER to send first message to Claude");
-                                        log::info!("[main] (costs ~100 output tokens)");
-                                        log::info!("[main] ========================================");
-
-                                        // Wait for Enter keypress
-                                        let kb = keyboard::ScancodeStream::new();
-                                        loop {
-                                            let key = kb.next_key().await;
-                                            match key {
-                                                pc_keyboard::DecodedKey::Unicode('\n') => break,
-                                                pc_keyboard::DecodedKey::Unicode('\r') => break,
-                                                _ => {}
-                                            }
-                                        }
-
-                                        log::info!("[main] sending Messages API request...");
+                                        log::info!("[main] sending first message to Claude (haiku, 20 tokens max)...");
                                         // Haiku — cheapest model. max_tokens:20 to minimize cost.
                                         let body = alloc::format!(
                                             r#"{{"model":"claude-haiku-4-5-20251001","max_tokens":20,"messages":[{{"role":"user","content":"Say hi from bare metal in 10 words"}}]}}"#
