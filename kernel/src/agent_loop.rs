@@ -154,9 +154,6 @@ pub fn run_tool_loop(
                 tool_rounds
             );
 
-            // Also capture any text the model produced alongside tool calls.
-            let text_alongside = api_response.text();
-
             // Record the assistant's tool_use blocks in the conversation.
             // The assistant message may contain both text and tool_use blocks.
             // We need to record the full assistant response as-is.
