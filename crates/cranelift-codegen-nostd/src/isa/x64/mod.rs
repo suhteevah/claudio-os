@@ -178,6 +178,14 @@ impl TargetIsa for X64Backend {
     }
 
 }
+/// Stub — unwind info generation disabled for no_std.
+fn emit_unwind_info(
+    _buffer: &crate::machinst::buffer::MachBufferFinalized<crate::machinst::buffer::Final>,
+    _kind: crate::isa::unwind::UnwindInfoKind,
+) -> crate::CodegenResult<Option<crate::isa::unwind::UnwindInfo>> {
+    Ok(None)
+}
+
 impl fmt::Display for X64Backend {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("MachBackend")

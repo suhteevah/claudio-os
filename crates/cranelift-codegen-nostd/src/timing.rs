@@ -1,27 +1,9 @@
-//! Timing/profiling — disabled for no_std bare metal.
-//! The real module uses thread_local! and std::time which need std.
+//! Timing/profiling — no-op stubs for no_std bare metal.
 
-/// A pass identifier for timing purposes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PassTime(u8);
-
-impl PassTime {
-    fn idx(self) -> usize { self.0 as usize }
-}
-
-impl core::fmt::Display for PassTime {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(f, "pass{}", self.0)
-    }
-}
-
-/// Timing token — no-op on no_std.
+/// Timing token — drops silently (no measurement).
 pub struct TimingToken;
 
-/// Start timing a pass — returns immediately (no-op).
-pub fn take_current() -> PassTimes { PassTimes }
-
-/// Accumulated timing data — empty on no_std.
+/// Accumulated pass times — empty on no_std.
 pub struct PassTimes;
 
 impl core::fmt::Display for PassTimes {
@@ -29,3 +11,25 @@ impl core::fmt::Display for PassTimes {
         write!(f, "(timing disabled)")
     }
 }
+
+/// Take accumulated timing data.
+pub fn take_current() -> PassTimes { PassTimes }
+
+// All pass timing functions — return no-op tokens
+pub fn canonicalize_nans() -> TimingToken { TimingToken }
+pub fn compile() -> TimingToken { TimingToken }
+pub fn domtree() -> TimingToken { TimingToken }
+pub fn egraph() -> TimingToken { TimingToken }
+pub fn flowgraph() -> TimingToken { TimingToken }
+pub fn layout_renumber() -> TimingToken { TimingToken }
+pub fn loop_analysis() -> TimingToken { TimingToken }
+pub fn regalloc() -> TimingToken { TimingToken }
+pub fn regalloc_checker() -> TimingToken { TimingToken }
+pub fn remove_constant_phis() -> TimingToken { TimingToken }
+pub fn store_incremental_cache() -> TimingToken { TimingToken }
+pub fn try_incremental_cache() -> TimingToken { TimingToken }
+pub fn unreachable_code() -> TimingToken { TimingToken }
+pub fn vcode_emit() -> TimingToken { TimingToken }
+pub fn vcode_emit_finish() -> TimingToken { TimingToken }
+pub fn vcode_lower() -> TimingToken { TimingToken }
+pub fn verifier() -> TimingToken { TimingToken }

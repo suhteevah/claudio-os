@@ -1,1 +1,3 @@
-//! Disabled — unwind support removed for no_std
+//! Windows x64 unwind stub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnwindInfo;
