@@ -339,7 +339,7 @@ impl Context {
     #[cfg(feature = "souper-harvest")]
     pub fn souper_harvest(
         &mut self,
-        out: &mut std::sync::mpsc::Sender<String>,
+    #[cfg(feature = "souper-harvest")] out: &mut alloc::vec::Vec<alloc::string::String>,
     ) -> CodegenResult<()> {
         do_souper_harvest(&self.func, out);
         Ok(())

@@ -18,12 +18,14 @@ extern crate alloc;
 
 #[cfg(feature = "std")]
 #[macro_use]
+#[cfg(feature = "std")]
+#[macro_use]
 extern crate std;
 
 #[cfg(not(feature = "std"))]
 use hashbrown::{hash_map, HashMap};
 #[cfg(feature = "std")]
-use std::collections::{hash_map, HashMap};
+use hashbrown::{hash_map, HashMap};
 
 pub use crate::context::Context;
 pub use crate::value_label::{LabelValueLoc, ValueLabelsRanges, ValueLocRange};
@@ -35,7 +37,6 @@ pub use cranelift_bitset as bitset;
 pub use cranelift_control as control;
 pub use cranelift_entity as entity;
 #[cfg(feature = "unwind")]
-pub use gimli;
 
 #[macro_use]
 mod machinst;

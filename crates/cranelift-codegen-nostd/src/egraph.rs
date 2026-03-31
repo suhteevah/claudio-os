@@ -280,7 +280,7 @@ where
         // A pure node always has exactly one result.
         let orig_value = self.func.dfg.first_result(inst);
 
-        let mut optimized_values = std::mem::take(&mut self.optimized_values);
+        let mut optimized_values = core::mem::take(&mut self.optimized_values);
 
         // Limit rewrite depth. When we apply optimization rules, they
         // may create new nodes (values) and those are, recursively,
@@ -808,7 +808,7 @@ impl<'a> CtxEq<(Type, InstructionData), (Type, InstructionData)> for GVNContext<
 
 impl<'a> CtxHash<(Type, InstructionData)> for GVNContext<'a> {
     fn ctx_hash<H: Hasher>(&self, state: &mut H, (ty, inst): &(Type, InstructionData)) {
-        std::hash::Hash::hash(&ty, state);
+        core::hash::Hash::hash(&ty, state);
         inst.hash(state, self.value_lists, |value| self.union_find.find(value));
     }
 }

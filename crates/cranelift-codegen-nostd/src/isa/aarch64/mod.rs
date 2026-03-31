@@ -148,7 +148,6 @@ impl TargetIsa for AArch64Backend {
     }
 
     #[cfg(feature = "unwind")]
-    fn create_systemv_cie(&self) -> Option<gimli::write::CommonInformationEntry> {
         let is_apple_os = match self.triple.operating_system {
             OperatingSystem::Darwin(_)
             | OperatingSystem::IOS(_)

@@ -24,7 +24,7 @@ use crate::machinst::{
 };
 use alloc::vec::Vec;
 use regalloc2::PReg;
-use std::boxed::Box;
+use alloc::boxed::Box;
 
 /// Type representing out-of-line data for calls. This type optional because the
 /// call instruction is also used by Winch to emit calls, but the

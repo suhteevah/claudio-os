@@ -125,11 +125,6 @@ impl TargetIsa for X64Backend {
     }
 
     #[cfg(feature = "unwind")]
-    fn create_systemv_cie(&self) -> Option<gimli::write::CommonInformationEntry> {
-        Some(inst::unwind::systemv::create_cie())
-    }
-
-    #[cfg(feature = "unwind")]
     fn map_regalloc_reg_to_dwarf(&self, reg: Reg) -> Result<u16, systemv::RegisterMappingError> {
         inst::unwind::systemv::map_reg(reg).map(|reg| reg.0)
     }
@@ -181,34 +176,8 @@ impl TargetIsa for X64Backend {
     fn has_x86_pmaddubsw_lowering(&self) -> bool {
         self.x64_flags.use_ssse3()
     }
-}
 
-/// Emit unwind info for an x86 target.
-pub fn emit_unwind_info(
-    buffer: &MachBufferFinalized<Final>,
-    kind: crate::isa::unwind::UnwindInfoKind,
-) -> CodegenResult<Option<crate::isa::unwind::UnwindInfo>> {
-    use crate::isa::unwind::{UnwindInfo, UnwindInfoKind};
-    Ok(match kind {
-        UnwindInfoKind::SystemV => {
-            let mapper = self::inst::unwind::systemv::RegisterMapper;
-            Some(UnwindInfo::SystemV(
-                crate::isa::unwind::systemv::create_unwind_info_from_insts(
-                    &buffer.unwind_info[..],
-                    buffer.data().len(),
-                    &mapper,
-                )?,
-            ))
-        }
-        UnwindInfoKind::Windows => Some(UnwindInfo::WindowsX64(
-            crate::isa::unwind::winx64::create_unwind_info_from_insts::<
-                self::inst::unwind::winx64::RegisterMapper,
-            >(&buffer.unwind_info[..])?,
-        )),
-        _ => None,
-    })
 }
-
 impl fmt::Display for X64Backend {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("MachBackend")

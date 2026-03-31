@@ -102,6 +102,11 @@ default-features = false
 version = "=29.0.1"
 optional = true
 
+[dependencies.spin]
+version = "0.9"
+default-features = false
+features = ["once"]
+
 [dependencies.regalloc2]
 version = "0.11.1"
 default-features = false

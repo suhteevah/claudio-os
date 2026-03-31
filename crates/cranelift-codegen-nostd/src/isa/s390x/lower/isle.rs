@@ -28,9 +28,9 @@ use crate::{
 };
 use regalloc2::PReg;
 use smallvec::smallvec;
-use std::boxed::Box;
-use std::cell::Cell;
-use std::vec::Vec;
+use alloc::boxed::Box;
+use core::cell::Cell;
+use alloc::vec::Vec;
 
 type BoxCallInfo = Box<CallInfo<ExternalName>>;
 type BoxCallIndInfo = Box<CallInfo<Reg>>;
@@ -783,7 +783,7 @@ impl generated_code::Context for IsleContext<'_, '_, MInst, S390xBackend> {
     #[inline]
     fn fcvt_to_sint_lb32(&mut self, size: u8) -> u64 {
         let lb = (-2.0_f32).powi((size - 1).into());
-        std::cmp::max(lb.to_bits() + 1, (lb - 1.0).to_bits()) as u64
+        core::cmp::max(lb.to_bits() + 1, (lb - 1.0).to_bits()) as u64
     }
 
     #[inline]
@@ -794,7 +794,7 @@ impl generated_code::Context for IsleContext<'_, '_, MInst, S390xBackend> {
     #[inline]
     fn fcvt_to_sint_lb64(&mut self, size: u8) -> u64 {
         let lb = (-2.0_f64).powi((size - 1).into());
-        std::cmp::max(lb.to_bits() + 1, (lb - 1.0).to_bits())
+        core::cmp::max(lb.to_bits() + 1, (lb - 1.0).to_bits())
     }
 
     #[inline]

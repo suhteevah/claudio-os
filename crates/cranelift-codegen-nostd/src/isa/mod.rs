@@ -23,7 +23,7 @@
 //! # #[macro_use] extern crate target_lexicon;
 //! use cranelift_codegen::isa;
 //! use cranelift_codegen::settings::{self, Configurable};
-//! use std::str::FromStr;
+//! use core::str::FromStr;
 //! use target_lexicon::Triple;
 //!
 //! let shared_builder = settings::builder();
@@ -145,7 +145,7 @@ pub enum LookupError {
 
 // This is manually implementing Error and Display instead of using thiserror to reduce the amount
 // of dependencies used by Cranelift.
-impl std::error::Error for LookupError {}
+impl core::error::Error for LookupError {}
 
 impl fmt::Display for LookupError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
@@ -332,11 +332,6 @@ pub trait TargetIsa: fmt::Display + Send + Sync {
     /// Creates a new System V Common Information Entry for the ISA.
     ///
     /// Returns `None` if the ISA does not support System V unwind information.
-    #[cfg(feature = "unwind")]
-    fn create_systemv_cie(&self) -> Option<gimli::write::CommonInformationEntry> {
-        // By default, an ISA cannot create a System V CIE
-        None
-    }
 
     /// Returns an object that can be used to build the text section of an
     /// executable.
@@ -395,8 +390,8 @@ pub trait TargetIsa: fmt::Display + Send + Sync {
     /// Returns whether the CLIF `x86_pmaddubsw` instruction is implemented for
     /// this ISA.
     fn has_x86_pmaddubsw_lowering(&self) -> bool;
-}
 
+}
 /// Function alignment specifications as required by an ISA, returned by
 /// [`TargetIsa::function_alignment`].
 #[derive(Copy, Clone)]

@@ -1,2 +1,1 @@
-#[cfg(feature = "unwind")]
-pub(crate) mod systemv;
+//! Disabled — unwind support removed for no_std

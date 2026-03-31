@@ -422,7 +422,7 @@ pub struct OpenPatchRegion(usize);
 /// the [`PatchRegion::patch`] function can be used to get a mutable buffer to the instruction
 /// bytes, and the constants uses can be updated directly.
 pub struct PatchRegion {
-    range: std::ops::Range<usize>,
+    range: core::ops::Range<usize>,
 }
 
 impl PatchRegion {

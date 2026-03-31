@@ -351,7 +351,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
             } else {
                 // Every arg takes a minimum slot of 8 bytes. (16-byte stack
                 // alignment happens separately after all args.)
-                std::cmp::max(size, 8)
+                core::cmp::max(size, 8)
             };
 
             if !is_winch_return {

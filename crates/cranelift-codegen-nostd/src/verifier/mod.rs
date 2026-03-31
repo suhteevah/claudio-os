@@ -100,7 +100,7 @@ pub struct VerifierError {
 
 // This is manually implementing Error and Display instead of using thiserror to reduce the amount
 // of dependencies used by Cranelift.
-impl std::error::Error for VerifierError {}
+impl core::error::Error for VerifierError {}
 
 impl Display for VerifierError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
@@ -179,7 +179,7 @@ pub struct VerifierErrors(pub Vec<VerifierError>);
 
 // This is manually implementing Error and Display instead of using thiserror to reduce the amount
 // of dependencies used by Cranelift.
-impl std::error::Error for VerifierErrors {}
+impl core::error::Error for VerifierErrors {}
 
 impl VerifierErrors {
     /// Return a new `VerifierErrors` struct.

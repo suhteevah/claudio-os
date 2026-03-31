@@ -391,7 +391,7 @@ impl<T: CompilePhase> CompiledCodeBase<T> {
         params: Option<&crate::ir::function::FunctionParameters>,
         cs: &capstone::Capstone,
     ) -> Result<String, anyhow::Error> {
-        use std::fmt::Write;
+        use core::fmt::Write;
 
         let mut buf = String::new();
 

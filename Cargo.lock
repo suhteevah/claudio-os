@@ -315,6 +315,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "smallvec",
+ "spin",
  "target-lexicon",
 ]
 

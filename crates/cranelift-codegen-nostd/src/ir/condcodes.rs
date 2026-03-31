@@ -344,7 +344,7 @@ impl FromStr for FloatCC {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(test)] use std::string::ToString;
+    #[cfg(test)] use alloc::string::ToString;
 
     #[test]
     fn int_complement() {

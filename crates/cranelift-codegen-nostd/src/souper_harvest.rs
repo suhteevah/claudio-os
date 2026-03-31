@@ -1,3 +1,4 @@
+#![cfg(all(feature = "souper-harvest", feature = "std"))]
 //! Harvest left-hand side superoptimization candidates.
 //!
 //! Given a clif function, harvest all its integer subexpressions, so that they
@@ -27,9 +28,9 @@
 use crate::ir;
 use souper_ir::ast;
 use std::collections::{HashMap, HashSet};
-use std::string::String;
-use std::sync::mpsc;
-use std::vec::Vec;
+use alloc::string::String;
+use core::marker;
+use alloc::vec::Vec;
 
 /// Harvest Souper left-hand side candidates from the given function.
 ///

@@ -139,7 +139,6 @@ impl TargetIsa for S390xBackend {
     }
 
     #[cfg(feature = "unwind")]
-    fn create_systemv_cie(&self) -> Option<gimli::write::CommonInformationEntry> {
         Some(inst::unwind::systemv::create_cie())
     }
 
