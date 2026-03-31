@@ -249,6 +249,34 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                 "required": ["command"]
             }),
         },
+        ToolSpec {
+            name: "compile_rust".into(),
+            description: "Compile Rust source code via the remote build server. \
+                Sends the source to the host-side build server which runs rustc \
+                and returns compilation output (errors, warnings). Use this to \
+                check if Rust code compiles, see error messages, and iterate on fixes."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Complete Rust source code to compile"
+                    },
+                    "edition": {
+                        "type": "string",
+                        "description": "Rust edition (default: 2021)",
+                        "enum": ["2015", "2018", "2021", "2024"]
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "Compilation mode: 'check' (default, fast) or 'build' (full)",
+                        "enum": ["check", "build"]
+                    }
+                },
+                "required": ["source"]
+            }),
+        },
     ]
 }
 
@@ -273,6 +301,7 @@ pub fn execute_tool(call: &ToolCall) -> ToolResult {
         "file_write" => execute_file_write(call),
         "list_directory" => execute_list_dir(call),
         "execute_command" => execute_command(call),
+        "compile_rust" => execute_compile_rust(call),
         _ => {
             log::warn!("[tools] unknown tool: {}", call.name);
             return ToolResult {
@@ -410,4 +439,207 @@ fn execute_command(call: &ToolCall) -> ToolResult {
         ),
         is_error: true,
     }
+}
+
+// ---------------------------------------------------------------------------
+// compile_rust — remote compilation via host-side build server
+// ---------------------------------------------------------------------------
+
+/// Port the build server listens on (host side).
+const BUILD_SERVER_PORT: u16 = 8445;
+
+/// Build a JSON request body for the build server's /compile endpoint.
+fn build_compile_request(source: &str, edition: &str, mode: &str) -> Vec<u8> {
+    let req = serde_json::json!({
+        "source": source,
+        "edition": edition,
+        "mode": mode,
+    });
+    serde_json::to_vec(&req).unwrap_or_default()
+}
+
+/// Format the build server response into a human-readable string for the agent.
+fn format_compile_result(success: bool, stdout: &str, stderr: &str) -> String {
+    let mut out = String::new();
+
+    if success {
+        out.push_str("Compilation successful!\n");
+    } else {
+        out.push_str("Compilation FAILED.\n");
+    }
+
+    if !stdout.is_empty() {
+        out.push_str("\n--- stdout ---\n");
+        out.push_str(stdout);
+    }
+
+    if !stderr.is_empty() {
+        out.push_str("\n--- stderr ---\n");
+        out.push_str(stderr);
+    }
+
+    if stdout.is_empty() && stderr.is_empty() && success {
+        out.push_str("(no warnings)");
+    }
+
+    out
+}
+
+/// Execute the `compile_rust` tool.
+///
+/// Sends the Rust source to the host-side build server at 10.0.2.2:8445
+/// (QEMU SLIRP gateway) via plain HTTP. The build server runs `rustc` and
+/// returns compilation output.
+///
+/// The actual network call is deferred to the kernel's agent loop, which has
+/// access to the network stack. This function builds the request and parses
+/// the response. The kernel injects a `COMPILE_RUST_HANDLER` function pointer
+/// that performs the TCP I/O.
+///
+/// If no handler is registered (e.g. in unit tests), falls back to an error.
+fn execute_compile_rust(call: &ToolCall) -> ToolResult {
+    let source = match get_string_field(&call.input, "source") {
+        Ok(s) => s,
+        Err(e) => {
+            return ToolResult {
+                tool_use_id: call.id.clone(),
+                content: e,
+                is_error: true,
+            };
+        }
+    };
+
+    let edition = call
+        .input
+        .get("edition")
+        .and_then(Value::as_str)
+        .unwrap_or("2021");
+
+    let mode = call
+        .input
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("check");
+
+    log::info!(
+        "[tools] compile_rust: {} bytes, edition={}, mode={}",
+        source.len(),
+        edition,
+        mode
+    );
+
+    // Build the JSON body for the build server.
+    let body = build_compile_request(source, edition, mode);
+
+    // Check if a compile handler has been registered by the kernel.
+    let handler = unsafe { COMPILE_RUST_HANDLER };
+    match handler {
+        Some(h) => {
+            // Call the kernel-provided handler to perform the HTTP request.
+            match h(&body) {
+                Ok(response_bytes) => parse_compile_response(call, &response_bytes),
+                Err(e) => ToolResult {
+                    tool_use_id: call.id.clone(),
+                    content: format!(
+                        "Build server request failed: {}. \
+                         Make sure the build server is running: \
+                         python tools/build-server.py",
+                        e
+                    ),
+                    is_error: true,
+                },
+            }
+        }
+        None => ToolResult {
+            tool_use_id: call.id.clone(),
+            content: String::from(
+                "compile_rust: no network handler registered. \
+                 The kernel must call set_compile_handler() at init.",
+            ),
+            is_error: true,
+        },
+    }
+}
+
+/// Parse the HTTP response from the build server into a ToolResult.
+fn parse_compile_response(call: &ToolCall, raw: &[u8]) -> ToolResult {
+    // Find body after HTTP headers.
+    let body_start = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(0);
+    let body = &raw[body_start..];
+
+    let body_str = match core::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => {
+            return ToolResult {
+                tool_use_id: call.id.clone(),
+                content: String::from("build server returned non-UTF8 response"),
+                is_error: true,
+            };
+        }
+    };
+
+    // Parse JSON response.
+    let parsed: Result<Value, _> = serde_json::from_str(body_str);
+    match parsed {
+        Ok(val) => {
+            let success = val.get("success").and_then(Value::as_bool).unwrap_or(false);
+            let stdout = val.get("stdout").and_then(Value::as_str).unwrap_or("");
+            let stderr = val.get("stderr").and_then(Value::as_str).unwrap_or("");
+
+            let content = format_compile_result(success, stdout, stderr);
+            ToolResult {
+                tool_use_id: call.id.clone(),
+                content,
+                is_error: !success,
+            }
+        }
+        Err(e) => {
+            // Maybe the body is the error message directly.
+            ToolResult {
+                tool_use_id: call.id.clone(),
+                content: format!(
+                    "Failed to parse build server response: {}\nRaw: {}",
+                    e,
+                    &body_str[..core::cmp::min(body_str.len(), 500)]
+                ),
+                is_error: true,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compile handler — function pointer injected by the kernel
+// ---------------------------------------------------------------------------
+
+/// Type for the compile handler function.
+///
+/// The kernel registers a function that takes the JSON request body bytes
+/// and returns the raw HTTP response bytes (or an error string).
+/// This allows the `no_std` api-client crate to delegate networking to the
+/// kernel, which owns the network stack.
+pub type CompileHandler = fn(&[u8]) -> Result<Vec<u8>, String>;
+
+/// Global compile handler — set by the kernel at startup.
+///
+/// SAFETY: This is only written once during kernel init (single-threaded boot)
+/// and read during tool execution. In a multi-agent scenario the handler is
+/// read-only after init.
+static mut COMPILE_RUST_HANDLER: Option<CompileHandler> = None;
+
+/// Register the compile handler. Called by the kernel during init.
+///
+/// # Safety
+/// Must be called once during single-threaded kernel initialization.
+pub unsafe fn set_compile_handler(handler: CompileHandler) {
+    COMPILE_RUST_HANDLER = Some(handler);
+}
+
+/// Get the build server port (for use by the kernel's handler implementation).
+pub const fn build_server_port() -> u16 {
+    BUILD_SERVER_PORT
 }

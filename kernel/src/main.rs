@@ -427,6 +427,15 @@ async fn main_async() {
                         log::info!("[main]   n = focus next, p = focus prev");
                         log::info!("[main]   c = new agent, x = close pane");
 
+                        // Register the compile_rust tool handler so agents
+                        // can compile Rust code via the host build server.
+                        unsafe {
+                            agent_loop::init_compile_handler(
+                                &mut stack as *mut _,
+                                now,
+                            );
+                        }
+
                         let fb_w = framebuffer::width();
                         let fb_h = framebuffer::height();
                         dashboard::run_dashboard(

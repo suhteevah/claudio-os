@@ -26,6 +26,7 @@ use claudio_api::messages::{
 };
 use claudio_api::tools::{
     builtin_tool_definitions, execute_tool, extract_tool_calls_from_response,
+    build_server_port,
 };
 use claudio_net::NetworkStack;
 
@@ -37,6 +38,116 @@ static RNG_SEED: AtomicU64 = AtomicU64::new(1);
 /// Maximum number of consecutive tool-use rounds before we force-stop.
 /// Prevents runaway loops if the model keeps requesting tools.
 const MAX_TOOL_ROUNDS: usize = 20;
+
+// ---------------------------------------------------------------------------
+// Build server compile handler
+// ---------------------------------------------------------------------------
+
+/// Global network stack reference for the compile handler.
+///
+/// The compile handler is a plain `fn` pointer (not a closure), so it cannot
+/// capture the network stack. We store a pointer here during init.
+///
+/// SAFETY: Set once during single-threaded boot, read during tool execution.
+/// The network stack outlives all agent sessions.
+static mut BUILD_STACK: Option<*mut NetworkStack> = None;
+static mut BUILD_NOW_FN: Option<fn() -> claudio_net::Instant> = None;
+
+/// Initialize the compile_rust tool handler.
+///
+/// Must be called once during kernel init, before any agent sessions start.
+/// Registers a function pointer that the api-client's `execute_tool` can call
+/// to reach the host-side build server.
+///
+/// # Safety
+/// - `stack` must remain valid for the entire runtime.
+/// - Must be called once from a single thread during init.
+pub unsafe fn init_compile_handler(
+    stack: *mut NetworkStack,
+    now: fn() -> claudio_net::Instant,
+) {
+    BUILD_STACK = Some(stack);
+    BUILD_NOW_FN = Some(now);
+    claudio_api::tools::set_compile_handler(compile_handler);
+    log::info!("[agent_loop] compile_rust handler registered (build server port {})", build_server_port());
+}
+
+/// The compile handler called by `execute_tool("compile_rust")`.
+///
+/// Sends an HTTP POST to the build server at 10.0.2.2:{BUILD_SERVER_PORT}
+/// and returns the raw HTTP response bytes.
+fn compile_handler(body: &[u8]) -> Result<Vec<u8>, String> {
+    let stack = unsafe {
+        BUILD_STACK
+            .and_then(|p| p.as_mut())
+            .ok_or_else(|| String::from("network stack not initialized"))?
+    };
+    let now = unsafe {
+        BUILD_NOW_FN.ok_or_else(|| String::from("time function not initialized"))?
+    };
+
+    let port = build_server_port();
+
+    // Build HTTP request to the build server.
+    let http_req = claudio_net::http::HttpRequest::post(
+        "10.0.2.2",        // QEMU SLIRP host gateway
+        "/compile",
+        body.to_vec(),
+    )
+    .header("Content-Type", "application/json")
+    .header("Connection", "close");
+
+    let req_bytes = http_req.to_bytes();
+    log::debug!(
+        "[compile] sending {} bytes to build server at 10.0.2.2:{}",
+        req_bytes.len(),
+        port
+    );
+
+    // Connect via TCP (plain HTTP, no TLS needed for local build server).
+    let local_port = RNG_SEED.fetch_add(1, Ordering::Relaxed) as u16 + 55000;
+    let server_ip = claudio_net::Ipv4Address::new(10, 0, 2, 2);
+
+    let handle = claudio_net::tls::tcp_connect(stack, server_ip, port, local_port, now)
+        .map_err(|e| {
+            alloc::format!(
+                "build server connect failed: {:?}. Run: python tools/build-server.py",
+                e
+            )
+        })?;
+
+    // Send the request.
+    claudio_net::tls::tcp_send(stack, handle, &req_bytes, now).map_err(|e| {
+        claudio_net::tls::tcp_close(stack, handle);
+        alloc::format!("build server send failed: {:?}", e)
+    })?;
+
+    // Read the response.
+    let mut buf = alloc::vec![0u8; 65536];
+    let mut total = 0;
+    for _ in 0..500 {
+        match claudio_net::tls::tcp_recv(stack, handle, &mut buf[total..], now) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                if total >= buf.len() - 1024 {
+                    break; // Buffer nearly full
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    claudio_net::tls::tcp_close(stack, handle);
+
+    if total == 0 {
+        return Err(String::from(
+            "no response from build server. Is it running? python tools/build-server.py",
+        ));
+    }
+
+    log::debug!("[compile] received {} bytes from build server", total);
+    Ok(buf[..total].to_vec())
+}
 
 // ---------------------------------------------------------------------------
 // Public API: core tool-use loop (used by dashboard)
@@ -172,6 +283,9 @@ pub fn run_tool_loop(
                     format!("\"{}\"", path)
                 } else if let Some(cmd) = tc.input.get("command").and_then(|v| v.as_str()) {
                     format!("\"{}\"", cmd)
+                } else if let Some(src) = tc.input.get("source").and_then(|v| v.as_str()) {
+                    let lines = src.lines().count();
+                    format!("{} bytes, {} lines", src.len(), lines)
                 } else {
                     String::from("...")
                 };
@@ -229,7 +343,7 @@ pub async fn run_agent(
 ) {
     log::info!("[agent_loop] starting interactive agent loop");
     log::info!("[agent_loop] type a message and press Enter to chat with Claude");
-    log::info!("[agent_loop] tools: file_read, file_write, list_directory, execute_command");
+    log::info!("[agent_loop] tools: file_read, file_write, list_directory, execute_command, compile_rust");
     log::info!("[agent_loop] commands: /quit, /clear, /tokens");
 
     // Create a session with id=0, pane=0 (single-agent for now).

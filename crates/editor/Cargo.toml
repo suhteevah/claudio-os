@@ -1,0 +1,8 @@
+[package]
+name = "claudio-editor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pc-keyboard = { workspace = true }
+log = { workspace = true }

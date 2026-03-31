@@ -1,0 +1,8 @@
+[package]
+name = "python-lite"
+version.workspace = true
+edition.workspace = true
+description = "Minimal Python-like interpreter for ClaudioOS bare-metal environment"
+
+[dependencies]
+log = { workspace = true }

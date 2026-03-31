@@ -157,6 +157,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "claudio-editor"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "pc-keyboard",
+]
+
+[[package]]
 name = "claudio-fs"
 version = "0.1.0"
 dependencies = [
