@@ -2,8 +2,8 @@
 //!
 //! Implements the VirtIO 0.9.5 (legacy) interface over PCI I/O ports.
 //! Two virtqueues are used: RX (queue 0) and TX (queue 1). Each queue has a
-//! descriptor table, available ring, and used ring allocated from the kernel
-//! heap and communicated to the device as physical page numbers.
+//! descriptor table, available ring, and used ring allocated as a single
+//! contiguous page-aligned region per the legacy spec.
 //!
 //! The driver pre-populates RX descriptors with 2048-byte buffers so the
 //! device can DMA incoming frames into them. On transmit, a descriptor is
@@ -13,7 +13,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr;
 use core::sync::atomic::{self, Ordering};
@@ -47,6 +46,7 @@ const VIRTIO_STATUS_ACK: u8 = 1;
 const VIRTIO_STATUS_DRIVER: u8 = 2;
 const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
+const _VIRTIO_STATUS_FAILED: u8 = 128;
 
 // ---------------------------------------------------------------------------
 // Feature bits we care about
@@ -136,11 +136,14 @@ struct VirtqUsed {
 // ---------------------------------------------------------------------------
 
 struct VirtQueue {
-    /// Heap-allocated, page-aligned descriptor table.
+    /// Base pointer of the contiguous legacy allocation.
+    /// Descriptor table starts here.
+    base: *mut u8,
+    /// Pointer to the descriptor table (same as base, typed).
     descs: *mut VirtqDesc,
-    /// Heap-allocated available ring.
+    /// Pointer to the available ring.
     avail: *mut VirtqAvail,
-    /// Heap-allocated used ring.
+    /// Pointer to the used ring.
     used: *mut VirtqUsed,
     /// Actual queue size reported by the device (<= QUEUE_SIZE).
     queue_size: u16,
@@ -152,107 +155,121 @@ struct VirtQueue {
     last_used_idx: u16,
     /// Pre-allocated DMA-safe buffers, one per descriptor.
     buffers: Vec<Box<[u8; BUF_SIZE]>>,
-    /// Physical memory offset for virt→phys translation.
+    /// Physical memory offset for virt->phys translation.
+    ///
+    /// With the bootloader's offset page table mapping:
+    ///   virt_addr = phys_addr + phys_mem_offset
+    /// So: phys = virt - phys_mem_offset
+    ///
+    /// IMPORTANT: This only works for memory in the bootloader's physical
+    /// memory mapping region. Our kernel heap is mapped separately at
+    /// HEAP_START (0x4444_4444_0000) and does NOT follow this formula.
+    /// For heap allocations we need the actual physical frames backing them.
+    /// However, the bootloader crate's OffsetPageTable means all physical
+    /// memory is accessible at phys + offset, and for DMA we need the
+    /// reverse mapping. Since the heap pages were allocated from the
+    /// physical frame allocator, we can walk the page tables to find the
+    /// physical address. For simplicity, we use a large page-aligned
+    /// allocation which the frame allocator backs with contiguous frames
+    /// starting from the allocated virtual address's backing frame.
     phys_mem_offset: u64,
 }
 
 impl VirtQueue {
-    /// Allocate and initialize a virtqueue.
+    /// Convert a virtual address to a physical address.
     ///
-    /// `phys_mem_offset` is the bootloader-provided offset such that
-    /// `virt - phys_mem_offset == phys`. With `OffsetPageTable`, the kernel
-    /// heap is identity-mapped through this offset.
-    fn new(queue_size: u16, phys_mem_offset: u64) -> Self {
-        let qs = queue_size as usize;
-
-        // Allocate descriptor table — must be 16-byte aligned (struct is
-        // repr(C, align(16))).
-        let descs = {
-            let mut v = vec![
-                VirtqDesc {
-                    addr: 0,
-                    len: 0,
-                    flags: 0,
-                    next: 0
-                };
-                qs
-            ];
-            // Chain free descriptors: each points to next.
-            for i in 0..qs {
-                v[i].next = if i + 1 < qs { (i + 1) as u16 } else { 0 };
-                v[i].flags = VIRTQ_DESC_F_NEXT;
-            }
-            let ptr = v.as_mut_ptr();
-            core::mem::forget(v);
-            ptr
-        };
-
-        // Allocate available ring.
-        let avail: *mut VirtqAvail = {
-            let layout = alloc::alloc::Layout::new::<VirtqAvail>();
-            let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut VirtqAvail };
-            assert!(!ptr.is_null(), "failed to allocate avail ring");
-            ptr
-        };
-
-        // Allocate used ring.
-        let used: *mut VirtqUsed = {
-            let layout = alloc::alloc::Layout::new::<VirtqUsed>();
-            let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut VirtqUsed };
-            assert!(!ptr.is_null(), "failed to allocate used ring");
-            ptr
-        };
-
-        // Pre-allocate buffers.
-        let mut buffers = Vec::with_capacity(qs);
-        for _ in 0..qs {
-            buffers.push(Box::new([0u8; BUF_SIZE]));
-        }
-
-        Self {
-            descs,
-            avail,
-            used,
-            queue_size,
-            free_head: 0,
-            num_free: queue_size,
-            last_used_idx: 0,
-            buffers,
-            phys_mem_offset,
-        }
-    }
-
-    /// Convert a virtual address to a physical address using the offset
-    /// mapping provided by the bootloader.
+    /// This walks the page table to find the physical address backing a
+    /// virtual address. For heap-allocated memory, the simple
+    /// `virt - phys_mem_offset` formula does NOT work because the heap is
+    /// mapped at a different virtual range (0x4444_4444_0000).
+    ///
+    /// We use the x86_64 page table registers to do the translation.
     fn virt_to_phys(&self, virt: usize) -> u64 {
-        // With the bootloader's offset mapping, virtual addresses in the
-        // direct-physical mapping region satisfy:
-        //   virt_addr = phys_addr + phys_mem_offset
-        // So: phys = virt - phys_mem_offset
-        (virt as u64).wrapping_sub(self.phys_mem_offset)
+        // For addresses in the physical memory mapping region
+        // (phys_mem_offset .. phys_mem_offset + phys_mem_size),
+        // the formula is: phys = virt - phys_mem_offset.
+        //
+        // For heap addresses (starting at 0x4444_4444_0000), we need to
+        // walk the page tables. We do this by reading CR3 and manually
+        // traversing the 4-level page table.
+        let virt_addr = x86_64::VirtAddr::new(virt as u64);
+        let phys_mem_offset = x86_64::VirtAddr::new(self.phys_mem_offset);
+
+        // Read CR3 to get the level 4 page table physical address
+        let (l4_frame, _) = x86_64::registers::control::Cr3::read();
+        let l4_phys = l4_frame.start_address();
+        let l4_virt = phys_mem_offset + l4_phys.as_u64();
+        let l4_table = unsafe { &*(l4_virt.as_ptr() as *const x86_64::structures::paging::PageTable) };
+
+        // Level 4 index
+        let l4_idx = virt_addr.p4_index();
+        let l4_entry = &l4_table[l4_idx];
+        if l4_entry.is_unused() {
+            panic!("[virtio-net] virt_to_phys: L4 entry unused for {:#x}", virt);
+        }
+        let l3_phys = l4_entry.addr();
+        let l3_virt = phys_mem_offset + l3_phys.as_u64();
+        let l3_table = unsafe { &*(l3_virt.as_ptr() as *const x86_64::structures::paging::PageTable) };
+
+        // Level 3 index
+        let l3_idx = virt_addr.p3_index();
+        let l3_entry = &l3_table[l3_idx];
+        if l3_entry.is_unused() {
+            panic!("[virtio-net] virt_to_phys: L3 entry unused for {:#x}", virt);
+        }
+        // Check for 1GiB huge page
+        if l3_entry.flags().contains(x86_64::structures::paging::PageTableFlags::HUGE_PAGE) {
+            let base = l3_entry.addr().as_u64();
+            let offset = virt as u64 & 0x3FFF_FFFF; // 30-bit offset within 1GiB page
+            return base + offset;
+        }
+
+        let l2_phys = l3_entry.addr();
+        let l2_virt = phys_mem_offset + l2_phys.as_u64();
+        let l2_table = unsafe { &*(l2_virt.as_ptr() as *const x86_64::structures::paging::PageTable) };
+
+        // Level 2 index
+        let l2_idx = virt_addr.p2_index();
+        let l2_entry = &l2_table[l2_idx];
+        if l2_entry.is_unused() {
+            panic!("[virtio-net] virt_to_phys: L2 entry unused for {:#x}", virt);
+        }
+        // Check for 2MiB huge page
+        if l2_entry.flags().contains(x86_64::structures::paging::PageTableFlags::HUGE_PAGE) {
+            let base = l2_entry.addr().as_u64();
+            let offset = virt as u64 & 0x1F_FFFF; // 21-bit offset within 2MiB page
+            return base + offset;
+        }
+
+        let l1_phys = l2_entry.addr();
+        let l1_virt = phys_mem_offset + l1_phys.as_u64();
+        let l1_table = unsafe { &*(l1_virt.as_ptr() as *const x86_64::structures::paging::PageTable) };
+
+        // Level 1 index
+        let l1_idx = virt_addr.p1_index();
+        let l1_entry = &l1_table[l1_idx];
+        if l1_entry.is_unused() {
+            panic!("[virtio-net] virt_to_phys: L1 entry unused for {:#x}", virt);
+        }
+        let frame_phys = l1_entry.addr().as_u64();
+        let page_offset = virt as u64 & 0xFFF; // 12-bit offset within 4KiB page
+        frame_phys + page_offset
     }
 
-    /// Physical address of the descriptor table (page-aligned base).
+    /// Physical address of the descriptor table.
     fn descs_phys(&self) -> u64 {
         self.virt_to_phys(self.descs as usize)
     }
 
     /// The legacy VirtIO address register receives the queue's physical page
-    /// frame number — i.e. the physical address of the descriptor table
-    /// shifted right by 12 bits.
-    ///
-    /// NOTE: In legacy VirtIO the descriptor table, available ring, and used
-    /// ring are expected to be laid out in a specific contiguous fashion. QEMU
-    /// is lenient with separate allocations as long as we write the descriptor
-    /// PFN correctly, but the spec technically requires them to be in a single
-    /// contiguous allocation.  For robustness we compute the full legacy
-    /// layout and use a single allocation in `new_legacy()`.
+    /// frame number -- the physical address of the descriptor table shifted
+    /// right by 12 bits.
     fn pfn(&self) -> u32 {
         (self.descs_phys() >> 12) as u32
     }
 
-    /// Allocate one descriptor index from the free list. Returns `None` if the
-    /// queue is full.
+    /// Allocate one descriptor index from the free list. Returns `None` if
+    /// the queue is full.
     fn alloc_desc(&mut self) -> Option<u16> {
         if self.num_free == 0 {
             return None;
@@ -268,18 +285,19 @@ impl VirtQueue {
     fn free_desc(&mut self, idx: u16) {
         unsafe {
             let desc = &mut *self.descs.add(idx as usize);
-            desc.flags = VIRTQ_DESC_F_NEXT;
+            desc.flags = 0;
             desc.next = self.free_head;
         }
         self.free_head = idx;
         self.num_free += 1;
     }
 
-    /// Push a descriptor head into the available ring so the device can see it.
+    /// Push a descriptor head into the available ring so the device can see
+    /// it.
     fn push_avail(&mut self, desc_idx: u16) {
         unsafe {
             let avail = &mut *self.avail;
-            let ring_idx = (avail.idx as usize) % QUEUE_SIZE;
+            let ring_idx = (avail.idx as usize) % (self.queue_size as usize);
             avail.ring[ring_idx] = desc_idx;
             // Memory barrier: make sure descriptor writes are visible before
             // we update the index.
@@ -289,14 +307,14 @@ impl VirtQueue {
     }
 
     /// Check whether the device has completed any descriptors since our last
-    /// check. Returns an iterator of `(descriptor_index, bytes_written)`.
+    /// check. Returns `Some((descriptor_index, bytes_written))`.
     fn pop_used(&mut self) -> Option<(u16, u32)> {
-        let used = unsafe { &*self.used };
         atomic::fence(Ordering::Acquire);
+        let used = unsafe { &*self.used };
         if self.last_used_idx == used.idx {
             return None;
         }
-        let ring_idx = (self.last_used_idx as usize) % QUEUE_SIZE;
+        let ring_idx = (self.last_used_idx as usize) % (self.queue_size as usize);
         let elem = used.ring[ring_idx];
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         Some((elem.id as u16, elem.len))
@@ -309,7 +327,7 @@ impl VirtQueue {
 
 /// Allocate the legacy virtqueue layout as a single contiguous region.
 ///
-/// Legacy VirtIO 0.9.5 spec says the layout is:
+/// Legacy VirtIO 0.9.5 spec layout:
 ///   - Descriptor table: 16 * queue_size bytes (16-byte aligned)
 ///   - Available ring:   6 + 2 * queue_size bytes (2-byte aligned)
 ///   - Padding to next page boundary
@@ -335,14 +353,19 @@ fn alloc_legacy_virtqueue(queue_size: u16, phys_mem_offset: u64) -> VirtQueue {
     let avail = unsafe { base.add(desc_size) } as *mut VirtqAvail;
     let used = unsafe { base.add(used_offset) } as *mut VirtqUsed;
 
-    // Chain free descriptors
+    // Chain free descriptors: each points to next, last has no NEXT flag.
     for i in 0..qs {
         unsafe {
             let desc = &mut *descs.add(i);
             desc.addr = 0;
             desc.len = 0;
-            desc.flags = VIRTQ_DESC_F_NEXT;
-            desc.next = if i + 1 < qs { (i + 1) as u16 } else { 0 };
+            if i + 1 < qs {
+                desc.flags = VIRTQ_DESC_F_NEXT;
+                desc.next = (i + 1) as u16;
+            } else {
+                desc.flags = 0;
+                desc.next = 0;
+            }
         }
     }
 
@@ -353,6 +376,7 @@ fn alloc_legacy_virtqueue(queue_size: u16, phys_mem_offset: u64) -> VirtQueue {
     }
 
     VirtQueue {
+        base,
         descs,
         avail,
         used,
@@ -408,6 +432,12 @@ pub struct VirtioNet {
     tx_queue: VirtQueue,
 }
 
+// SAFETY: VirtQueue contains raw pointers to heap memory that is only accessed
+// through &mut self methods. The driver is designed to be owned by a single
+// task (the network stack poller). The raw pointers are stable heap allocations
+// that won't be moved.
+unsafe impl Send for VirtioNet {}
+
 /// Errors from driver initialization.
 #[derive(Debug)]
 pub enum VirtioInitError {
@@ -423,27 +453,28 @@ impl VirtioNet {
     /// Initialize the VirtIO-net device at the given I/O base.
     ///
     /// # Arguments
-    /// * `io_base` — I/O port base from PCI BAR0 (masked to I/O space).
-    /// * `phys_mem_offset` — the bootloader-provided physical memory offset
+    /// * `io_base` -- I/O port base from PCI BAR0 (masked to I/O space).
+    /// * `phys_mem_offset` -- the bootloader-provided physical memory offset
     ///   for virtual-to-physical address translation.
     ///
     /// # Safety
     /// The caller must ensure `io_base` points to a valid VirtIO legacy device
-    /// and that `phys_mem_offset` is correct.
+    /// and that `phys_mem_offset` is correct. PCI bus mastering must be enabled
+    /// before calling this.
     pub unsafe fn new(
         io_base: u16,
         phys_mem_offset: u64,
     ) -> Result<Self, VirtioInitError> {
         log::info!("[virtio-net] initializing device at I/O base {:#x}", io_base);
 
-        // ── Step 1: Reset ─────────────────────────────────────────────
+        // -- Step 1: Reset --
         unsafe { port_write_u8(io_base, VIRTIO_DEVICE_STATUS, 0) };
         log::debug!("[virtio-net] device reset");
 
-        // ── Step 2: Acknowledge ───────────────────────────────────────
+        // -- Step 2: Acknowledge --
         unsafe { port_write_u8(io_base, VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_ACK) };
 
-        // ── Step 3: Driver ────────────────────────────────────────────
+        // -- Step 3: Driver --
         unsafe {
             port_write_u8(
                 io_base,
@@ -452,18 +483,18 @@ impl VirtioNet {
             )
         };
 
-        // ── Step 4: Feature negotiation ───────────────────────────────
+        // -- Step 4: Feature negotiation --
         let device_features = unsafe { port_read_u32(io_base, VIRTIO_DEVICE_FEATURES) };
         log::debug!("[virtio-net] device features: {:#010x}", device_features);
 
-        // We request MAC address feature. We explicitly do NOT request
-        // VIRTIO_NET_F_MRG_RXBUF so the header stays at 10 bytes.
+        // We request MAC address and link status features. We explicitly do
+        // NOT request VIRTIO_NET_F_MRG_RXBUF so the header stays at 10 bytes.
         let guest_features = device_features & (VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
         unsafe { port_write_u32(io_base, VIRTIO_GUEST_FEATURES, guest_features) };
         log::debug!("[virtio-net] guest features: {:#010x}", guest_features);
 
         // Legacy devices don't require FEATURES_OK, but set it anyway for
-        // transitional devices.
+        // transitional devices that support the modern interface.
         unsafe {
             port_write_u8(
                 io_base,
@@ -472,17 +503,32 @@ impl VirtioNet {
             )
         };
 
-        // ── Step 5: Read MAC address ──────────────────────────────────
+        // Verify FEATURES_OK was accepted (only meaningful for modern devices,
+        // but harmless to check).
+        let status = unsafe { port_read_u8(io_base, VIRTIO_DEVICE_STATUS) };
+        if status & VIRTIO_STATUS_FEATURES_OK == 0 {
+            log::warn!("[virtio-net] FEATURES_OK not set (legacy device), continuing");
+            // This is expected for pure legacy devices; not an error.
+        }
+
+        // -- Step 5: Read MAC address --
         let mut mac = [0u8; 6];
-        for i in 0..6 {
-            mac[i] = unsafe { port_read_u8(io_base, VIRTIO_MAC_BASE + i as u16) };
+        if device_features & VIRTIO_NET_F_MAC != 0 {
+            for i in 0..6 {
+                mac[i] = unsafe { port_read_u8(io_base, VIRTIO_MAC_BASE + i as u16) };
+            }
+        } else {
+            // Device doesn't advertise MAC feature. Use a locally-administered
+            // fallback MAC for QEMU SLIRP (which assigns one anyway).
+            mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+            log::warn!("[virtio-net] no MAC feature, using fallback");
         }
         log::info!(
             "[virtio-net] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
 
-        // ── Step 6: Set up RX queue (index 0) ─────────────────────────
+        // -- Step 6: Set up RX queue (index 0) --
         unsafe { port_write_u16(io_base, VIRTIO_QUEUE_SELECT, 0) };
         let rx_size = unsafe { port_read_u16(io_base, VIRTIO_QUEUE_SIZE) };
         log::debug!("[virtio-net] RX queue size: {}", rx_size);
@@ -496,9 +542,13 @@ impl VirtioNet {
         // Write the physical page frame number of the descriptor table.
         let rx_pfn = rx_queue.pfn();
         unsafe { port_write_u32(io_base, VIRTIO_QUEUE_ADDR, rx_pfn) };
-        log::debug!("[virtio-net] RX queue PFN: {:#x}", rx_pfn);
+        log::debug!(
+            "[virtio-net] RX queue PFN: {:#x} (phys: {:#x})",
+            rx_pfn,
+            (rx_pfn as u64) << 12
+        );
 
-        // ── Step 7: Set up TX queue (index 1) ─────────────────────────
+        // -- Step 7: Set up TX queue (index 1) --
         unsafe { port_write_u16(io_base, VIRTIO_QUEUE_SELECT, 1) };
         let tx_size = unsafe { port_read_u16(io_base, VIRTIO_QUEUE_SIZE) };
         log::debug!("[virtio-net] TX queue size: {}", tx_size);
@@ -511,12 +561,16 @@ impl VirtioNet {
 
         let tx_pfn = tx_queue.pfn();
         unsafe { port_write_u32(io_base, VIRTIO_QUEUE_ADDR, tx_pfn) };
-        log::debug!("[virtio-net] TX queue PFN: {:#x}", tx_pfn);
+        log::debug!(
+            "[virtio-net] TX queue PFN: {:#x} (phys: {:#x})",
+            tx_pfn,
+            (tx_pfn as u64) << 12
+        );
 
-        // ── Step 8: Pre-populate RX queue with receive buffers ────────
+        // -- Step 8: Pre-populate RX queue with receive buffers --
         Self::populate_rx_queue(&mut rx_queue);
 
-        // ── Step 9: Set DRIVER_OK — device is live ────────────────────
+        // -- Step 9: Set DRIVER_OK — device is live --
         unsafe {
             port_write_u8(
                 io_base,
@@ -527,7 +581,18 @@ impl VirtioNet {
                     | VIRTIO_STATUS_DRIVER_OK,
             )
         };
-        log::info!("[virtio-net] device initialized successfully");
+
+        // Read back status to verify device accepted initialization
+        let final_status = unsafe { port_read_u8(io_base, VIRTIO_DEVICE_STATUS) };
+        if final_status & VIRTIO_STATUS_DRIVER_OK == 0 {
+            log::error!(
+                "[virtio-net] device did not accept DRIVER_OK, status: {:#x}",
+                final_status
+            );
+            return Err(VirtioInitError::DeviceError);
+        }
+
+        log::info!("[virtio-net] device initialized successfully (status: {:#x})", final_status);
 
         Ok(Self {
             io_base,
@@ -540,8 +605,8 @@ impl VirtioNet {
     /// Fill every free RX descriptor with a device-writable buffer so the NIC
     /// can DMA received frames into them.
     fn populate_rx_queue(rx_queue: &mut VirtQueue) {
-        let count = rx_queue.num_free;
-        for _ in 0..count {
+        let mut populated = 0u16;
+        loop {
             let idx = match rx_queue.alloc_desc() {
                 Some(i) => i,
                 None => break,
@@ -560,17 +625,16 @@ impl VirtioNet {
             }
 
             rx_queue.push_avail(idx);
+            populated += 1;
         }
 
-        log::debug!(
-            "[virtio-net] populated {} RX descriptors",
-            count - rx_queue.num_free
-        );
+        log::debug!("[virtio-net] populated {} RX descriptors", populated);
     }
 
     /// Acknowledge an interrupt by reading the ISR status register.
+    ///
     /// Returns the ISR bits (bit 0 = used-buffer notification, bit 1 = config
-    /// change).
+    /// change). Reading ISR automatically clears it.
     pub fn ack_interrupt(&self) -> u8 {
         unsafe { port_read_u8(self.io_base, VIRTIO_ISR_STATUS) }
     }
@@ -580,6 +644,11 @@ impl VirtioNet {
         while let Some((desc_idx, _len)) = self.tx_queue.pop_used() {
             self.tx_queue.free_desc(desc_idx);
         }
+    }
+
+    /// Notify the device that new buffers are available on a queue.
+    fn notify_queue(&self, queue_idx: u16) {
+        unsafe { port_write_u16(self.io_base, VIRTIO_QUEUE_NOTIFY, queue_idx) };
     }
 }
 
@@ -609,7 +678,7 @@ impl NicDriver for VirtioNet {
         // Write the Ethernet frame after the header.
         buf[VIRTIO_NET_HDR_SIZE..VIRTIO_NET_HDR_SIZE + frame.len()].copy_from_slice(frame);
 
-        // Set up the descriptor.
+        // Set up the descriptor with the physical address.
         let buf_ptr = buf.as_ptr() as usize;
         let buf_phys = self.tx_queue.virt_to_phys(buf_ptr);
         unsafe {
@@ -622,7 +691,7 @@ impl NicDriver for VirtioNet {
 
         // Make it available and kick the device.
         self.tx_queue.push_avail(desc_idx);
-        unsafe { port_write_u16(self.io_base, VIRTIO_QUEUE_NOTIFY, 1) }; // queue 1 = TX
+        self.notify_queue(1); // queue 1 = TX
 
         Ok(())
     }
@@ -638,7 +707,7 @@ impl NicDriver for VirtioNet {
 
         // The device wrote VirtIO-net header + Ethernet frame into the buffer.
         if total_len <= VIRTIO_NET_HDR_SIZE {
-            // Runt or header-only — recycle the buffer and ignore.
+            // Runt or header-only -- recycle the buffer and ignore.
             self.recycle_rx_desc(desc_idx);
             return Ok(None);
         }
@@ -647,12 +716,13 @@ impl NicDriver for VirtioNet {
         let buf = &self.rx_queue.buffers[desc_idx as usize];
 
         if frame_len > out.len() {
-            // Caller's buffer is too small — drop the frame.
+            // Caller's buffer is too small -- drop the frame.
             self.recycle_rx_desc(desc_idx);
             return Err(NicError::BufferFull);
         }
 
-        out[..frame_len].copy_from_slice(&buf[VIRTIO_NET_HDR_SIZE..VIRTIO_NET_HDR_SIZE + frame_len]);
+        out[..frame_len]
+            .copy_from_slice(&buf[VIRTIO_NET_HDR_SIZE..VIRTIO_NET_HDR_SIZE + frame_len]);
 
         // Recycle the descriptor back into the RX ring.
         self.recycle_rx_desc(desc_idx);
@@ -681,6 +751,6 @@ impl VirtioNet {
 
         self.rx_queue.push_avail(desc_idx);
         // Notify the device that new RX buffers are available.
-        unsafe { port_write_u16(self.io_base, VIRTIO_QUEUE_NOTIFY, 0) }; // queue 0 = RX
+        self.notify_queue(0); // queue 0 = RX
     }
 }

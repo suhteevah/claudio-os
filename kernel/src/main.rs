@@ -24,6 +24,11 @@ mod serial;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Physical memory offset provided by the bootloader, stored globally so that
+/// subsystems initialised after boot (e.g. networking) can translate addresses.
+static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Bootloader configuration — request a framebuffer and physical memory mapping
 static BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -76,6 +81,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .physical_memory_offset
         .into_option()
         .expect("bootloader must map physical memory");
+
+    // Store phys_mem_offset globally so subsystems like networking can use it.
+    PHYS_MEM_OFFSET.store(phys_mem_offset, Ordering::Relaxed);
 
     let memory_map = &boot_info.memory_regions;
     memory::init(phys_mem_offset, memory_map);
@@ -149,16 +157,111 @@ fn post_stack_switch() -> ! {
     halt_loop()
 }
 
+/// Return the current time as a smoltcp Instant, derived from the PIT tick
+/// counter in the timer interrupt handler.
+fn now() -> claudio_net::Instant {
+    claudio_net::Instant::from_millis(interrupts::millis_since_boot())
+}
+
 /// The main async entry point — runs inside the cooperative executor.
 ///
 /// Phase 1 goal: boot to a working terminal with keyboard input echoed
 /// to serial output, proving the full stack works end-to-end.
+///
+/// Phase 2 goal: initialize the network stack, obtain an IP via DHCP,
+/// resolve DNS, and establish a TCP connection.
 async fn main_async() {
     log::info!("[main] async runtime started");
     log::info!("[main] ClaudioOS Phase 1 — Boot to Terminal");
+    log::info!("[main] ClaudioOS Phase 2 — Networking");
+
+    // ── Phase 2: Network stack initialization ───────────────────────
+
+    // Step 1: Find the VirtIO-net PCI device (or fall back to e1000).
+    let nic_dev = pci::find_device(0x1AF4, 0x1000)
+        .or_else(|| {
+            log::info!("[main] no VirtIO-net found, trying e1000...");
+            pci::find_device(0x8086, 0x100E)
+        });
+
+    match nic_dev {
+        None => {
+            log::warn!("[main] no supported NIC found — skipping networking");
+        }
+        Some(dev) => {
+            log::info!(
+                "[main] NIC found: vendor={:#06x} device={:#06x} io_base={:#x} irq={}",
+                dev.vendor_id,
+                dev.device_id,
+                dev.io_base(),
+                dev.irq_line,
+            );
+
+            let phys_mem_offset = PHYS_MEM_OFFSET.load(Ordering::Relaxed);
+
+            let pci_info = claudio_net::PciDeviceInfo {
+                io_base: dev.io_base(),
+                irq_line: dev.irq_line,
+            };
+
+            // Step 2-4: Init VirtIO driver + smoltcp + DHCP (busy-poll).
+            let stack_result = unsafe {
+                claudio_net::init(pci_info, phys_mem_offset, now)
+            };
+
+            match stack_result {
+                Err(e) => {
+                    log::error!("[main] network init failed: {:?}", e);
+                }
+                Ok(mut stack) => {
+                    // Step 5: Log the assigned IP, gateway, DNS servers.
+                    if let Some(addr) = stack.ipv4_addr() {
+                        log::info!("[main] IP address: {}", addr);
+                    }
+                    if let Some(gw) = stack.gateway {
+                        log::info!("[main] gateway: {}", gw);
+                    }
+                    for dns in &stack.dns_servers {
+                        log::info!("[main] DNS server: {}", dns);
+                    }
+
+                    // Step 6: Try to resolve "api.anthropic.com".
+                    log::info!("[main] resolving api.anthropic.com...");
+                    match claudio_net::dns::resolve(&mut stack, "api.anthropic.com", now) {
+                        Err(e) => {
+                            log::error!("[main] DNS resolution failed: {:?}", e);
+                        }
+                        Ok(ip) => {
+                            log::info!("[main] api.anthropic.com = {}", ip);
+
+                            // Step 7: Try a TCP connection on port 443.
+                            log::info!("[main] attempting TCP connection to {}:443...", ip);
+                            match claudio_net::tls::tcp_connect(
+                                &mut stack, ip, 443, 49152, now,
+                            ) {
+                                Err(e) => {
+                                    log::error!("[main] TCP connect failed: {:?}", e);
+                                }
+                                Ok(handle) => {
+                                    log::info!(
+                                        "[main] TCP connected to {}:443! Phase 2 networking COMPLETE.",
+                                        ip
+                                    );
+                                    // Clean up — we just wanted to prove connectivity.
+                                    claudio_net::tls::tcp_close(&mut stack, handle);
+                                    log::info!("[main] TCP connection closed.");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Phase 1: Keyboard input loop ────────────────────────────────
     log::info!("[main] keyboard input active, type away!");
 
-    // Async keyboard stream — woken by ISR, no polling needed
     let stream = keyboard::ScancodeStream::new();
 
     loop {

@@ -18,10 +18,8 @@ vte = { workspace = true }
 
 # Internal crates
 claudio-terminal = { path = "../crates/terminal" }
-
-# Phase 2+ crates (disabled until Phase 1 boots):
-# claudio-net = { path = "../crates/net" }       # Phase 2: networking + TLS
-# claudio-api = { path = "../crates/api-client" } # Phase 3: API client
-# claudio-auth = { path = "../crates/auth" }      # Phase 3: auth
-# claudio-agent = { path = "../crates/agent" }    # Phase 4: agent sessions
-# claudio-fs = { path = "../crates/fs-persist" }  # Phase 3: persistence
+claudio-net = { path = "../crates/net" }
+claudio-api = { path = "../crates/api-client" }
+claudio-auth = { path = "../crates/auth" }
+claudio-agent = { path = "../crates/agent" }
+claudio-fs = { path = "../crates/fs-persist" }

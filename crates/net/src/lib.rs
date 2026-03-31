@@ -107,6 +107,24 @@ pub use nic::VirtioNet;
 pub use stack::NetworkStack;
 pub use tls::{TcpError, TlsError, TlsStream};
 
+/// Re-export smoltcp's Instant type so the kernel can construct timestamps
+/// without depending on smoltcp directly.
+pub use smoltcp::time::Instant;
+
+// ---------------------------------------------------------------------------
+// PCI device info (mirror of kernel's PciDevice, kept minimal to avoid
+// cross-crate dependency on kernel internals)
+// ---------------------------------------------------------------------------
+
+/// Minimal PCI device descriptor passed from the kernel's PCI scanner.
+#[derive(Debug, Clone, Copy)]
+pub struct PciDeviceInfo {
+    /// I/O port base address (BAR0 with indicator bits stripped).
+    pub io_base: u16,
+    /// PCI interrupt line (IRQ number).
+    pub irq_line: u8,
+}
+
 // ---------------------------------------------------------------------------
 // High-level initialization
 // ---------------------------------------------------------------------------
@@ -116,25 +134,35 @@ const DHCP_TIMEOUT_POLLS: usize = 100_000;
 
 /// Initialize the network stack end-to-end.
 ///
-/// 1. Creates the VirtIO-net driver at `io_base`.
+/// 1. Creates the VirtIO-net driver using PCI device info.
 /// 2. Wraps it in a smoltcp `Interface` with DHCP.
 /// 3. Polls until a DHCP lease is acquired.
 ///
 /// # Arguments
-/// * `io_base` — VirtIO PCI I/O base from BAR0.
-/// * `phys_mem_offset` — the bootloader's physical memory offset for
-///   virt→phys address translation.
-/// * `now` — a function returning the current [`smoltcp::time::Instant`].
+/// * `pci_dev` -- PCI device info (I/O base from BAR0, IRQ line).
+/// * `phys_mem_offset` -- the bootloader's physical memory offset for
+///   virt->phys address translation.
+/// * `now` -- a function returning the current [`smoltcp::time::Instant`].
 ///
 /// # Safety
-/// The caller must ensure `io_base` points to a valid VirtIO-net device.
+/// The caller must ensure the PCI device info points to a valid VirtIO-net
+/// device and that `phys_mem_offset` is correct. PCI bus mastering must be
+/// enabled before calling this.
 pub unsafe fn init(
-    io_base: u16,
+    pci_dev: PciDeviceInfo,
     phys_mem_offset: u64,
     now: impl Fn() -> smoltcp::time::Instant,
 ) -> Result<NetworkStack, InitError> {
+    log::info!(
+        "[net] initializing with I/O base {:#x}, IRQ {}",
+        pci_dev.io_base,
+        pci_dev.irq_line
+    );
+
     // Step 1: Initialize the NIC driver.
-    let nic = unsafe { VirtioNet::new(io_base, phys_mem_offset).map_err(InitError::NicInit)? };
+    let nic = unsafe {
+        VirtioNet::new(pci_dev.io_base, phys_mem_offset).map_err(InitError::NicInit)?
+    };
 
     // Step 2: Create the smoltcp network stack with DHCP.
     let mut stack = NetworkStack::new(nic);
@@ -158,4 +186,29 @@ pub unsafe fn init(
 
     log::error!("[net] DHCP timed out after {} polls", DHCP_TIMEOUT_POLLS);
     Err(InitError::DhcpTimeout)
+
+}
+
+/// Initialize the network stack using raw I/O base and phys_mem_offset.
+///
+/// Convenience wrapper for callers that have already extracted the I/O base
+/// from PCI BAR0.
+///
+/// # Safety
+/// Same as [`init`].
+pub unsafe fn init_from_io_base(
+    io_base: u16,
+    phys_mem_offset: u64,
+    now: impl Fn() -> smoltcp::time::Instant,
+) -> Result<NetworkStack, InitError> {
+    unsafe {
+        init(
+            PciDeviceInfo {
+                io_base,
+                irq_line: 0,
+            },
+            phys_mem_offset,
+            now,
+        )
+    }
 }

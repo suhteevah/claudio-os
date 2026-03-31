@@ -4,9 +4,28 @@
 //! - Timer (IRQ0/32): tick the executor, poll smoltcp
 //! - Keyboard (IRQ1/33): push keycode to input queue, wake terminal future
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::{Lazy, Mutex};
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+
+/// Global tick counter incremented by the PIT timer interrupt (IRQ0).
+///
+/// The PIT fires at ~18.2 Hz by default (actually 1193182/65536 ≈ 18.2065 Hz).
+/// Each tick is ~54.925 ms. We use this as the time source for smoltcp.
+static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Return the current tick count (incremented ~18.2 times/second by IRQ0).
+pub fn tick_count() -> u64 {
+    TICK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Return the current time as milliseconds since boot, derived from the PIT
+/// tick counter. At ~18.2 Hz, each tick ≈ 54.925 ms. We approximate with
+/// tick * 55 for simplicity.
+pub fn millis_since_boot() -> i64 {
+    (TICK_COUNT.load(Ordering::Relaxed) * 55) as i64
+}
 
 use crate::gdt;
 
@@ -234,7 +253,9 @@ extern "x86-interrupt" fn double_fault_handler(
 // ── Hardware interrupt handlers ─────────────────────────────────────
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    // ONLY EOI. No asm!, no serial, no nothing. Pure minimal.
+    // Increment global tick counter for smoltcp timestamps.
+    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // EOI — must be last.
     unsafe {
         x86_64::instructions::port::Port::<u8>::new(0x20).write(0x20);
     }

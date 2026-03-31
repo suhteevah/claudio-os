@@ -3,12 +3,11 @@ resolver = "2"
 members = [
     "kernel",
     "crates/terminal",
-    # Phase 2+ crates (uncomment when ready):
-    # "crates/net",
-    # "crates/api-client",
-    # "crates/auth",
-    # "crates/agent",
-    # "crates/fs-persist",
+    "crates/net",
+    "crates/api-client",
+    "crates/auth",
+    "crates/agent",
+    "crates/fs-persist",
 ]
 exclude = [
     "tools/image-builder",  # Host-side tool, must NOT inherit x86_64-unknown-none target

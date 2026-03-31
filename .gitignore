@@ -10,3 +10,4 @@ serial_output*.txt
 serial_out*.txt
 qemu_debug.log
 tools/image-builder/target/
+serial_*.txt

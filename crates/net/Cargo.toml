@@ -5,7 +5,8 @@ edition.workspace = true
 
 [dependencies]
 smoltcp = { workspace = true }
-embedded-tls = { workspace = true }
+# embedded-tls crashes LLVM on x86_64-unknown-none (aes/sha2 SIMD issues)
+# TLS will be implemented via software-only crypto in Phase 2.5
 log = { workspace = true }
 spin = { workspace = true }
 x86_64 = { workspace = true }
