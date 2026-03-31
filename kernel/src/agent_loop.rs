@@ -1,8 +1,8 @@
 //! Full agent loop: user input -> API call -> tool execution -> repeat.
 //!
 //! Implements the conversational tool-use cycle against the Anthropic Messages
-//! API.  Uses the TLS proxy on the host (10.0.2.2:8443) for HTTPS, since
-//! native TLS is still WIP.
+//! API.  Uses native TLS via `claudio_net::https_request()` to connect directly
+//! to api.anthropic.com:443.
 //!
 //! # Two entry points
 //!
@@ -16,9 +16,8 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use claudio_agent::{AgentSession, AgentState};
 use claudio_api::messages::{
@@ -32,8 +31,8 @@ use claudio_net::NetworkStack;
 
 use crate::keyboard;
 
-/// Ephemeral local port counter — each TCP connection needs a unique local port.
-static LOCAL_PORT: AtomicU16 = AtomicU16::new(52000);
+/// RNG seed counter — each TLS connection needs a unique seed.
+static RNG_SEED: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum number of consecutive tool-use rounds before we force-stop.
 /// Prevents runaway loops if the model keeps requesting tools.
@@ -65,7 +64,7 @@ pub struct ToolCallInfo {
 /// This is the core function the dashboard calls after `session.handle_input()`.
 /// It:
 /// 1. Builds a `MessagesRequest` with tool definitions.
-/// 2. Sends it to the API via the TLS proxy.
+/// 2. Sends it to the API via native TLS to api.anthropic.com:443.
 /// 3. If the model responds with `tool_use`, executes each tool, records
 ///    results in the session, and loops back to step 1.
 /// 4. If the model responds with text (or `end_turn`), returns the text.
@@ -98,8 +97,8 @@ pub fn run_tool_loop(
             }
         };
 
-        // Send to API via TLS proxy.
-        let response_bytes = match send_via_proxy(stack, api_key, &body_bytes, now) {
+        // Send to API via native TLS.
+        let response_bytes = match send_via_https(stack, api_key, &body_bytes, now) {
             Ok(bytes) => bytes,
             Err(e) => {
                 log::error!("[agent_loop] API request failed: {}", e);
@@ -381,22 +380,19 @@ fn session_to_api_messages(session: &AgentSession) -> Vec<Message> {
 }
 
 // ---------------------------------------------------------------------------
-// Network: send request via TLS proxy
+// Network: send request via native TLS
 // ---------------------------------------------------------------------------
 
-/// Send an API request through the TLS proxy running on the host.
+/// Send an API request directly to api.anthropic.com via native TLS.
 ///
-/// The proxy listens on 10.0.2.2:8443 and forwards HTTPS to api.anthropic.com.
-/// We send a plain HTTP/1.1 request; the proxy handles TLS upstream.
-pub fn send_via_proxy(
+/// Uses `claudio_net::https_request()` which handles DNS + TCP + TLS
+/// handshake + send + recv + close all in one call.
+pub fn send_via_https(
     stack: &mut NetworkStack,
     api_key: &str,
     body: &[u8],
     now: fn() -> claudio_net::Instant,
 ) -> Result<Vec<u8>, String> {
-    let proxy_ip = claudio_net::Ipv4Address::new(10, 0, 2, 2);
-    let local_port = LOCAL_PORT.fetch_add(1, Ordering::Relaxed);
-
     // Build HTTP request.
     let http_req = claudio_net::http::HttpRequest::post(
         "api.anthropic.com",
@@ -410,51 +406,21 @@ pub fn send_via_proxy(
 
     let req_bytes = http_req.to_bytes();
     log::debug!(
-        "[agent_loop] sending {} byte request to proxy",
+        "[agent_loop] sending {} byte request via native TLS",
         req_bytes.len()
     );
 
-    // TCP connect to proxy.
-    let handle =
-        claudio_net::tls::tcp_connect(stack, proxy_ip, 8443, local_port, || now()).map_err(
-            |e| {
-                format!(
-                    "proxy connect failed: {:?} — run: python tools/tls-proxy.py 8443",
-                    e
-                )
-            },
-        )?;
+    let seed = RNG_SEED.fetch_add(1, Ordering::Relaxed);
 
-    // Send request.
-    if let Err(e) = claudio_net::tls::tcp_send(stack, handle, &req_bytes, || now()) {
-        claudio_net::tls::tcp_close(stack, handle);
-        return Err(format!("send failed: {:?}", e));
-    }
-
-    // Read response.
-    let mut buf = vec![0u8; 65536];
-    let mut total = 0;
-    for _ in 0..1000 {
-        match claudio_net::tls::tcp_recv(stack, handle, &mut buf[total..], || now()) {
-            Ok(0) => break,
-            Ok(n) => {
-                total += n;
-                // Check if we have a complete HTTP response.
-                if claudio_net::http::HttpResponse::parse(&buf[..total]).is_ok() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    claudio_net::tls::tcp_close(stack, handle);
-
-    if total == 0 {
-        return Err(String::from("no response from proxy"));
-    }
-
-    Ok(buf[..total].to_vec())
+    claudio_net::https_request(
+        stack,
+        "api.anthropic.com",
+        443,
+        &req_bytes,
+        now,
+        seed,
+    )
+    .map_err(|e| format!("HTTPS request failed: {:?}", e))
 }
 
 // ---------------------------------------------------------------------------

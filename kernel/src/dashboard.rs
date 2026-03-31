@@ -143,7 +143,21 @@ pub async fn run_dashboard(
     let first_agent_id = dashboard.create_session(String::from("agent-0"), first_pane_id);
     input_buffers.push(InputBuffer::new(first_agent_id));
 
-    // Draw initial prompt into the first pane.
+    // Draw welcome banner + initial prompt into the first pane.
+    {
+        let pane = layout.pane_by_id_mut(first_pane_id).unwrap();
+        pane.write_str("\x1b[96mClaudioOS v0.1.0\x1b[0m — \x1b[93mBare Metal AI Agent Terminal\x1b[0m\r\n");
+        pane.write_str("\x1b[90m────────────────────────────────────────────────────\x1b[0m\r\n");
+        pane.write_str("\r\n");
+        pane.write_str("  \x1b[32mPhase 1\x1b[0m: Boot to terminal ............. \x1b[92mOK\x1b[0m\r\n");
+        pane.write_str("  \x1b[32mPhase 2\x1b[0m: Networking ................... \x1b[92mOK\x1b[0m\r\n");
+        pane.write_str("  \x1b[32mPhase 3\x1b[0m: TLS + API .................... \x1b[92mOK\x1b[0m\r\n");
+        pane.write_str("  \x1b[32mPhase 4\x1b[0m: Multi-agent dashboard ........ \x1b[92mOK\x1b[0m\r\n");
+        pane.write_str("\r\n");
+        pane.write_str("\x1b[90mCtrl+B then \" = split | n/p = focus | c = new agent | x = close\x1b[0m\r\n");
+        pane.write_str("\x1b[90mType a message and press Enter to talk to Claude.\x1b[0m\r\n");
+        pane.write_str("\r\n");
+    }
     render_prompt(&mut layout, &dashboard, &input_buffers);
     render_all(&layout);
 

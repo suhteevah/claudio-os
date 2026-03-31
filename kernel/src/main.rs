@@ -134,6 +134,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         log::warn!("[boot] no framebuffer available, serial-only mode");
     }
 
+    // ── Phase 4b: Early framebuffer test render ──────────────────────
+    // Render a simple banner to prove the framebuffer + font pipeline works.
+    // This runs BEFORE networking, so it's visible even if DHCP/TLS stalls.
+    {
+        let fb_w = framebuffer::width();
+        let fb_h = framebuffer::height();
+        if fb_w > 0 && fb_h > 0 {
+            let mut draw_target = terminal::FramebufferDrawTarget;
+            let mut layout = claudio_terminal::Layout::new(fb_w, fb_h);
+            {
+                let pane = layout.focused_pane_mut();
+                pane.write_str("\x1b[96mClaudioOS v0.1.0\x1b[0m\r\n");
+                pane.write_str("\x1b[93mBare Metal AI Agent Terminal\x1b[0m\r\n");
+                pane.write_str("\r\n");
+                pane.write_str("\x1b[90mBooting... initialising network stack.\x1b[0m\r\n");
+            }
+            layout.render_all(&mut draw_target);
+            log::info!("[boot] early banner rendered to framebuffer");
+        }
+    }
+
     // ── Phase 5: PCI enumeration + device discovery ──────────────────
     log::info!("[boot] starting PCI enumeration...");
     pci::enumerate();
@@ -187,110 +208,19 @@ fn now() -> claudio_net::Instant {
     claudio_net::Instant::from_millis(interrupts::millis_since_boot())
 }
 
-/// Decode complete HTTP chunks from `chunk_buf`, feed the decoded payload
-/// bytes into the SSE `StreamParser`, and process resulting events through
-/// the `StreamAccumulator`.  For each `TextDelta` event the text is printed
-/// immediately to serial so the user sees tokens as they arrive.
-///
-/// Any incomplete chunk data is left in `chunk_buf` for the next call.
-/// Sets `stream_done = true` when a `MessageStop` event is received.
-fn decode_and_feed_chunks(
-    chunk_buf: &mut alloc::vec::Vec<u8>,
-    parser: &mut claudio_api::streaming::StreamParser,
-    accumulator: &mut claudio_api::streaming::StreamAccumulator,
-    stream_done: &mut bool,
-) {
-    use claudio_api::streaming::{StreamEvent, Delta};
-
-    // Process all complete HTTP chunks in the buffer.
-    // Chunk format: <hex-size>\r\n<data>\r\n
-    loop {
-        // Find the chunk size line ending (\r\n)
-        let crlf_pos = match chunk_buf.windows(2).position(|w| w == b"\r\n") {
-            Some(pos) => pos,
-            None => break, // Need more data
-        };
-
-        // Parse the hex chunk size
-        let size_str = match core::str::from_utf8(&chunk_buf[..crlf_pos]) {
-            Ok(s) => s.trim(),
-            Err(_) => break,
-        };
-        // Chunk size may have extensions after `;` — ignore them
-        let size_hex = size_str.split(';').next().unwrap_or("").trim();
-        let chunk_size = match usize::from_str_radix(size_hex, 16) {
-            Ok(s) => s,
-            Err(_) => break,
-        };
-
-        // Terminal chunk (size 0) means end of chunked stream
-        if chunk_size == 0 {
-            log::debug!("[stream] received terminal chunk");
-            break;
-        }
-
-        // Check if we have the full chunk: size_line + \r\n + data + \r\n
-        let total_needed = crlf_pos + 2 + chunk_size + 2;
-        if chunk_buf.len() < total_needed {
-            break; // Need more data
-        }
-
-        // Extract the chunk payload
-        let payload_start = crlf_pos + 2;
-        let payload = chunk_buf[payload_start..payload_start + chunk_size].to_vec();
-
-        // Consume this chunk from the buffer
-        *chunk_buf = chunk_buf[total_needed..].to_vec();
-
-        // Feed the decoded payload into the SSE stream parser
-        let events = parser.feed(&payload);
-        for event in &events {
-            accumulator.process(event);
-            match event {
-                StreamEvent::MessageStart { message_id, model } => {
-                    log::info!("[stream] message started: id={} model={}", message_id, model);
-                }
-                StreamEvent::ContentBlockDelta { delta: Delta::TextDelta { text }, .. } => {
-                    // Print each text token immediately to serial — this is the
-                    // key streaming UX: the user sees tokens as they arrive.
-                    crate::serial_print!("{}", text);
-                }
-                StreamEvent::MessageStop => {
-                    log::debug!("[stream] received MessageStop");
-                    *stream_done = true;
-                }
-                StreamEvent::Error { error_type, message } => {
-                    log::error!("[stream] SSE error [{}]: {}", error_type, message);
-                    *stream_done = true;
-                }
-                StreamEvent::Ping => {
-                    log::trace!("[stream] ping");
-                }
-                _ => {}
-            }
-        }
-
-        if *stream_done {
-            break;
-        }
-    }
-}
-
 /// The main async entry point — runs inside the cooperative executor.
 ///
-/// Phase 1 goal: boot to a working terminal with keyboard input echoed
-/// to serial output, proving the full stack works end-to-end.
-///
-/// Phase 2 goal: initialize the network stack, obtain an IP via DHCP,
-/// resolve DNS, and establish a TCP connection.
+/// Boot sequence:
+///   1. Initialize network stack (VirtIO-net + DHCP + DNS)
+///   2. Authenticate (compile-time API key or auth relay on gateway:8444)
+///   3. Launch the multi-agent dashboard (native TLS to api.anthropic.com)
 async fn main_async() {
     log::info!("[main] async runtime started");
-    log::info!("[main] ClaudioOS Phase 1 — Boot to Terminal");
-    log::info!("[main] ClaudioOS Phase 2 — Networking");
+    log::info!("[main] ClaudioOS — Boot to Dashboard");
 
-    // ── Phase 2: Network stack initialization ───────────────────────
+    // ── Step 1: Network stack initialization ──────────────────────────
 
-    // Step 1: Find the VirtIO-net PCI device (or fall back to e1000).
+    // Find the VirtIO-net PCI device (or fall back to e1000).
     let nic_dev = pci::find_device(0x1AF4, 0x1000)
         .or_else(|| {
             log::info!("[main] no VirtIO-net found, trying e1000...");
@@ -317,7 +247,7 @@ async fn main_async() {
                 irq_line: dev.irq_line,
             };
 
-            // Step 2-4: Init VirtIO driver + smoltcp + DHCP (busy-poll).
+            // Init VirtIO driver + smoltcp + DHCP (busy-poll).
             let stack_result = unsafe {
                 claudio_net::init(pci_info, phys_mem_offset, now)
             };
@@ -327,7 +257,7 @@ async fn main_async() {
                     log::error!("[main] network init failed: {:?}", e);
                 }
                 Ok(mut stack) => {
-                    // Step 5: Log the assigned IP, gateway, DNS servers.
+                    // Log the assigned IP, gateway, DNS servers.
                     if let Some(addr) = stack.ipv4_addr() {
                         log::info!("[main] IP address: {}", addr);
                     }
@@ -338,7 +268,7 @@ async fn main_async() {
                         log::info!("[main] DNS server: {}", dns);
                     }
 
-                    // Step 6: Try to resolve "api.anthropic.com".
+                    // Pre-resolve api.anthropic.com to verify DNS works.
                     log::info!("[main] resolving api.anthropic.com...");
                     match claudio_net::dns::resolve(&mut stack, "api.anthropic.com", now) {
                         Err(e) => {
@@ -346,227 +276,91 @@ async fn main_async() {
                         }
                         Ok(ip) => {
                             log::info!("[main] api.anthropic.com = {}", ip);
+                        }
+                    }
 
-                            // Step 7: Native TLS HTTPS request to Anthropic API!
-                            // No proxy needed — embedded-tls does the TLS handshake directly.
-                            log::info!("[main] ============================================");
-                            log::info!("[main] ClaudioOS Phase 3 — NATIVE TLS + API CALL");
-                            log::info!("[main] ============================================");
+                    // ── Step 2: Authentication ────────────────────────────────
 
-                            // Check baked-in key first, then try auth relay
-                            let mut api_key_buf = alloc::string::String::new();
-                            if let Some(key) = option_env!("CLAUDIO_API_KEY") {
-                                api_key_buf = alloc::string::String::from(key);
-                                log::info!("[auth] using compile-time API key ({} chars)", api_key_buf.len());
-                            } else {
-                            // Fetch API key from auth relay (run `python tools/auth-relay.py`)
-                            log::info!("[auth] no compile-time key, trying auth relay...");
-                            let relay_ip = claudio_net::Ipv4Address::new(10, 0, 2, 2);
-                            for attempt in 0..30u16 {
-                                match claudio_net::tls::tcp_connect(&mut stack, relay_ip, 8444, 49300 + attempt, now) {
-                                    Err(_) => {
-                                        if attempt % 10 == 0 { log::info!("[auth] waiting for relay... ({})", attempt); }
-                                        for _ in 0..500000 { core::hint::spin_loop(); }
-                                        continue;
-                                    }
-                                    Ok(h) => {
-                                        let req = claudio_net::http::HttpRequest::get("10.0.2.2:8444", "/token")
-                                            .header("Connection", "close").to_bytes();
-                                        if claudio_net::tls::tcp_send(&mut stack, h, &req, now).is_ok() {
-                                            let mut buf = alloc::vec![0u8; 4096];
-                                            let mut total = 0;
-                                            for _ in 0..30 {
-                                                match claudio_net::tls::tcp_recv(&mut stack, h, &mut buf[total..], now) {
-                                                    Ok(0) => break,
-                                                    Ok(n) => { total += n; if claudio_net::http::HttpResponse::parse(&buf[..total]).is_ok() { break; } }
-                                                    Err(_) => break,
-                                                }
-                                            }
-                                            claudio_net::tls::tcp_close(&mut stack, h);
-                                            if let Ok(resp) = claudio_net::http::HttpResponse::parse(&buf[..total]) {
-                                                if resp.status == 200 {
-                                                    if let Ok(body) = core::str::from_utf8(&resp.body) {
-                                                        let needle = if body.contains("\"api_key\": \"") { "\"api_key\": \"" } else { "\"api_key\":\"" };
-                                                        if let Some(s) = body.find(needle) {
-                                                            let rest = &body[s + needle.len()..];
-                                                            if let Some(e) = rest.find('"') {
-                                                                api_key_buf = alloc::string::String::from(&rest[..e]);
-                                                                log::info!("[auth] token: {}...{} ({} chars)", &api_key_buf[..6], &api_key_buf[api_key_buf.len()-4..], api_key_buf.len());
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        } else { claudio_net::tls::tcp_close(&mut stack, h); }
-                                        for _ in 0..500000 { core::hint::spin_loop(); }
-                                    }
+                    // Check baked-in key first, then try auth relay.
+                    let mut api_key_buf = alloc::string::String::new();
+                    if let Some(key) = option_env!("CLAUDIO_API_KEY") {
+                        api_key_buf = alloc::string::String::from(key);
+                        log::info!("[auth] using compile-time API key ({} chars)", api_key_buf.len());
+                    } else {
+                        // Fetch API key from auth relay (plain HTTP to gateway:8444).
+                        // Run `python tools/auth-relay.py` on host.
+                        log::info!("[auth] no compile-time key, trying auth relay...");
+                        let relay_ip = claudio_net::Ipv4Address::new(10, 0, 2, 2);
+                        for attempt in 0..30u16 {
+                            match claudio_net::tls::tcp_connect(&mut stack, relay_ip, 8444, 49300 + attempt, now) {
+                                Err(_) => {
+                                    if attempt % 10 == 0 { log::info!("[auth] waiting for relay... ({})", attempt); }
+                                    for _ in 0..500000 { core::hint::spin_loop(); }
+                                    continue;
                                 }
-                            }
-                            } // end else (no compile-time key)
-
-                            let api_key: &str = &api_key_buf;
-                            if api_key.is_empty() {
-                                log::warn!("[auth] no API key — run `python tools/auth-relay.py`");
-                            } else {
-                                // Streaming API call via TLS proxy.
-                                // Run `python tools/tls-proxy.py 8443` on host.
-                                log::info!("[main] making STREAMING API request via TLS proxy...");
-                                let body = alloc::format!(
-                                    r#"{{"model":"claude-haiku-4-5-20251001","max_tokens":256,"stream":true,"messages":[{{"role":"user","content":"Say hi from bare metal in 10 words"}}]}}"#
-                                );
-                                let req = claudio_net::http::HttpRequest::post(
-                                    "api.anthropic.com", "/v1/messages", body.into_bytes(),
-                                )
-                                .header("Content-Type", "application/json")
-                                .header("x-api-key", api_key)
-                                .header("anthropic-version", "2023-06-01")
-                                .header("Accept", "text/event-stream")
-                                .header("Connection", "close");
-
-                                // Connect to TLS proxy on host
-                                let proxy = claudio_net::Ipv4Address::new(10, 0, 2, 2);
-                                static PORT_CTR: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(50000);
-                                let lp = PORT_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                                match claudio_net::tls::tcp_connect(&mut stack, proxy, 8443, lp, now) {
-                                    Err(e) => log::error!("[main] proxy connect failed: {:?}. Run: python tools/tls-proxy.py 8443", e),
-                                    Ok(h) => {
-                                        let bytes = req.to_bytes();
-                                        log::info!("[main] sending {} bytes to proxy...", bytes.len());
-                                        if let Err(e) = claudio_net::tls::tcp_send(&mut stack, h, &bytes, now) {
-                                            log::error!("[main] send failed: {:?}", e);
-                                        } else {
-                                            log::info!("[main] send complete, reading streaming response...");
-                                            log::info!("[main] (proxy is doing TLS upstream to api.anthropic.com — this takes a few seconds)");
-
-                                            // Phase 1: Read until we have the full HTTP headers
-                                            let mut header_buf = alloc::vec![0u8; 4096];
-                                            let mut header_total = 0usize;
-                                            let mut headers_parsed = false;
-                                            let mut body_start = 0usize;
-                                            let mut http_status = 0u16;
-
-                                            for _ in 0..200 {
-                                                match claudio_net::tls::tcp_recv(&mut stack, h, &mut header_buf[header_total..], now) {
-                                                    Ok(0) => break,
-                                                    Ok(n) => {
-                                                        header_total += n;
-                                                        // Check if we have the full header block (\r\n\r\n)
-                                                        if let Some(pos) = header_buf[..header_total].windows(4).position(|w| w == b"\r\n\r\n") {
-                                                            body_start = pos + 4;
-                                                            // Parse status from first line
-                                                            let hdr_str = core::str::from_utf8(&header_buf[..pos]).unwrap_or("");
-                                                            http_status = hdr_str.split(' ').nth(1)
-                                                                .and_then(|s| s.parse::<u16>().ok())
-                                                                .unwrap_or(0);
-                                                            log::info!("[stream] HTTP status: {}", http_status);
-                                                            headers_parsed = true;
-                                                            break;
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        log::error!("[stream] recv error reading headers: {:?}", e);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-
-                                            if !headers_parsed {
-                                                log::error!("[stream] failed to receive HTTP headers");
-                                            } else if http_status != 200 {
-                                                // Non-200: read the rest as error body
-                                                let error_body = &header_buf[body_start..header_total];
-                                                if let Ok(text) = core::str::from_utf8(error_body) {
-                                                    log::error!("[stream] API error (HTTP {}): {}", http_status, text);
-                                                }
-                                            } else {
-                                                // Phase 2: Stream SSE events token-by-token
-                                                log::info!("[stream] ============================================");
-                                                log::info!("[stream]   STREAMING CLAUDE'S RESPONSE (token by token)");
-                                                log::info!("[stream] ============================================");
-
-                                                use claudio_api::streaming::{StreamParser, StreamAccumulator, StreamEvent, Delta};
-                                                let mut parser = StreamParser::new();
-                                                let mut accumulator = StreamAccumulator::new();
-                                                let mut stream_done = false;
-
-                                                // Buffer for raw chunked-encoded bytes not yet decoded
-                                                let mut chunk_buf = alloc::vec::Vec::<u8>::new();
-
-                                                // Seed with any body bytes already read with headers
-                                                if header_total > body_start {
-                                                    chunk_buf.extend_from_slice(&header_buf[body_start..header_total]);
-                                                }
-
-                                                // Process any complete chunks already buffered
-                                                decode_and_feed_chunks(&mut chunk_buf, &mut parser, &mut accumulator, &mut stream_done);
-
-                                                // Phase 3: Read more data incrementally from the TCP stream
-                                                let mut recv_buf = [0u8; 4096];
-                                                if !stream_done {
-                                                    for _ in 0..2000 {
-                                                        match claudio_net::tls::tcp_recv(&mut stack, h, &mut recv_buf, now) {
-                                                            Ok(0) => {
-                                                                log::debug!("[stream] connection closed (EOF)");
-                                                                break;
-                                                            }
-                                                            Ok(n) => {
-                                                                chunk_buf.extend_from_slice(&recv_buf[..n]);
-                                                                decode_and_feed_chunks(&mut chunk_buf, &mut parser, &mut accumulator, &mut stream_done);
-                                                                if stream_done { break; }
-                                                            }
-                                                            Err(e) => {
-                                                                log::warn!("[stream] recv error: {:?}", e);
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-
-                                                // Drain any remaining data in the parser buffer
-                                                let final_events = parser.finish();
-                                                for event in &final_events {
-                                                    accumulator.process(event);
-                                                    if let StreamEvent::ContentBlockDelta { delta: Delta::TextDelta { text }, .. } = event {
-                                                        crate::serial_print!("{}", text);
-                                                    }
-                                                }
-
-                                                crate::serial_print!("\r\n");
-                                                log::info!("[stream] ============================================");
-                                                log::info!("[stream] stream complete — stop_reason: {:?}", accumulator.stop_reason);
-                                                log::info!("[stream] output tokens: {}", accumulator.output_tokens);
-                                                log::info!("[stream] full text: {}", accumulator.text);
-                                                log::info!("[stream] ============================================");
+                                Ok(h) => {
+                                    let req = claudio_net::http::HttpRequest::get("10.0.2.2:8444", "/token")
+                                        .header("Connection", "close").to_bytes();
+                                    if claudio_net::tls::tcp_send(&mut stack, h, &req, now).is_ok() {
+                                        let mut buf = alloc::vec![0u8; 4096];
+                                        let mut total = 0;
+                                        for _ in 0..30 {
+                                            match claudio_net::tls::tcp_recv(&mut stack, h, &mut buf[total..], now) {
+                                                Ok(0) => break,
+                                                Ok(n) => { total += n; if claudio_net::http::HttpResponse::parse(&buf[..total]).is_ok() { break; } }
+                                                Err(_) => break,
                                             }
                                         }
                                         claudio_net::tls::tcp_close(&mut stack, h);
-                                    }
+                                        if let Ok(resp) = claudio_net::http::HttpResponse::parse(&buf[..total]) {
+                                            if resp.status == 200 {
+                                                if let Ok(body) = core::str::from_utf8(&resp.body) {
+                                                    let needle = if body.contains("\"api_key\": \"") { "\"api_key\": \"" } else { "\"api_key\":\"" };
+                                                    if let Some(s) = body.find(needle) {
+                                                        let rest = &body[s + needle.len()..];
+                                                        if let Some(e) = rest.find('"') {
+                                                            api_key_buf = alloc::string::String::from(&rest[..e]);
+                                                            log::info!("[auth] token: {}...{} ({} chars)", &api_key_buf[..6], &api_key_buf[api_key_buf.len()-4..], api_key_buf.len());
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else { claudio_net::tls::tcp_close(&mut stack, h); }
+                                    for _ in 0..500000 { core::hint::spin_loop(); }
                                 }
-                                // ── Phase 4: Multi-agent dashboard ───────────────
-                                log::info!("[main] ============================================");
-                                log::info!("[main] ClaudioOS Phase 4 — MULTI-AGENT DASHBOARD");
-                                log::info!("[main] ============================================");
-                                log::info!("[main] Ctrl+B prefix for pane commands:");
-                                log::info!("[main]   \" = split horizontal");
-                                log::info!("[main]   %% = split vertical");
-                                log::info!("[main]   n = focus next, p = focus prev");
-                                log::info!("[main]   c = new agent, x = close pane");
-
-                                let fb_w = framebuffer::width();
-                                let fb_h = framebuffer::height();
-                                dashboard::run_dashboard(
-                                    &mut stack,
-                                    api_key,
-                                    fb_w,
-                                    fb_h,
-                                    now,
-                                ).await;
-
-                                // run_dashboard never returns in normal operation,
-                                // but if it does, fall through to the simple loop.
                             }
                         }
+                    } // end auth
+
+                    let api_key: &str = &api_key_buf;
+                    if api_key.is_empty() {
+                        log::warn!("[auth] no API key — run `python tools/auth-relay.py`");
+                    } else {
+                        // ── Step 3: Launch multi-agent dashboard ──────────────
+                        log::info!("[main] ============================================");
+                        log::info!("[main] ClaudioOS — MULTI-AGENT DASHBOARD");
+                        log::info!("[main] ============================================");
+                        log::info!("[main] Native TLS to api.anthropic.com:443");
+                        log::info!("[main] Ctrl+B prefix for pane commands:");
+                        log::info!("[main]   \" = split horizontal");
+                        log::info!("[main]   %% = split vertical");
+                        log::info!("[main]   n = focus next, p = focus prev");
+                        log::info!("[main]   c = new agent, x = close pane");
+
+                        let fb_w = framebuffer::width();
+                        let fb_h = framebuffer::height();
+                        dashboard::run_dashboard(
+                            &mut stack,
+                            api_key,
+                            fb_w,
+                            fb_h,
+                            now,
+                        ).await;
+
+                        // run_dashboard never returns in normal operation,
+                        // but if it does, fall through to the simple loop.
                     }
                 }
             }
