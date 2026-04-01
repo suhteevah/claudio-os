@@ -522,6 +522,18 @@ pub enum DashboardCommand {
 }
 ```
 
-These are not yet wired up to keyboard input -- Phase 1 only echoes keystrokes
-to serial. Phase 4 will add the `Ctrl+B` prefix key handler that translates
-key combos into `DashboardCommand` variants.
+These are wired up to keyboard input via the Ctrl+B prefix key handler.
+Pressing Ctrl+B enters "prefix mode", then the next key dispatches the command:
+
+| Key after Ctrl+B | Command |
+|-------------------|---------|
+| `%` | SplitVertical |
+| `"` | SplitHorizontal |
+| `n` / Tab | FocusNext |
+| `p` | FocusPrev |
+| `x` | ClosePane |
+| `c` | NewAgent |
+| `s` | ToggleStatusBar |
+
+Each agent pane displays a welcome banner on creation and runs its own
+conversation loop with the Anthropic Messages API.

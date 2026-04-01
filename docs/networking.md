@@ -3,9 +3,9 @@
 The networking subsystem provides the full path from Ethernet frames to HTTPS
 requests. It lives in `crates/net/`.
 
-**Status:** Phase 2 -- driver and protocol code is written, not yet activated in
-the boot sequence. The kernel workspace members for `crates/net/` are commented out
-in `Cargo.toml` and will be uncommented when Phase 2 is activated.
+**Status:** COMPLETE -- All networking subsystems are active and tested. The VirtIO-net
+driver, smoltcp stack, TLS 1.3, and HTTP/SSE client are integrated into the kernel
+boot sequence and have been used to make live API calls to `api.anthropic.com`.
 
 ---
 
@@ -366,61 +366,62 @@ interface that yields between poll iterations.
 
 ---
 
-## TLS Strategy
+## TLS 1.3
 
 **Source:** `crates/net/src/tls.rs`
 
-### The Challenge
+### Implementation
 
-TLS in a `#![no_std]` bare-metal environment is one of the hardest parts of the
-project. The workspace has both `embedded-tls` 0.17 and `rustls` 0.23 (no_std) as
-dependencies.
+TLS is implemented using `embedded-tls` 0.17 with the AES-128-GCM-SHA256 cipher suite.
+This was one of the hardest parts of the project due to several bare-metal constraints.
 
-| Option | Pros | Cons |
-|--------|------|------|
-| `embedded-tls` 0.17 | Designed for no_std, small footprint | LLVM codegen crashes on `x86_64-unknown-none` |
-| `rustls` (no_std) | Battle-tested, modern TLS 1.3 | Large, requires `ring` or `aws-lc-rs` crypto backend |
-| Custom TLS 1.3 | Total control over binary size | Enormous effort, high security risk |
-| `bearssl` via FFI | Small, proven C library | Requires C cross-compilation in build |
+### Key Design Decisions
 
-Current plan: `embedded-tls` with workarounds (specific opt-level or codegen flags).
-Fallback: `rustls` no_std port.
+| Decision | Rationale |
+|----------|-----------|
+| `embedded-tls` over `rustls` | Designed for no_std, smaller footprint |
+| Custom target `x86_64-claudio.json` | Enables SSE+AES-NI at LLVM level for crypto |
+| 16-byte aligned buffers | AES-NI requires aligned data |
+| `-cpu Haswell` in QEMU | Provides AES-NI hardware instructions |
+| Certificate verification disabled | Bare-metal has no CA root store (security tradeoff) |
+
+### Problems Solved
+
+1. **LLVM codegen crash**: The default `x86_64-unknown-none` target uses soft-float
+   (-soft-float feature). The `embedded-tls` crypto code uses SIMD intrinsics that
+   conflict. Solution: custom target with `+sse,+sse2,+aes,+pclmulqdq`.
+
+2. **AES-NI alignment**: AES-NI instructions (AESENC, AESDEC) require 16-byte
+   aligned memory. TLS buffers are explicitly aligned in the allocation.
+
+3. **memchr AVX2 crash**: The `memchr` crate auto-detects AVX2 at runtime and uses
+   it, but the default QEMU CPU doesn't support it. `-cpu Haswell` provides the
+   necessary instruction set.
 
 ### TCP Helpers
 
-Before TLS, the module provides raw TCP connection helpers:
+The module provides raw TCP connection helpers used by TLS and HTTP:
 
 - **`tcp_connect(stack, ip, port, local_port, now)`**: Creates a smoltcp TCP socket
-  with 8 KiB RX/TX buffers, initiates connection, polls until connected or timeout
-  (50,000 iterations).
+  with 8 KiB RX/TX buffers, initiates connection, polls until connected or timeout.
 - **`tcp_send(stack, handle, data, now)`**: Sends data slice over connected TCP socket,
-  polling until all bytes are sent.
+  polling until all bytes are sent. Includes send queue drain (waits for ACK).
 - **`tcp_recv(stack, handle, buf, now)`**: Receives data into buffer, returns byte count.
-  Returns `Ok(0)` on graceful close.
+  Returns `Ok(0)` on graceful close. Detects CloseWait state for EOF.
 - **`tcp_close(stack, handle)`**: Sends TCP close, removes socket from set.
 
-### TlsStream (Structural Stub)
+### TlsStream
 
-The `TlsStream` type wraps a TCP socket handle and will layer TLS encryption on top:
+The `TlsStream` type wraps a TCP socket handle with TLS 1.3 encryption:
 
-```rust
-pub struct TlsStream {
-    tcp_handle: SocketHandle,   // underlying TCP socket in NetworkStack
-    hostname: String,           // for SNI and cert verification
-    handshake_done: bool,       // whether TLS handshake completed
-    // Future: embedded-tls Connection state
-}
-```
+- **`connect(stack, ip, port, local_port, hostname, now)`**: TCP connect + TLS handshake in one call
+- **`handshake(stack, tcp_handle, hostname, now)`**: TLS handshake over existing TCP connection
+- **`send(stack, data, now)`**: Encrypt and send data through TLS record layer
+- **`recv(stack, buf, now)`**: Receive and decrypt data from TLS record layer
 
-Methods `handshake()`, `send()`, and `recv()` are defined but contain `todo!()`
-markers. The handshake sequence will be:
-1. ClientHello (with SNI, cipher suites)
-2. ServerHello + Certificate + ServerKeyExchange
-3. Verify certificate chain
-4. ClientKeyExchange + ChangeCipherSpec + Finished
-5. Server ChangeCipherSpec + Finished
-
-After handshake, all reads/writes go through the TLS record layer.
+The handshake negotiates TLS 1.3 with AES-128-GCM-SHA256. SNI is set from the
+hostname parameter. Certificate verification is skipped (no CA root store available
+in bare-metal environment).
 
 ---
 

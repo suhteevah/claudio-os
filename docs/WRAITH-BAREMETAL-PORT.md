@@ -17,14 +17,13 @@ ClaudioOS is a **Rust `#![no_std]` bare-metal OS** that boots directly on x86_64
 
 ### Priority 1: Headless HTTP Client (for OAuth + API)
 
-ClaudioOS currently has a raw HTTP/1.1 client over smoltcp TCP, but **no TLS**. The `embedded-tls` crate crashes LLVM because the bare-metal target (`x86_64-unknown-none`) doesn't enable SSE/AVX by default, and the crypto crates use SIMD intrinsics.
+**UPDATE (2026-03-31):** TLS is now working via `embedded-tls` with a custom target
+(`x86_64-claudio.json`) that enables SSE+AES-NI. The original blocker (LLVM crash)
+was solved by adding `+sse,+sse2,+aes,+pclmulqdq` to the target features. QEMU
+requires `-cpu Haswell` for the AES-NI instructions.
 
-**Ask**: Port wraith's HTTP/TLS layer to work with smoltcp instead of tokio/reqwest.
-
-Specifically:
-- Replace `reqwest` with raw HTTP over smoltcp TCP sockets
-- Replace `rustls`/`rquest` TLS with a software-only TLS implementation that compiles for `x86_64-unknown-none` (no SIMD, no `std`)
-- The `rquickjs` JS engine is NOT needed for this — just HTTP + TLS
+The HTTP/TLS stack is now complete. `wraith-transport` has been implemented to use
+ClaudioOS's existing `claudio-net` TCP + TLS stack directly.
 
 ### Priority 2: DOM Parser for OAuth Pages
 
@@ -59,14 +58,16 @@ This is the "wraith in a pane" vision.
 |---------|--------|
 | Heap allocation (`alloc`) | Yes, 16 MiB |
 | TCP/IP (smoltcp) | Working (DHCP, DNS, TCP connect) |
-| TLS | **BROKEN** — needs software-only crypto |
+| TLS 1.3 (embedded-tls) | Working (AES-128-GCM-SHA256, requires -cpu Haswell) |
+| HTTP/1.1 + SSE | Working (chunked encoding, streaming) |
+| Anthropic Messages API | Working (SSE streaming, tool use) |
 | Async runtime | Custom executor (not tokio) |
 | File I/O | FAT32 stub (not yet wired) |
 | Threads | None — single-core cooperative async |
 | `std` library | **NOT AVAILABLE** |
 | libc / POSIX | **NOT AVAILABLE** |
 | Dynamic linking | **NOT AVAILABLE** |
-| FPU/SSE | Not initialized yet (planned) |
+| FPU/SSE/AES-NI | Enabled via custom target (x86_64-claudio.json) |
 
 ### Crates That Won't Compile for `x86_64-unknown-none`
 
@@ -198,6 +199,6 @@ The `no_std` crates are NEW, extracted from wraith's existing code but stripped 
 
 ## Contact
 
-- **ClaudioOS repo**: https://github.com/suhteevah/claudio-os
+- **ClaudioOS repo**: https://github.com/suhteevah/baremetal-claude
 - **Owner**: Matt Gates (suhteevah) — Ridge Cell Repair LLC
 - **Wraith repo**: https://github.com/suhteevah/wraith-browser

@@ -400,7 +400,7 @@ memory offset mapping after translating the address via page table walk.
 
 ### 6. `mem::forget` for Long-Lived Allocations
 
-The heap stack (256 KiB Vec) must be leaked with `mem::forget()` because it must
+The heap stack (4 MiB Vec) must be leaked with `mem::forget()` because it must
 never be freed. If the Vec's destructor ran, the active stack would be deallocated.
 Same pattern applies to any allocation that must outlive normal Rust ownership.
 
@@ -412,19 +412,29 @@ ClaudioOS is developed in sequential phases. Each phase builds on the previous:
 
 | Phase | Focus | Status |
 |-------|-------|--------|
-| 1 | Boot to terminal (kernel, GDT, heap, interrupts, keyboard, framebuffer, PCI) | Active |
-| 2 | Networking + TLS (VirtIO-net, smoltcp, DHCP, DNS, TLS) | Code written, not activated |
-| 3 | API client + Auth (Messages API, SSE streaming, OAuth, FAT32 persist) | Partially stubbed |
-| 4 | Multi-agent dashboard (split panes, agent sessions, status bar) | Layout engine written |
-| 5 | Real hardware (physical NICs, USB keyboard, encryption, USB boot) | Future |
+| 1 | Boot to terminal (kernel, GDT, heap, interrupts, keyboard, framebuffer, PCI) | COMPLETE |
+| 2 | Networking + TLS (VirtIO-net, smoltcp, DHCP, DNS, TLS 1.3) | COMPLETE |
+| 3 | API client + Auth (Messages API, SSE streaming, auth relay) | COMPLETE |
+| 4 | Multi-agent dashboard (split panes, agent sessions, Ctrl+B keybindings) | COMPLETE |
+| 5 | Development environment (editor, Python interpreter, Rust compiler) | COMPLETE |
+| 6 | Self-hosting foundation (Cranelift no_std fork, rustc-lite) | COMPLETE |
+| 7 | Wraith browser integration (HTML parser, HTTP transport, text renderer) | WIP |
+| 8 | Real hardware (physical NICs, USB keyboard, encryption, USB boot) | Future |
 
-### Phase Activation
+### All Core Crates Are Active
 
-To activate Phase 2 (networking):
-1. Uncomment `"crates/net"` in workspace `Cargo.toml` members
-2. Uncomment `claudio-net = { path = "../crates/net" }` in `kernel/Cargo.toml`
-3. Add network init call after PCI enumeration in `kernel/src/main.rs`
-4. Wire up network stack polling to the async executor
+All workspace members in `Cargo.toml` are uncommented and active. The only stubbed
+crate is `fs-persist` (FAT32 persistence). Six Cranelift crates are forked under
+`crates/` and patched in via `[patch.crates-io]`.
+
+### Next Steps
+
+Priority items for continued development:
+1. Wire wraith browser crates into kernel for OAuth page rendering
+2. Implement FAT32 persistence for tokens and agent state
+3. Add status bar with token usage and network status
+4. Test on physical hardware (Arch Linux box, HP Victus laptop)
+5. Add e1000/I219-V NIC driver for real Intel NICs
 
 Each phase follows this pattern: write the crate code, test in isolation where
 possible, then integrate into the kernel boot sequence.

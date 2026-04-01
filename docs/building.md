@@ -215,9 +215,10 @@ qemu-system-x86_64 \
     -m 512M
 ```
 
-### With Networking (Phase 2+)
+### With Networking + TLS (Full Stack)
 
-Add VirtIO-net device with SLIRP user-mode networking:
+Add VirtIO-net device with SLIRP user-mode networking. **`-cpu Haswell` is required**
+for AES-NI instructions used by TLS 1.3:
 
 ```bash
 qemu-system-x86_64 \
@@ -227,7 +228,8 @@ qemu-system-x86_64 \
     -netdev user,id=net0 \
     -serial stdio \
     -m 512M \
-    -smp 4
+    -smp 4 \
+    -cpu Haswell
 ```
 
 SLIRP networking provides:
@@ -330,21 +332,19 @@ fatfs = { version = "0.3", default-features = false, features = ["alloc"] }
 If compilation still fails, the `fs-persist` crate (Phase 3) may need to use a
 fork or wait for v0.4.
 
-### `embedded-tls` LLVM Crashes
+### `embedded-tls` Issues
 
-The `embedded-tls` crate triggers LLVM codegen crashes on `x86_64-unknown-none`:
+The `embedded-tls` crate requires specific build configuration for bare-metal:
 
-```
-error: could not compile `embedded-tls`
-Caused by:
-  process didn't exit successfully: `rustc ...` (signal: 11, SIGSEGV)
-```
+1. **Custom target required**: The default `x86_64-unknown-none` target uses
+   soft-float which conflicts with AES-NI crypto. The project uses a custom target
+   `x86_64-claudio.json` with `+sse,+sse2,+aes,+pclmulqdq` features enabled.
 
-**Workarounds**:
-1. Set `opt-level = 1` in `[profile.dev]` (reduces optimization pressure)
-2. Set `codegen-units = 1` (single compilation unit avoids parallel LLVM issues)
-3. If neither works, the TLS implementation may need to be swapped to `rustls`
-   (no_std) or a custom solution
+2. **QEMU CPU**: TLS will crash with an illegal instruction fault if QEMU uses its
+   default CPU model. Always use `-cpu Haswell` or later for AES-NI support.
+
+3. **Aligned buffers**: AES-NI instructions require 16-byte aligned memory. TLS
+   buffers must be explicitly aligned in allocations.
 
 ### Boot Hangs (No Serial Output)
 
@@ -418,11 +418,11 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
 };
 ```
 
-**Part 2**: Allocate a fresh 256 KiB stack on the heap and switch to it before
+**Part 2**: Allocate a fresh 4 MiB stack on the heap and switch to it before
 enabling interrupts:
 
 ```rust
-const NEW_STACK_SIZE: usize = 256 * 1024;
+const NEW_STACK_SIZE: usize = 4 * 1024 * 1024;  // 4 MiB
 let new_stack = alloc::vec![0u8; NEW_STACK_SIZE];
 let new_stack_top = new_stack.as_ptr() as u64 + NEW_STACK_SIZE as u64;
 core::mem::forget(new_stack);  // Leak -- stack must never be freed
@@ -473,7 +473,9 @@ cargo build
 J:\baremetal claude\
 |-- CLAUDE.md                  Project design document and architecture spec
 |-- README.md                  User-facing README with status and build guide
-|-- Cargo.toml                 Workspace root (shared dependency versions)
+|-- HANDOFF.md                 Complete session summary and handoff notes
+|-- Cargo.toml                 Workspace root (shared deps + [patch.crates-io])
+|-- x86_64-claudio.json        Custom target with SSE+AES-NI for TLS crypto
 |-- rust-toolchain.toml        Nightly Rust + components + targets
 |-- .cargo/
 |   +-- config.toml            Default target, build-std, QEMU runner
@@ -483,7 +485,7 @@ J:\baremetal claude\
 |   +-- src/
 |       |-- main.rs            Entry point, boot phases, stack switch, panic
 |       |-- gdt.rs             GDT + TSS (data segment fix, IST stacks)
-|       |-- memory.rs          Frame allocator + heap mapping
+|       |-- memory.rs          Frame allocator + 16 MiB heap mapping
 |       |-- interrupts.rs      IDT + APIC disable + PIC ICW + ISR handlers
 |       |-- keyboard.rs        Async PS/2 keyboard (ScancodeStream)
 |       |-- serial.rs          16550 UART + serial_print! macros
@@ -494,45 +496,39 @@ J:\baremetal claude\
 |
 |-- crates/
 |   |-- terminal/              Split-pane framebuffer terminal renderer
-|   |   +-- src/
-|   |       |-- lib.rs         DrawTarget trait, LayoutNode, Viewport
-|   |       |-- render.rs      noto-sans-mono-bitmap font rendering, Color
-|   |       |-- pane.rs        Terminal pane (cells, VTE, cursor, SGR)
-|   |       +-- layout.rs      Binary split tree, focus, resize
-|   |
-|   |-- net/                   Networking stack (Phase 2)
-|   |   +-- src/
-|   |       |-- lib.rs         NicDriver trait, init + DHCP
-|   |       |-- nic.rs         VirtIO-net driver (757 lines)
-|   |       |-- stack.rs       smoltcp Device adapter, NetworkStack
-|   |       |-- dns.rs         DNS resolver
-|   |       |-- tls.rs         TLS stream (TCP helpers + stub)
-|   |       +-- http.rs        HTTP/1.1 + chunked + SSE parser
-|   |
-|   |-- api-client/            Anthropic Messages API client (Phase 3)
-|   |   +-- src/
-|   |       |-- lib.rs         AnthropicClient, auth header
-|   |       |-- messages.rs    (stub)
-|   |       |-- streaming.rs   (stub)
-|   |       +-- tools.rs       (stub)
-|   |
-|   |-- auth/                  OAuth 2.0 device flow (Phase 3)
-|   |   +-- src/lib.rs         Credentials, DeviceFlowPrompt
-|   |
-|   |-- agent/                 Agent session lifecycle (Phase 4, empty)
-|   +-- fs-persist/            FAT32 persistence (Phase 3, empty)
+|   |-- net/                   VirtIO-net + smoltcp + TLS 1.3 + HTTP/SSE
+|   |-- api-client/            Anthropic Messages API + SSE streaming
+|   |-- auth/                  OAuth device flow + credential types
+|   |-- agent/                 Agent session lifecycle + tool loop
+|   |-- editor/                Nano-like text editor (~400 LOC, 11 tests)
+|   |-- python-lite/           Minimal Python interpreter (28 tests)
+|   |-- rustc-lite/            Bare-metal Rust compiler via Cranelift
+|   |-- cranelift-codegen-nostd/       Forked cranelift-codegen for no_std
+|   |-- cranelift-frontend-nostd/      Forked cranelift-frontend for no_std
+|   |-- cranelift-codegen-shared-nostd/ Forked shared crate for no_std
+|   |-- cranelift-control-nostd/       Forked cranelift-control for no_std
+|   |-- rustc-hash-nostd/              Forked rustc-hash for no_std
+|   |-- arbitrary-stub/                no_std stub for arbitrary crate
+|   |-- wraith-dom/            no_std HTML parser + CSS selectors (WIP)
+|   |-- wraith-transport/      HTTP/HTTPS over smoltcp (WIP)
+|   |-- wraith-render/         HTML -> text-mode character grid (WIP)
+|   +-- fs-persist/            FAT32 persistence (stubbed)
 |
 |-- tools/
-|   +-- image-builder/         Host-side disk image builder
-|       |-- Cargo.toml         Depends on bootloader 0.11
-|       +-- src/main.rs        UefiBoot + BiosBoot image creation
+|   |-- image-builder/         Host-side UEFI/BIOS disk image builder
+|   |-- auth-relay.py          HTTP proxy for API key management
+|   |-- build-server.py        Host-side Rust compilation service
+|   |-- tls-proxy.py           TLS termination proxy (dev/debug)
+|   +-- tls-bridge.py          TLS bridge utility
 |
-+-- docs/                      This documentation
++-- docs/                      Documentation
     |-- architecture.md        System overview, boot sequence, memory map
     |-- kernel-internals.md    GDT, memory, PIC, serial, PCI
     |-- terminal.md            Font rendering, VTE, split panes, colors
-    |-- networking.md          VirtIO-net, smoltcp, DNS, TLS, HTTP
-    |-- api-protocol.md        Messages API, SSE, OAuth, tokens
+    |-- networking.md          VirtIO-net, smoltcp, DNS, TLS 1.3, HTTP
+    |-- api-protocol.md        Messages API, SSE, OAuth, tokens, tools
     |-- building.md            This file
-    +-- contributing.md        Dev workflow, conventions, testing
+    |-- contributing.md        Dev workflow, conventions, testing
+    |-- WRAITH-BAREMETAL-PORT.md    Wraith browser port specification
+    +-- WRAITH-CRATES-HANDOFF.md    Wraith crates handoff notes
 ```

@@ -88,13 +88,13 @@ Virtual Address Space (x86_64, 48-bit canonical addresses)
                        |                                  |
                        +----------------------------------+
                        |                                  |
-0x0000_4444_4444_0000  |  Kernel Heap (1 MiB)             |
+0x0000_4444_4444_0000  |  Kernel Heap (16 MiB)            |
                        |  HEAP_START = 0x4444_4444_0000   |
-                       |  HEAP_SIZE  = 1 MiB (1048576)    |
+                       |  HEAP_SIZE  = 16 MiB             |
                        |  Managed by linked_list_allocator|
                        |  (kernel/src/memory.rs)          |
                        |                                  |
-0x0000_4444_4454_0000  +----------------------------------+
+0x0000_4444_5444_0000  +----------------------------------+
                        |  (unmapped, available for heap   |
                        |   growth in future phases)       |
                        +----------------------------------+
@@ -107,7 +107,7 @@ Virtual Address Space (x86_64, 48-bit canonical addresses)
                        +----------------------------------+
                        |                                  |
                        |  Heap-allocated kernel stack     |
-                       |  (256 KiB, allocated in Phase 6, |
+                       |  (4 MiB, allocated at boot,      |
                        |   leaked via mem::forget)        |
                        |  Actual runtime stack after      |
                        |  post_stack_switch().            |
@@ -144,8 +144,8 @@ Virtual Address Space (x86_64, 48-bit canonical addresses)
   `kernel/src/memory.rs` constants `HEAP_START` and `HEAP_SIZE`.
 
 - **Two kernel stacks**: The bootloader provides a 128 KiB stack, but this is nearly
-  exhausted after init (log formatting is extremely stack-heavy). Phase 6 allocates a
-  fresh 256 KiB stack on the heap and switches to it. See
+  exhausted after init (log formatting is extremely stack-heavy). The kernel allocates
+  a fresh 4 MiB stack on the heap and switches to it. See
   [The Heap Stack Switch](#the-heap-stack-switch).
 
 - **Framebuffer address indirection**: The bootloader maps the GOP framebuffer at its
@@ -201,7 +201,7 @@ kernel_main(boot_info: &'static mut BootInfo)       [kernel/src/main.rs:48]
     |     1. Reads CR3 -> active L4 page table       [kernel/src/memory.rs]
     |     2. Creates OffsetPageTable mapper
     |     3. Creates BootInfoFrameAllocator from UEFI memory map
-    |     4. Maps HEAP_SIZE (1 MiB) pages at HEAP_START (0x4444_4444_0000)
+    |     4. Maps HEAP_SIZE (16 MiB) pages at HEAP_START (0x4444_4444_0000)
     |     5. Initializes linked_list_allocator as #[global_allocator]
     |
     |-- Phase 3: interrupts::init()                  [kernel/src/interrupts.rs]
@@ -272,12 +272,12 @@ interrupts at this point causes a stack overflow -> page fault -> double fault.
 
 ### The Solution
 
-Phase 6 allocates a fresh 256 KiB stack on the heap and switches to it via inline
+The kernel allocates a fresh 4 MiB stack on the heap and switches to it via inline
 assembly before enabling interrupts:
 
 ```rust
 // kernel/src/main.rs, Phase 6
-const NEW_STACK_SIZE: usize = 256 * 1024;
+const NEW_STACK_SIZE: usize = 4 * 1024 * 1024;  // 4 MiB
 let new_stack = alloc::vec![0u8; NEW_STACK_SIZE];
 let new_stack_top = new_stack.as_ptr() as u64 + NEW_STACK_SIZE as u64;
 core::mem::forget(new_stack);  // Leak -- kernel stack must never be freed
@@ -535,20 +535,25 @@ consistent lock ordering.
 
 ```
                     kernel (binary, #![no_std] #![no_main])
-                   /   |    |    \    \     \
-                  /    |    |     \    \     \
-                 v     v    v      v    v     v
-           terminal   net  auth  agent  fs   image-builder
-           (active)  (Ph2) (Ph3) (Ph4) (Ph3) (host-side)
-              |        |    |      |     |       |
-              |        v    |      v     |       v
-              |    api-client      |     |    bootloader 0.11
-              |        |    |      |     |    (UefiBoot, BiosBoot)
-              +--------+----+------+-----+
-              |                          |
-              v                          v
-         alloc + core              alloc + core
-         (#![no_std])              (#![no_std])
+                   /   |    |    \    \     \     \      \
+                  v    v    v     v    v     v     v      v
+           terminal  net  auth  agent  fs  editor python  rustc-lite
+           (active) (act) (act) (act) (stub)(act) -lite   (Cranelift)
+              |       |    |     |     |     |     |        |
+              |       v    |     v     |     |     |        v
+              |   api-client     |     |     |     |   cranelift-*-nostd
+              |       |    |     |     |     |     |   (6 forked crates)
+              +-------+----+-----+-----+-----+----+
+              |                                    |
+              v                                    v
+         alloc + core                        alloc + core
+         (#![no_std])                        (#![no_std])
+
+    Wraith browser crates (WIP):
+    wraith-dom  wraith-transport  wraith-render
+         |            |                |
+         v            v                v
+     alloc+core   claudio-net      wraith-dom
 ```
 
 ### External Crate Dependencies by Module
@@ -557,15 +562,23 @@ consistent lock ordering.
 |--------|-----------------|
 | `kernel` | `bootloader_api` 0.11, `x86_64` 0.15, `pc-keyboard` 0.8, `spin` 0.9, `linked_list_allocator` 0.10, `log` 0.4, `noto-sans-mono-bitmap` 0.3, `vte` 0.15 |
 | `terminal` | `vte` 0.15, `noto-sans-mono-bitmap` 0.3 |
-| `net` | `smoltcp` 0.12 (medium-ethernet, proto-ipv4, proto-dhcpv4, proto-dns, socket-tcp/udp/dhcpv4/dns), `embedded-tls` 0.17 |
+| `net` | `smoltcp` 0.12, `embedded-tls` 0.17, `embedded-io` 0.6, `rand_core` 0.6 |
 | `api-client` | `serde` 1.x (no_std, derive, alloc), `serde_json` 1.x (no_std, alloc) |
-| `auth` | (minimal, uses net + fs-persist) |
-| `fs-persist` | `fatfs` 0.3 (no_std, alloc) |
+| `auth` | (minimal, credential types + device flow prompt) |
+| `editor` | (pure no_std + alloc, no external deps) |
+| `python-lite` | (pure no_std + alloc, no external deps) |
+| `rustc-lite` | `cranelift-codegen`, `cranelift-frontend` (forked no_std) |
+| `cranelift-*-nostd` | `hashbrown`, `ahash`, `libm`, `target-lexicon` |
+| `wraith-dom` | (pure no_std + alloc, no external deps) |
+| `wraith-transport` | `claudio-net` (smoltcp, TLS) |
+| `wraith-render` | `wraith-dom` |
+| `fs-persist` | `fatfs` 0.3 (no_std, alloc) -- stubbed |
 
 All crates are `#![no_std]` with `extern crate alloc` where heap allocation is needed.
 No crate in the dependency tree pulls in `std`. The `tools/image-builder/` is a
 host-side binary excluded from the workspace to avoid inheriting the
-`x86_64-unknown-none` target.
+`x86_64-unknown-none` target. Six Cranelift crates are forked under `crates/` and
+patched in via `[patch.crates-io]` in the workspace `Cargo.toml`.
 
 ---
 
@@ -597,22 +610,55 @@ J:\baremetal claude\
       nic.rs            VirtIO-net legacy PCI driver (virtqueues, DMA, page walk)
       stack.rs          smoltcp Device adapter, NetworkStack, DHCP event handling
       dns.rs            DNS resolver via smoltcp socket (poll-loop style)
-      tls.rs            TLS stream stub (TCP helpers, TlsStream handshake/send/recv)
+      tls.rs            TLS 1.3 stream (embedded-tls, AES-128-GCM-SHA256)
       http.rs           HTTP/1.1 request builder, response parser, chunked, SSE
     api-client/src/
       lib.rs            AnthropicClient struct, auth header selection
-      messages.rs       (stub -- Messages API types)
-      streaming.rs      (stub -- SSE stream consumer)
-      tools.rs          (stub -- tool use protocol)
+      messages.rs       Messages API types + SSE streaming
+      streaming.rs      SSE stream consumer
+      tools.rs          Tool use protocol
     auth/src/
-      lib.rs            Credentials enum, DeviceFlowPrompt, authenticate() stub
+      lib.rs            Credentials enum, DeviceFlowPrompt
+    agent/src/
+      lib.rs            Agent session lifecycle, tool loop (max 20 rounds)
+    editor/src/
+      lib.rs            Nano-like text editor (~400 lines, 11 tests)
+    python-lite/src/
+      lib.rs            Module root + execute_python API
+      tokenizer.rs      Python tokenizer
+      parser.rs         Python AST parser
+      eval.rs           Python evaluator (vars, loops, functions)
+    rustc-lite/src/     Bare-metal Rust compiler via Cranelift
+    cranelift-codegen-nostd/     Forked cranelift-codegen for no_std
+    cranelift-frontend-nostd/    Forked cranelift-frontend for no_std
+    cranelift-codegen-shared-nostd/  Forked cranelift-codegen-shared for no_std
+    cranelift-control-nostd/     Forked cranelift-control for no_std
+    rustc-hash-nostd/            Forked rustc-hash for no_std
+    arbitrary-stub/              no_std stub for arbitrary crate
+    wraith-dom/src/
+      lib.rs            Module root + re-exports
+      parser.rs         HTML tokenizer + tree builder (619 lines)
+      selector.rs       CSS selector matching (354 lines)
+      forms.rs          Form detection + login heuristics (367 lines)
+      text.rs           Text extraction utilities (237 lines)
+    wraith-transport/src/
+      lib.rs            HTTP/HTTPS over smoltcp (572 lines)
+    wraith-render/src/
+      lib.rs            HTML -> text-mode character grid (1,221 lines)
+    fs-persist/         FAT32 persistence (stubbed)
   tools/
     image-builder/src/
       main.rs           Host-side UEFI + BIOS disk image builder
-  Cargo.toml            Workspace root with shared dependency versions
+    auth-relay.py       HTTP proxy for API key management
+    build-server.py     Host-side Rust compilation service for agents
+    tls-proxy.py        TLS termination proxy (dev/debug)
+    tls-bridge.py       TLS bridge utility
+  x86_64-claudio.json  Custom target with SSE+AES-NI (no soft-float)
+  Cargo.toml            Workspace root with shared deps + [patch.crates-io]
   .cargo/config.toml    Default target x86_64-unknown-none, build-std, QEMU runner
   rust-toolchain.toml   Nightly Rust + components (rust-src, llvm-tools-preview)
   CLAUDE.md             Project design document and build instructions
   README.md             User-facing README with status and build guide
+  HANDOFF.md            Complete session summary and status
   docs/                 This documentation directory
 ```

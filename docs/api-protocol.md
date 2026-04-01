@@ -3,12 +3,17 @@
 This document covers the Anthropic Messages API client, SSE streaming protocol,
 tool use, OAuth authentication, and token persistence.
 
+**Status:** COMPLETE -- The Messages API, SSE streaming, and tool use protocol are all
+active and tested. Claude Haiku has been called from bare metal and responded with
+token-by-token SSE streaming.
+
 **Source files:**
 - `crates/api-client/src/lib.rs` -- Client struct and auth header logic
-- `crates/api-client/src/messages.rs` -- Messages API types (stub)
-- `crates/api-client/src/streaming.rs` -- SSE stream consumer (stub)
-- `crates/api-client/src/tools.rs` -- Tool use protocol (stub)
+- `crates/api-client/src/messages.rs` -- Messages API types
+- `crates/api-client/src/streaming.rs` -- SSE stream consumer
+- `crates/api-client/src/tools.rs` -- Tool use protocol
 - `crates/auth/src/lib.rs` -- OAuth device flow and credential types
+- `crates/agent/src/lib.rs` -- Agent session lifecycle + tool loop
 - `crates/net/src/http.rs` -- Low-level HTTP/1.1 + SSE parsing
 
 ---
@@ -278,19 +283,30 @@ with more text, request another tool use, or end the turn.
 2. Accumulate input JSON fragments from input_json_delta events
 3. On content_block_stop: parse complete tool input JSON
 4. Match tool name and execute:
-     read_file   -> read from FAT32 via fs-persist crate
-     write_file  -> write to FAT32 via fs-persist crate
-     list_files  -> directory listing from FAT32
-     bash/exec   -> NOT AVAILABLE (no shell, no process execution)
+     edit_file       -> nano-like text editor (crates/editor)
+     execute_python  -> python-lite interpreter (crates/python-lite)
+     compile_rust    -> Rust compilation via build-server (tools/build-server.py)
+     read_file       -> read from FAT32 via fs-persist (stubbed)
+     write_file      -> write to FAT32 (stubbed)
+     bash/exec       -> NOT AVAILABLE (no shell, no process execution)
 5. Build tool_result message with output text
 6. Append to conversation history
 7. Send as next API call (full history + tool result)
+8. Repeat up to max 20 tool rounds per conversation turn
 ```
+
+### Available Tools
+
+| Tool | Implementation | Description |
+|------|---------------|-------------|
+| `edit_file` | `crates/editor/` | Nano-like text editor (~400 LOC, 11 tests) |
+| `execute_python` | `crates/python-lite/` | Minimal Python interpreter (vars, loops, functions, 28 tests) |
+| `compile_rust` | `tools/build-server.py` | Host-side Rust compilation via HTTP |
 
 **Important**: ClaudioOS has no shell, no subprocess execution, and no process
 isolation. Tools requiring arbitrary command execution (like `bash`) are not and
-cannot be supported. The agent will be configured with a tool set restricted to
-file I/O operations on the FAT32 partition.
+cannot be supported. The agent tool set provides file editing, Python execution,
+and Rust compilation as alternatives.
 
 ---
 

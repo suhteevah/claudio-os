@@ -225,7 +225,7 @@ purpose (needed for DMA buffer addresses).
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `HEAP_START` | `0x4444_4444_0000` | Virtual address of heap start |
-| `HEAP_SIZE` | `1048576` (1 MiB) | Initial heap size |
+| `HEAP_SIZE` | `16777216` (16 MiB) | Heap size (needed for Cranelift, TLS buffers, agent state) |
 
 The heap start address is chosen to be far from both the kernel's identity-mapped
 region and the bootloader's physical memory mapping to avoid collisions.
@@ -361,7 +361,7 @@ heap stack switch, ensuring:
 2. The keyboard decoder is ready
 3. The framebuffer is initialized
 4. PCI enumeration is complete
-5. The stack has plenty of room (256 KiB fresh allocation)
+5. The stack has plenty of room (4 MiB fresh allocation)
 6. The executor is about to start
 
 ---

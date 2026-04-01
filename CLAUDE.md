@@ -45,22 +45,36 @@ Supermicro SYS-4028GR-TRT, HP Victus laptop, Arch Linux box)
 ## Crate Structure
 
 - **`kernel/`** — Binary entry point. Boots, inits hardware, starts async executor,
-  launches auth gate then agent dashboard. This is `#![no_std]` + `#![no_main]`.
+  launches agent dashboard. This is `#![no_std]` + `#![no_main]`.
 - **`crates/api-client/`** — Anthropic Messages API client. Pure `no_std` + `alloc`.
   Handles streaming SSE, tool use protocol, conversation state. NO reqwest, NO hyper.
   Raw HTTP/1.1 over a TLS byte stream.
 - **`crates/auth/`** — OAuth 2.0 Device Authorization Grant (RFC 8628). Token persist
   to FAT32, background refresh task, credential store shared across all agents.
 - **`crates/terminal/`** — Framebuffer terminal renderer with split-pane support.
-  Uses `os-terminal` or custom `vte` + `noto-sans-mono-bitmap`. Each pane is a
-  viewport into the GOP framebuffer with independent scroll state.
-- **`crates/net/`** — smoltcp integration, DHCP, DNS, TLS wrapper. Provides a
-  high-level `TlsStream` type that the API client consumes. NIC driver abstraction.
+  Uses `vte` + `noto-sans-mono-bitmap`. Each pane is a viewport into the GOP
+  framebuffer with independent scroll state.
+- **`crates/net/`** — VirtIO-net driver, smoltcp integration, DHCP, DNS, TLS 1.3
+  wrapper. Provides `TlsStream` type that the API client consumes.
 - **`crates/agent/`** — Agent session lifecycle. Each session is an async task with
-  its own conversation history, tool execution, and terminal pane. The dashboard
-  manages creation/destruction/focus of sessions.
-- **`crates/fs-persist/`** — FAT32 persistence layer. Config, tokens, agent state,
-  conversation logs. Wraps `fatfs` with typed accessors.
+  its own conversation history, tool execution (max 20 rounds), and terminal pane.
+- **`crates/fs-persist/`** — FAT32 persistence layer (stubbed). Config, tokens,
+  agent state, conversation logs.
+- **`crates/editor/`** — Nano-like text editor (~400 lines, 11 tests). Provides
+  `edit_file` tool for Claude agents.
+- **`crates/python-lite/`** — Minimal Python interpreter (tokenizer, parser, eval).
+  Variables, loops, functions, 28 tests. Provides `execute_python` tool.
+- **`crates/rustc-lite/`** — Bare-metal Rust compiler using Cranelift backend.
+- **`crates/cranelift-*-nostd/`** — Forked Cranelift crates (codegen, frontend,
+  codegen-shared, control) patched for `#![no_std]`.
+- **`crates/rustc-hash-nostd/`** — Forked rustc-hash for `no_std`.
+- **`crates/arbitrary-stub/`** — Stub implementation of the arbitrary crate for
+  `no_std` (Cranelift dependency).
+- **`crates/wraith-dom/`** — `no_std` HTML parser, CSS selectors, form detection
+  (1,610 lines, 32 tests).
+- **`crates/wraith-transport/`** — HTTP/HTTPS over smoltcp (572 lines).
+- **`crates/wraith-render/`** — HTML to text-mode character grid (1,221 lines,
+  12 tests).
 
 ## Build & Run
 
@@ -74,22 +88,26 @@ sudo apt install qemu-system-x86 ovmf
 
 ### Development cycle
 ```bash
-# Build the kernel image
-cargo build --target x86_64-unknown-none
+# Build the kernel
+cargo build
 
-# Create bootable disk image (bootloader crate handles this)
-# The exact command depends on bootloader v0.11 disk image builder
+# Create bootable disk images (bootloader crate v0.11)
+cargo run --manifest-path tools/image-builder/Cargo.toml -- \
+    target/x86_64-unknown-none/debug/claudio-os
 
-# Run in QEMU with UEFI
+# Run in QEMU with UEFI + networking + TLS support
 qemu-system-x86_64 \
     -bios /usr/share/OVMF/OVMF_CODE.fd \
-    -drive format=raw,file=target/x86_64-unknown-none/debug/boot-bios-claudio-os.img \
+    -drive format=raw,file=target/x86_64-unknown-none/debug/claudio-os-uefi.img \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0,hostfwd=tcp::5555-:5555 \
     -serial stdio \
     -m 512M \
-    -smp 4
+    -smp 4 \
+    -cpu Haswell
 ```
+
+**Note:** `-cpu Haswell` is required for AES-NI instructions used by TLS 1.3.
 
 ### QEMU networking note
 `-netdev user` provides SLIRP NAT. The guest gets DHCP (10.0.2.x), DNS (10.0.2.3),
@@ -117,42 +135,77 @@ and outbound internet including HTTPS to api.anthropic.com. No bridging needed f
 
 ## Development Phases
 
-### Phase 1: Boot to terminal (PRIORITY — do this first)
-- [ ] Kernel boots via bootloader crate on QEMU with UEFI
-- [ ] GOP framebuffer initialized, can draw pixels
-- [ ] Serial debug output working (0x3F8)
-- [ ] GDT + IDT + interrupts configured
-- [ ] Heap allocator working (linked_list_allocator)
-- [ ] PS/2 keyboard input via IRQ1
-- [ ] Basic terminal: type characters, see them on screen
-- [ ] ANSI escape sequence support via vte
+### Phase 1: Boot to terminal -- COMPLETE
+- [x] Kernel boots via bootloader crate on QEMU with UEFI
+- [x] GOP framebuffer initialized, can draw pixels
+- [x] Serial debug output working (0x3F8)
+- [x] GDT + IDT + interrupts configured (data segment fix, APIC disable)
+- [x] Heap allocator working (linked_list_allocator, 16 MiB)
+- [x] PS/2 keyboard input via IRQ1 (async ScancodeStream)
+- [x] Basic terminal: type characters, see them on screen
+- [x] ANSI escape sequence support via vte
+- [x] SSE/SSE2/AVX enabled (CR0/CR4/XCR0 + CPUID detection)
+- [x] 4 MiB heap-allocated kernel stack (bootloader stack exhaustion fix)
+- [x] PIT timer at 18.2 Hz for timestamps
+- [x] PCI bus enumeration with bus mastering
 
-### Phase 2: Networking + TLS
-- [ ] VirtIO-net driver initialized via PCI enumeration
-- [ ] smoltcp interface with DHCP obtaining IP + DNS
-- [ ] TCP connection to a known IP (test with httpbin.org)
-- [ ] DNS resolution working (resolve api.anthropic.com)
-- [ ] TLS handshake (embedded-tls initially)
-- [ ] HTTPS GET to verify connectivity
-- [ ] HTTPS POST with JSON body
+### Phase 2: Networking + TLS -- COMPLETE
+- [x] VirtIO-net driver initialized via PCI enumeration (legacy 0.9.5)
+- [x] smoltcp interface with DHCP obtaining IP + DNS
+- [x] TCP connection to a known IP (test with httpbin.org)
+- [x] DNS resolution working (resolve api.anthropic.com)
+- [x] TLS 1.3 handshake (embedded-tls, AES-128-GCM-SHA256)
+- [x] HTTPS GET to verify connectivity
+- [x] HTTPS POST with JSON body
+- [x] Chunked transfer encoding + SSE parsing
+- [x] TCP send queue drain + CloseWait EOF detection
+- [x] Nagle disabled for immediate packet transmission
+- [x] Custom target x86_64-claudio.json with SSE+AES-NI (requires -cpu Haswell)
 
-### Phase 3: API client + Auth
-- [ ] OAuth device flow: display code, poll for token
-- [ ] Token persistence to FAT32 image
-- [ ] Anthropic Messages API: send prompt, receive response
-- [ ] SSE streaming: parse `event: content_block_delta` etc.
-- [ ] Tool use protocol: parse tool_use blocks, return tool_result
-- [ ] Conversation state management
+### Phase 3: API client + Auth -- COMPLETE
+- [x] Auth relay (tools/auth-relay.py) for API key management
+- [x] Compile-time CLAUDIO_API_KEY fallback
+- [x] Anthropic Messages API: send prompt, receive response
+- [x] SSE streaming: parse `event: content_block_delta` etc. (token-by-token)
+- [x] Tool use protocol: parse tool_use blocks, return tool_result
+- [x] Conversation state management
+- [ ] OAuth device flow: display code, poll for token (deferred -- using auth relay)
+- [ ] Token persistence to FAT32 image (deferred -- fs-persist stubbed)
 
-### Phase 4: Multi-agent dashboard
-- [ ] Split-pane layout tree (horizontal/vertical splits)
-- [ ] Per-pane terminal instances with independent scroll
-- [ ] Keyboard shortcuts: Ctrl+B prefix (tmux-style) for pane mgmt
-- [ ] Agent session creation/destruction
-- [ ] Focus switching between panes
-- [ ] Status bar: agent states, token usage, network status
+### Phase 4: Multi-agent dashboard -- COMPLETE
+- [x] Split-pane layout tree (horizontal/vertical splits)
+- [x] Per-pane terminal instances with independent scroll
+- [x] Keyboard shortcuts: Ctrl+B prefix (tmux-style) for pane mgmt
+- [x] Agent session creation/destruction
+- [x] Focus switching between panes
+- [x] Agent tool loop (send -> tool_use -> execute -> resend, max 20 rounds)
+- [x] Welcome banner rendering
+- [ ] Status bar: agent states, token usage, network status (not yet wired)
 
-### Phase 5: Real hardware + hardening
+### Phase 5: Development environment -- COMPLETE
+- [x] python-lite: Minimal Python interpreter (vars, loops, functions, 28 tests)
+- [x] Nano-like text editor (crates/editor, ~400 lines, 11 tests)
+- [x] Rust build server (tools/build-server.py) + compile_rust tool
+- [x] execute_python tool for Claude agents
+- [x] Tools integrated into agent tool loop
+
+### Phase 6: Self-hosting foundation -- COMPLETE
+- [x] Cranelift code generator compiles for bare metal
+- [x] Forked 6 crates for no_std (cranelift-codegen, cranelift-frontend,
+      cranelift-codegen-shared, cranelift-control, rustc-hash, arbitrary)
+- [x] libm for f32/f64 math in no_std
+- [x] Build script post-processing for generated code std->core replacement
+- [x] hashbrown with ahash for HashMap/HashSet
+- [x] crates/rustc-lite: Bare-metal Rust compilation via Cranelift
+
+### Phase 7: Wraith browser integration (WIP)
+- [x] wraith-dom: no_std HTML parser + CSS selectors + form detection (1,610 lines)
+- [x] wraith-transport: HTTP/HTTPS over smoltcp (572 lines)
+- [x] wraith-render: HTML -> text-mode character grid (1,221 lines)
+- [ ] Wire into kernel boot for OAuth page rendering
+- [ ] Form interaction (keyboard input at rendered form fields)
+
+### Future: Real hardware + hardening
 - [ ] Boot on physical hardware (test on Arch box first)
 - [ ] e1000/I219-V NIC driver for real Intel NICs
 - [ ] USB keyboard via xHCI (CrabUSB) or rely on PS/2 emulation
