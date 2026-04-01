@@ -313,65 +313,88 @@ async fn main_async() {
                         // ── Try OAuth: fetch Anthropic console via native HTTPS ──
                         log::info!("[oauth] ============================================");
                         log::info!("[oauth] ATTEMPTING BROWSER-BASED OAUTH");
-                        log::info!("[oauth] Fetching console.anthropic.com via native TLS...");
+                        log::info!("[oauth] Following redirect chain from console.anthropic.com...");
                         log::info!("[oauth] ============================================");
 
-                        let seed = interrupts::tick_count();
-                        let oauth_req = claudio_net::http::HttpRequest::get(
-                            "console.anthropic.com",
-                            "/settings/keys",
-                        )
-                        .header("User-Agent", "ClaudioOS/0.1 (bare-metal Rust OS)")
-                        .header("Accept", "text/html")
-                        .header("Connection", "close");
+                        let mut current_host = alloc::string::String::from("console.anthropic.com");
+                        let mut current_path = alloc::string::String::from("/settings/keys");
+                        let mut cookies = alloc::string::String::new();
 
-                        match claudio_net::https_request(
-                            &mut stack, "console.anthropic.com", 443,
-                            &oauth_req.to_bytes(), now, seed,
-                        ) {
+                        for redirect_num in 0..10u8 {
+                            log::info!("[oauth] [{}/10] GET https://{}{}",
+                                redirect_num + 1, current_host, current_path);
+
+                            let seed = interrupts::tick_count() + redirect_num as u64;
+                            let mut req = claudio_net::http::HttpRequest::get(
+                                &current_host, &current_path,
+                            )
+                            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) ClaudioOS/0.1")
+                            .header("Accept", "text/html,application/xhtml+xml,*/*")
+                            .header("Connection", "close");
+
+                            if !cookies.is_empty() {
+                                req = req.header("Cookie", &cookies);
+                            }
+
+                            match claudio_net::https_request(
+                                &mut stack, &current_host, 443,
+                                &req.to_bytes(), now, seed,
+                            ) {
                             Ok(resp_bytes) => {
                                 let resp_str = core::str::from_utf8(&resp_bytes).unwrap_or("<binary>");
-                                log::info!("[oauth] got {} bytes from console.anthropic.com", resp_bytes.len());
+                                log::info!("[oauth] got {} bytes", resp_bytes.len());
 
-                                // Check for Cloudflare challenge
-                                let is_cf = resp_str.contains("Just a moment")
-                                    || resp_str.contains("cf_chl")
-                                    || resp_str.contains("challenge-platform");
-
-                                if is_cf {
-                                    log::info!("[oauth] Cloudflare challenge detected! Attempting to solve...");
-
-                                    // Extract body from HTTP response
-                                    if let Some(body_start) = resp_str.find("\r\n\r\n") {
-                                        let body = &resp_str[body_start + 4..];
-                                        log::info!("[oauth] challenge page: {} bytes", body.len());
-
-                                        // Try Cloudflare solver
-                                        let result = wraith_dom::cloudflare::handle_cloudflare_response(403, body.as_bytes(), "console.anthropic.com", "/settings/keys", "");
-                                        match result {
-                                            Some(cookie) => {
-                                                log::info!("[oauth] !! CLOUDFLARE SOLVED !!");
-                                                log::info!("[oauth] cookie: {}", cookie.cookie);
-                                                // TODO: re-fetch with cookie
-                                            }
-                                            None => {
-                                                log::warn!("[oauth] Cloudflare solver couldn't crack it");
-                                                log::info!("[oauth] challenge JS may need features js-lite doesn't have yet");
-                                            }
+                                // Collect Set-Cookie headers
+                                for line in resp_str.split("\r\n") {
+                                    if let Some(rest) = line.strip_prefix("Set-Cookie:").or_else(|| line.strip_prefix("set-cookie:")) {
+                                        if let Some(nv) = rest.trim().split(';').next() {
+                                            if !cookies.is_empty() { cookies.push_str("; "); }
+                                            cookies.push_str(nv);
+                                            log::info!("[oauth] cookie: {}", nv);
                                         }
                                     }
-                                } else {
-                                    log::info!("[oauth] no Cloudflare challenge! got real page");
-                                    // Show first 500 chars
-                                    let preview = if resp_str.len() > 500 { &resp_str[..500] } else { resp_str };
+                                }
+
+                                // Parse status code
+                                let status = resp_str.split(' ').nth(1)
+                                    .and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+
+                                // Check for redirect
+                                if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                                    if let Some(loc_line) = resp_str.split("\r\n").find(|l| l.starts_with("Location:") || l.starts_with("location:")) {
+                                        let location = loc_line.splitn(2, ':').nth(1).unwrap_or("").trim();
+                                        log::info!("[oauth] {} redirect -> {}", status, location);
+                                        if let Some(rest) = location.strip_prefix("https://") {
+                                            let (host, path) = if let Some(slash) = rest.find('/') {
+                                                (&rest[..slash], &rest[slash..])
+                                            } else {
+                                                (rest, "/")
+                                            };
+                                            current_host = alloc::string::String::from(host);
+                                            current_path = alloc::string::String::from(path);
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                // Final page — show it
+                                log::info!("[oauth] ============================================");
+                                log::info!("[oauth] FINAL PAGE: HTTP {} on {}{}", status, current_host, current_path);
+                                log::info!("[oauth] ============================================");
+                                if let Some(pos) = resp_str.find("\r\n\r\n") {
+                                    let body = &resp_str[pos + 4..];
+                                    let preview = if body.len() > 1500 { &body[..1500] } else { body };
                                     log::info!("[oauth] {}", preview);
                                 }
+                                log::info!("[oauth] cookies: {}", cookies);
+                                break;
                             }
                             Err(e) => {
-                                log::error!("[oauth] HTTPS request failed: {:?}", e);
-                                log::info!("[oauth] falling back to auth relay...");
+                                log::error!("[oauth] request failed: {:?}", e);
+                                break;
                             }
                         }
+                        } // end redirect loop
 
                         // Fallback: auth relay
                         // Fetch API key from auth relay (plain HTTP to gateway:8444).
