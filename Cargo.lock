@@ -236,6 +236,7 @@ dependencies = [
  "serde_json",
  "spin",
  "vte",
+ "wraith-dom",
  "x86_64",
 ]
 

@@ -25,3 +25,4 @@ claudio-auth = { path = "../crates/auth" }
 claudio-agent = { path = "../crates/agent" }
 claudio-fs = { path = "../crates/fs-persist" }
 claudio-rustc = { path = "../crates/rustc-lite" }
+wraith-dom = { path = "../crates/wraith-dom" }

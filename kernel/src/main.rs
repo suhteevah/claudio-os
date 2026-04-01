@@ -304,12 +304,76 @@ async fn main_async() {
 
                     // ── Step 2: Authentication ────────────────────────────────
 
-                    // Check baked-in key first, then try auth relay.
+                    // Check baked-in key first, then try OAuth, then relay.
                     let mut api_key_buf = alloc::string::String::new();
                     if let Some(key) = option_env!("CLAUDIO_API_KEY") {
                         api_key_buf = alloc::string::String::from(key);
                         log::info!("[auth] using compile-time API key ({} chars)", api_key_buf.len());
                     } else {
+                        // ── Try OAuth: fetch Anthropic console via native HTTPS ──
+                        log::info!("[oauth] ============================================");
+                        log::info!("[oauth] ATTEMPTING BROWSER-BASED OAUTH");
+                        log::info!("[oauth] Fetching console.anthropic.com via native TLS...");
+                        log::info!("[oauth] ============================================");
+
+                        let seed = interrupts::tick_count();
+                        let oauth_req = claudio_net::http::HttpRequest::get(
+                            "console.anthropic.com",
+                            "/settings/keys",
+                        )
+                        .header("User-Agent", "ClaudioOS/0.1 (bare-metal Rust OS)")
+                        .header("Accept", "text/html")
+                        .header("Connection", "close");
+
+                        match claudio_net::https_request(
+                            &mut stack, "console.anthropic.com", 443,
+                            &oauth_req.to_bytes(), now, seed,
+                        ) {
+                            Ok(resp_bytes) => {
+                                let resp_str = core::str::from_utf8(&resp_bytes).unwrap_or("<binary>");
+                                log::info!("[oauth] got {} bytes from console.anthropic.com", resp_bytes.len());
+
+                                // Check for Cloudflare challenge
+                                let is_cf = resp_str.contains("Just a moment")
+                                    || resp_str.contains("cf_chl")
+                                    || resp_str.contains("challenge-platform");
+
+                                if is_cf {
+                                    log::info!("[oauth] Cloudflare challenge detected! Attempting to solve...");
+
+                                    // Extract body from HTTP response
+                                    if let Some(body_start) = resp_str.find("\r\n\r\n") {
+                                        let body = &resp_str[body_start + 4..];
+                                        log::info!("[oauth] challenge page: {} bytes", body.len());
+
+                                        // Try Cloudflare solver
+                                        let result = wraith_dom::cloudflare::handle_cloudflare_response(403, body.as_bytes(), "console.anthropic.com", "/settings/keys", "");
+                                        match result {
+                                            Some(cookie) => {
+                                                log::info!("[oauth] !! CLOUDFLARE SOLVED !!");
+                                                log::info!("[oauth] cookie: {}", cookie.cookie);
+                                                // TODO: re-fetch with cookie
+                                            }
+                                            None => {
+                                                log::warn!("[oauth] Cloudflare solver couldn't crack it");
+                                                log::info!("[oauth] challenge JS may need features js-lite doesn't have yet");
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    log::info!("[oauth] no Cloudflare challenge! got real page");
+                                    // Show first 500 chars
+                                    let preview = if resp_str.len() > 500 { &resp_str[..500] } else { resp_str };
+                                    log::info!("[oauth] {}", preview);
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("[oauth] HTTPS request failed: {:?}", e);
+                                log::info!("[oauth] falling back to auth relay...");
+                            }
+                        }
+
+                        // Fallback: auth relay
                         // Fetch API key from auth relay (plain HTTP to gateway:8444).
                         // Run `python tools/auth-relay.py` on host.
                         log::info!("[auth] no compile-time key, trying auth relay...");
