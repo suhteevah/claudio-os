@@ -11,6 +11,7 @@ if ((Test-Path $credFile) -and ((Get-Content $credFile -Raw).Trim().Length -gt 0
 
 # Run QEMU with graphical window (framebuffer + PS/2 keyboard)
 # Serial output goes to stdout for logging
+# -display gtk,grab-on-hover=on ensures keyboard input reaches PS/2 controller
 & "C:\Program Files\qemu\qemu-system-x86_64.exe" `
     -cpu Haswell `
     -drive "if=pflash,format=raw,readonly=on,file=C:\Program Files\qemu\share\edk2-x86_64-code.fd" `
@@ -18,6 +19,7 @@ if ((Test-Path $credFile) -and ((Get-Content $credFile -Raw).Trim().Length -gt 0
     -device virtio-net-pci,netdev=net0 `
     -netdev user,id=net0 `
     -serial stdio `
-    -m 512M `
+    -display gtk,grab-on-hover=on `
+    -m 1G `
     -no-reboot `
     @fwCfgArgs

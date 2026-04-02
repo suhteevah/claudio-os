@@ -1,7 +1,8 @@
-//! Font rendering using noto-sans-mono-bitmap.
+//! Font rendering using embedded Terminus 8×16 bitmap font.
 //!
 //! Provides character-level rendering to any [`DrawTarget`](super::DrawTarget)
-//! using pre-rasterised glyphs from the Noto Sans Mono font.
+//! using the Terminus font — a crisp, pixel-perfect bitmap font designed
+//! specifically for terminal use. No anti-aliasing, no sub-pixel fuzz.
 //!
 //! ## Fast-path rendering
 //!
@@ -11,13 +12,13 @@
 //! `core::ptr::write_volatile`. This is the TempleOS-style approach: treat the
 //! framebuffer as a flat array and memcpy scanlines.
 
-use noto_sans_mono_bitmap::{get_raster, get_raster_width, FontWeight, RasterHeight};
+use super::terminus;
 
 /// Height of each character cell in pixels.
-pub const FONT_HEIGHT: usize = 16;
+pub const FONT_HEIGHT: usize = terminus::CHAR_HEIGHT;
 
 /// Width of each character cell in pixels (monospace — constant for all glyphs).
-pub const FONT_WIDTH: usize = get_raster_width(FontWeight::Regular, RasterHeight::Size16);
+pub const FONT_WIDTH: usize = terminus::CHAR_WIDTH;
 
 /// An RGB colour triple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,9 +66,11 @@ impl Color {
 
 /// Render a single character glyph into `target` at pixel position (`x`, `y`).
 ///
+/// Uses the Terminus 8×16 bitmap font. Each glyph row is a single byte where
+/// bit 7 (MSB) = leftmost pixel. A set bit renders as `fg`, clear bit as `bg`.
+///
 /// When the target provides a direct buffer via `buffer_mut()`, this writes
 /// pixels directly into the buffer — no per-pixel function call overhead.
-/// Missing glyphs are replaced with `'?'`.
 pub fn render_char<D: super::DrawTarget>(
     target: &mut D,
     x: usize,
@@ -76,11 +79,7 @@ pub fn render_char<D: super::DrawTarget>(
     fg: Color,
     bg: Color,
 ) {
-    let raster = get_raster(c, FontWeight::Regular, RasterHeight::Size16)
-        .unwrap_or_else(|| {
-            get_raster('?', FontWeight::Regular, RasterHeight::Size16)
-                .expect("fallback glyph '?' must exist")
-        });
+    let glyph = terminus::get_glyph(c);
 
     let stride = target.stride();
     let bpp = target.bytes_per_pixel();
@@ -91,22 +90,22 @@ pub fn render_char<D: super::DrawTarget>(
 
     // Fast path: direct buffer writes
     if let Some(buf) = target.buffer_mut() {
-        for (row_idx, row) in raster.raster().iter().enumerate() {
+        for (row_idx, &row_bits) in glyph.iter().enumerate() {
             let py = y + row_idx;
             if py >= th {
                 break;
             }
             let row_base = py * stride * bpp;
-            for (col_idx, &intensity) in row.iter().enumerate() {
+            for col_idx in 0..FONT_WIDTH {
                 let px = x + col_idx;
                 if px >= tw {
                     break;
                 }
                 let offset = row_base + px * bpp;
-                // Safety: we bounds-checked px < tw and py < th, and the buffer
-                // is sized to stride * height * bpp.
+                // Test bit (MSB = leftmost pixel): bit 7 for col 0, bit 6 for col 1, etc.
+                let is_set = (row_bits >> (7 - col_idx)) & 1 != 0;
                 if offset + 3 < buf.len() {
-                    let pixel = if intensity > 128 { &fg_bgr } else { &bg_bgr };
+                    let pixel = if is_set { &fg_bgr } else { &bg_bgr };
                     // Use write_volatile to ensure the write hits the backing
                     // store (important for memory-mapped framebuffers).
                     unsafe {
@@ -119,11 +118,12 @@ pub fn render_char<D: super::DrawTarget>(
     }
 
     // Slow fallback: per-pixel function calls (backward compat).
-    for (row_idx, row) in raster.raster().iter().enumerate() {
-        for (col_idx, &intensity) in row.iter().enumerate() {
+    for (row_idx, &row_bits) in glyph.iter().enumerate() {
+        for col_idx in 0..FONT_WIDTH {
             let px = x + col_idx;
             let py = y + row_idx;
-            if intensity > 128 {
+            let is_set = (row_bits >> (7 - col_idx)) & 1 != 0;
+            if is_set {
                 target.put_pixel(px, py, fg.r, fg.g, fg.b);
             } else {
                 target.put_pixel(px, py, bg.r, bg.g, bg.b);
@@ -156,7 +156,6 @@ pub fn fill_rect<D: super::DrawTarget>(
     // Fast path: direct buffer writes with scanline memcpy.
     if let Some(buf) = target.buffer_mut() {
         // Build one scanline worth of pixel data, then memcpy it to each row.
-        // For a typical 1280-wide fill, this is ~5KB on the stack — fine.
         let clamped_w = w.min(tw.saturating_sub(x));
         let pixel = color.to_bgr32();
 

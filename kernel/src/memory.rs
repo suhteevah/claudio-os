@@ -10,10 +10,11 @@ use x86_64::structures::paging::{
 };
 use x86_64::{PhysAddr, VirtAddr};
 
-/// Kernel heap: 16 MiB — needs room for VirtIO queues, smoltcp buffers,
-/// log formatting, BTreeMap allocations, and the 256 KiB stack we allocate.
+/// Kernel heap: 64 MiB — needs room for VirtIO queues, smoltcp buffers,
+/// log formatting, BTreeMap allocations, double-buffered framebuffer
+/// (2560x1600x4x2 = 32 MiB at high res), and the 4 MiB kernel stack.
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+pub const HEAP_SIZE: usize = 48 * 1024 * 1024; // 48 MiB (double-buffered 2560x1600 = ~32 MiB + kernel stack + buffers)
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();

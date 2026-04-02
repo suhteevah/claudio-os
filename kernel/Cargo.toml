@@ -13,7 +13,6 @@ spin = { workspace = true }
 log = { workspace = true }
 conquer-once = { workspace = true }
 pc-keyboard = { workspace = true }
-noto-sans-mono-bitmap = { workspace = true }
 vte = { workspace = true }
 serde_json = { workspace = true }
 

@@ -40,6 +40,14 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
     // Request a larger kernel stack — default is too small for interrupt handlers
     // with the log crate's formatting. 128 KiB should be plenty.
     config.kernel_stack_size = 128 * 1024;
+    // Request 1920×1080 framebuffer resolution (or the highest available).
+    // The bootloader will pick the closest GOP mode that meets these minimums,
+    // falling back to a smaller mode if the display doesn't support 1080p.
+    #[allow(deprecated)]
+    {
+        config.frame_buffer.minimum_framebuffer_width = Some(1920);
+        config.frame_buffer.minimum_framebuffer_height = Some(1080);
+    }
     config
 };
 
@@ -307,6 +315,7 @@ async fn main_async() {
                     // Check for saved session via QEMU fw_cfg, then compile-time, then OAuth
                     let mut api_key_buf = alloc::string::String::new();
                     let mut session_cookie_buf = alloc::string::String::new();
+                    let mut saved_conv_id = alloc::string::String::new();
 
                     // Try reading session from QEMU fw_cfg (opt/claudio/session)
                     {
@@ -363,7 +372,15 @@ async fn main_async() {
                                 if let Ok(s) = core::str::from_utf8(&session_data) {
                                     let trimmed = s.trim();
                                     if !trimmed.is_empty() {
-                                        session_cookie_buf = alloc::string::String::from(trimmed);
+                                        // Format: "cookie\nconv_id" or just "cookie"
+                                        let mut lines = trimmed.splitn(2, '\n');
+                                        if let Some(cookie) = lines.next() {
+                                            session_cookie_buf = alloc::string::String::from(cookie.trim());
+                                        }
+                                        if let Some(conv) = lines.next() {
+                                            saved_conv_id = alloc::string::String::from(conv.trim());
+                                            log::info!("[auth] loaded saved conversation: {}", saved_conv_id);
+                                        }
                                         log::info!("[auth] loaded saved session from fw_cfg ({} bytes)", trimmed.len());
                                     }
                                 }
@@ -826,7 +843,11 @@ async fn main_async() {
 
                         let org_id = "9cb75ae8-c9bb-4ef3-afed-7ff716b22fd3";
 
-                        // Step 1: Create conversation
+                        // Step 1: Create or reuse conversation
+                        let conv_uuid = if !saved_conv_id.is_empty() {
+                            log::info!("[claude.ai] reusing saved conversation: {}", saved_conv_id);
+                            Some(saved_conv_id.clone())
+                        } else {
                         log::info!("[claude.ai] creating conversation...");
                         let create_body = br#"{"name":"","project_uuid":null}"#;
                         let create_path = alloc::format!("/api/organizations/{}/chat_conversations", org_id);
@@ -841,7 +862,7 @@ async fn main_async() {
                         .header("Referer", "https://claude.ai/new")
                         .header("Connection", "close");
                         let seed = interrupts::tick_count();
-                        let conv_uuid = match claudio_net::https_request(
+                        match claudio_net::https_request(
                             &mut stack, "claude.ai", 443, &create_req.to_bytes(), now, seed,
                         ) {
                             Ok(resp) => {
@@ -867,9 +888,15 @@ async fn main_async() {
                                 }
                             }
                             Err(e) => { log::error!("[claude.ai] create request failed: {:?}", e); None }
-                        };
+                        }
+                        }; // end if saved_conv_id
 
                         if let Some(conv_id) = conv_uuid {
+                            // Save conv_id for reuse across reboots
+                            if saved_conv_id.is_empty() {
+                                log::info!("[oauth] SAVE_CONV:{}", conv_id);
+                            }
+
                             // Step 2: Send a message
                             log::info!("[claude.ai] sending test message...");
                             let msg_body = alloc::format!(
