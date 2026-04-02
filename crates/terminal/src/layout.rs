@@ -165,7 +165,7 @@ impl Layout {
 
     // -- rendering ----------------------------------------------------------
 
-    /// Render all panes and separators onto the draw target.
+    /// Render all panes and separators onto the draw target (full redraw).
     pub fn render_all<D: super::DrawTarget>(&self, target: &mut D) {
         for (i, pane) in self.panes.iter().enumerate() {
             pane.render(target);
@@ -174,6 +174,40 @@ impl Layout {
             }
         }
         // Draw separators.
+        self.render_separators(target, &self.root);
+    }
+
+    /// Render only dirty rows of dirty panes, plus cursor delta on the
+    /// focused pane. This is the fast path for typing — typically re-renders
+    /// only 1 character row (~16 pixel-rows) instead of the full screen.
+    ///
+    /// Returns `true` if anything was rendered (caller may need to
+    /// blit the back buffer to the front buffer).
+    pub fn render_dirty<D: super::DrawTarget>(&mut self, target: &mut D) -> bool {
+        let mut rendered = false;
+        for (i, pane) in self.panes.iter_mut().enumerate() {
+            if pane.is_dirty() {
+                pane.render_dirty(target);
+                pane.clear_dirty();
+                rendered = true;
+            }
+            if i == self.focused_idx {
+                pane.render_cursor_delta(target);
+                rendered = true;
+            }
+        }
+        rendered
+    }
+
+    /// Full render of all panes, then clear all dirty flags.
+    pub fn render_all_and_clear<D: super::DrawTarget>(&mut self, target: &mut D) {
+        for (i, pane) in self.panes.iter_mut().enumerate() {
+            pane.render(target);
+            if i == self.focused_idx {
+                pane.render_cursor_delta(target);
+            }
+            pane.clear_dirty();
+        }
         self.render_separators(target, &self.root);
     }
 

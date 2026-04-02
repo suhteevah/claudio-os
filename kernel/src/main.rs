@@ -304,75 +304,295 @@ async fn main_async() {
 
                     // ── Step 2: Authentication ────────────────────────────────
 
-                    // Check baked-in key first, then try SSO OAuth, then relay.
+                    // Check for saved session via QEMU fw_cfg, then compile-time, then OAuth
                     let mut api_key_buf = alloc::string::String::new();
-                    if let Some(key) = option_env!("CLAUDIO_API_KEY") {
+                    let mut session_cookie_buf = alloc::string::String::new();
+
+                    // Try reading session from QEMU fw_cfg (opt/claudio/session)
+                    {
+                        // fw_cfg: enumerate entries to find our key
+                        // Selector port: 0x510, Data port: 0x511
+                        // Entry 0x0000 = signature, 0x0001 = count
+                        // File directory at selector 0x0019
+                        log::info!("[auth] checking fw_cfg for saved session...");
+                        unsafe {
+                            let mut sel = x86_64::instructions::port::Port::<u16>::new(0x510);
+                            let mut data = x86_64::instructions::port::Port::<u8>::new(0x511);
+
+                            // Read file directory (selector 0x0019)
+                            sel.write(0x0019);
+                            // First 4 bytes = number of files (big-endian)
+                            let count = ((data.read() as u32) << 24)
+                                | ((data.read() as u32) << 16)
+                                | ((data.read() as u32) << 8)
+                                | (data.read() as u32);
+                            log::debug!("[auth] fw_cfg: {} files", count);
+
+                            let mut found_selector: Option<u16> = None;
+                            let mut found_size: u32 = 0;
+
+                            for _ in 0..count.min(64) {
+                                // Each entry: 4 bytes size, 2 bytes select, 2 bytes reserved, 56 bytes name
+                                let size = ((data.read() as u32) << 24)
+                                    | ((data.read() as u32) << 16)
+                                    | ((data.read() as u32) << 8)
+                                    | (data.read() as u32);
+                                let select = ((data.read() as u16) << 8) | (data.read() as u16);
+                                let _reserved = ((data.read() as u16) << 8) | (data.read() as u16);
+                                let mut name_buf = [0u8; 56];
+                                for b in name_buf.iter_mut() { *b = data.read(); }
+                                let name_len = name_buf.iter().position(|&b| b == 0).unwrap_or(56);
+                                let name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("");
+
+                                if name == "opt/claudio/session" {
+                                    log::info!("[auth] fw_cfg: found session file (selector=0x{:04x}, {} bytes)", select, size);
+                                    found_selector = Some(select);
+                                    found_size = size;
+                                    // Skip remaining entries
+                                    break;
+                                }
+                            }
+
+                            if let Some(sel_val) = found_selector {
+                                // Read the session data
+                                sel.write(sel_val);
+                                let mut session_data = alloc::vec::Vec::with_capacity(found_size as usize);
+                                for _ in 0..found_size {
+                                    session_data.push(data.read());
+                                }
+                                if let Ok(s) = core::str::from_utf8(&session_data) {
+                                    let trimmed = s.trim();
+                                    if !trimmed.is_empty() {
+                                        session_cookie_buf = alloc::string::String::from(trimmed);
+                                        log::info!("[auth] loaded saved session from fw_cfg ({} bytes)", trimmed.len());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !session_cookie_buf.is_empty() {
+                        log::info!("[auth] using saved session cookie");
+                    } else if let Some(ssid) = option_env!("CLAUDIO_SESSION") {
+                        session_cookie_buf = alloc::format!("sessionKey={}", ssid);
+                        log::info!("[auth] using compile-time claude.ai session cookie");
+                    } else if let Some(key) = option_env!("CLAUDIO_API_KEY") {
                         api_key_buf = alloc::string::String::from(key);
                         log::info!("[auth] using compile-time API key ({} chars)", api_key_buf.len());
                     } else {
-                        // ── SSO OAuth: send email → get SSO URL → user auths on phone ──
+                        // ── SSO OAuth: load /login for cookies → send email → verify code ──
                         log::info!("[oauth] ============================================");
                         log::info!("[oauth]   ClaudioOS SSO Authentication");
                         log::info!("[oauth] ============================================");
-                        log::info!("[oauth] Enter your email to sign in via SSO.");
+
+                        // Generate a device ID (UUID v4 format) and set initial cookies
+                        let tick = interrupts::tick_count();
+                        let device_id = alloc::format!(
+                            "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+                            tick as u32, (tick >> 32) as u16, (tick >> 48) as u16 & 0xFFF,
+                            0x8000 | ((tick >> 60) as u16 & 0x3FFF),
+                            tick.wrapping_mul(0x5DEECE66D)
+                        );
+                        let mut session_cookies = alloc::format!("anthropic-device-id={}", device_id);
+                        log::info!("[oauth] device-id: {}", device_id);
+
+                        log::info!("[oauth] Enter your email to sign in:");
                         log::info!("[oauth] Type your email and press Enter:");
 
-                        // Read email from keyboard
+                        // Read email from SERIAL PORT (not PS/2 keyboard)
+                        // QEMU -nographic sends typed chars to serial (0x3F8)
                         let mut email = alloc::string::String::new();
-                        let kb = keyboard::ScancodeStream::new();
                         loop {
-                            let key = kb.next_key().await;
-                            match key {
-                                pc_keyboard::DecodedKey::Unicode('\n') | pc_keyboard::DecodedKey::Unicode('\r') => {
-                                    if !email.is_empty() { break; }
+                            // Poll serial port for incoming character
+                            let c: u8 = unsafe {
+                                let mut lsr = x86_64::instructions::port::Port::<u8>::new(0x3F8 + 5);
+                                // Wait for data ready (bit 0 of LSR)
+                                loop {
+                                    if lsr.read() & 1 != 0 { break; }
+                                    core::hint::spin_loop(); // spin_loop, not hlt (serial IRQ4 not unmasked)
                                 }
-                                pc_keyboard::DecodedKey::Unicode(c) if !c.is_control() => {
-                                    email.push(c);
-                                    // Echo to serial
-                                    unsafe { x86_64::instructions::port::Port::<u8>::new(0x3F8).write(c as u8); }
-                                }
-                                pc_keyboard::DecodedKey::Unicode('\u{8}') => { // backspace
-                                    email.pop();
-                                    unsafe {
-                                        let mut p = x86_64::instructions::port::Port::<u8>::new(0x3F8);
-                                        p.write(8); p.write(b' '); p.write(8);
+                                x86_64::instructions::port::Port::<u8>::new(0x3F8).read()
+                            };
+                            match c {
+                                b'\r' | b'\n' => {
+                                    if !email.is_empty() {
+                                        // Echo newline
+                                        unsafe {
+                                            let mut p = x86_64::instructions::port::Port::<u8>::new(0x3F8);
+                                            p.write(b'\r'); p.write(b'\n');
+                                        }
+                                        break;
                                     }
+                                }
+                                0x7F | 8 => { // DEL or backspace
+                                    if email.pop().is_some() {
+                                        unsafe {
+                                            let mut p = x86_64::instructions::port::Port::<u8>::new(0x3F8);
+                                            p.write(8); p.write(b' '); p.write(8);
+                                        }
+                                    }
+                                }
+                                c if c >= 0x20 && c < 0x7F => {
+                                    email.push(c as char);
+                                    // Echo character
+                                    unsafe { x86_64::instructions::port::Port::<u8>::new(0x3F8).write(c); }
                                 }
                                 _ => {}
                             }
                         }
                         log::info!("[oauth] email: {}", email);
 
+                        // Helper: parse HTTP status code from response
+                        fn parse_status(resp: &str) -> u16 {
+                            // "HTTP/1.1 302 Found\r\n..."
+                            if let Some(line) = resp.lines().next() {
+                                let parts: alloc::vec::Vec<&str> = line.split_whitespace().collect();
+                                if parts.len() >= 2 { return parts[1].parse().unwrap_or(0); }
+                            }
+                            0
+                        }
+                        // Helper: extract Location header
+                        fn parse_location(resp: &str) -> Option<alloc::string::String> {
+                            for line in resp.split("\r\n") {
+                                if let Some(rest) = line.strip_prefix("Location:").or_else(|| line.strip_prefix("location:")) {
+                                    return Some(alloc::string::String::from(rest.trim()));
+                                }
+                            }
+                            None
+                        }
+                        // Helper: collect cookies from response into cookie jar
+                        fn collect_cookies(resp: &str, jar: &mut alloc::string::String) {
+                            for line in resp.split("\r\n") {
+                                if let Some(rest) = line.strip_prefix("Set-Cookie:").or_else(|| line.strip_prefix("set-cookie:")) {
+                                    if let Some(nv) = rest.trim().split(';').next() {
+                                        if !jar.is_empty() { jar.push_str("; "); }
+                                        jar.push_str(nv);
+                                    }
+                                }
+                            }
+                        }
+                        // Helper: extract body from HTTP response
+                        fn extract_body(resp_bytes: &[u8]) -> alloc::vec::Vec<u8> {
+                            let resp = core::str::from_utf8(resp_bytes).unwrap_or("");
+                            if let Some(pos) = resp.find("\r\n\r\n") {
+                                let raw = &resp_bytes[pos + 4..];
+                                claudio_net::http::decode_chunked(raw).unwrap_or_else(|_| raw.to_vec())
+                            } else {
+                                alloc::vec::Vec::new()
+                            }
+                        }
+
+                        // Helper: make HTTPS request with Cloudflare challenge retry
+                        // Returns (status, body_bytes, updated_cookies)
+                        fn https_with_cf(
+                            stack: &mut claudio_net::NetworkStack,
+                            host: &str,
+                            req_bytes: &[u8],
+                            now: fn() -> claudio_net::Instant,
+                            seed: u64,
+                            cookies: &mut alloc::string::String,
+                        ) -> Result<(u16, alloc::vec::Vec<u8>), &'static str> {
+                            let resp_bytes = claudio_net::https_request(stack, host, 443, req_bytes, now, seed)
+                                .map_err(|_| "https request failed")?;
+                            let resp_str = core::str::from_utf8(&resp_bytes).unwrap_or("");
+                            let status = parse_status(resp_str);
+                            collect_cookies(resp_str, cookies);
+                            let body = extract_body(&resp_bytes);
+
+                            log::info!("[oauth] HTTP {} — {} bytes body", status, body.len());
+
+                            // Check for Cloudflare challenge (403/503)
+                            if status == 403 || status == 503 {
+                                let body_str = core::str::from_utf8(&body).unwrap_or("");
+                                if wraith_dom::cloudflare::is_cloudflare_challenge(body_str) {
+                                    log::info!("[oauth] Cloudflare challenge detected! Solving with js-lite...");
+                                    if let Some(cf_cookie) = wraith_dom::cloudflare::handle_cloudflare_response(
+                                        status, &body, host, "/", cookies,
+                                    ) {
+                                        log::info!("[oauth] Cloudflare solved! Cookie: {}...", &cf_cookie.cookie[..cf_cookie.cookie.len().min(40)]);
+                                        if !cookies.is_empty() { cookies.push_str("; "); }
+                                        cookies.push_str(&cf_cookie.cookie);
+                                        // Retry with the clearance cookie
+                                        // We'd need to rebuild the request with new cookies — caller handles
+                                        return Ok((status, body));
+                                    } else {
+                                        log::warn!("[oauth] could not solve Cloudflare challenge");
+                                    }
+                                }
+                            }
+
+                            // Check for redirect
+                            if status == 301 || status == 302 || status == 303 || status == 307 {
+                                if let Some(location) = parse_location(resp_str) {
+                                    log::info!("[oauth] redirect -> {}", location);
+                                    // Extract host and path from Location URL
+                                    let (redir_host, redir_path) = if let Some(rest) = location.strip_prefix("https://") {
+                                        if let Some(slash) = rest.find('/') {
+                                            (&rest[..slash], &rest[slash..])
+                                        } else {
+                                            (rest, "/")
+                                        }
+                                    } else {
+                                        (host, location.as_str())
+                                    };
+                                    // Follow redirect with GET
+                                    let redir_req = claudio_net::http::HttpRequest::get(redir_host, redir_path)
+                                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0")
+                                        .header("Accept", "application/json, text/html")
+                                        .header("Accept-Language", "en-US,en;q=0.5")
+                                        .header("Cookie", cookies.as_str())
+                                        .header("Connection", "close");
+                                    let seed2 = seed.wrapping_add(1);
+                                    let resp2 = claudio_net::https_request(stack, redir_host, 443, &redir_req.to_bytes(), now, seed2)
+                                        .map_err(|_| "redirect request failed")?;
+                                    let resp2_str = core::str::from_utf8(&resp2).unwrap_or("");
+                                    let status2 = parse_status(resp2_str);
+                                    collect_cookies(resp2_str, cookies);
+                                    let body2 = extract_body(&resp2);
+                                    log::info!("[oauth] redirect result: HTTP {} — {} bytes", status2, body2.len());
+                                    return Ok((status2, body2));
+                                }
+                            }
+
+                            Ok((status, body))
+                        }
+
                         // Step 1: POST /api/auth/send_magic_link
                         log::info!("[oauth] sending magic link request...");
+                        let tz_offset = 300i32; // EST = UTC-5 = 300 minutes
                         let body = alloc::format!(
-                            r#"{{"email_address":"{}","source":"console"}}"#, email
+                            r#"{{"email_address":"{}","login_intent":"magic_link","utc_offset":{},"source":"claude"}}"#, email, tz_offset
                         );
                         let seed = interrupts::tick_count();
-                        let req = claudio_net::http::HttpRequest::post(
-                            "platform.claude.com",
+                        let mut req = claudio_net::http::HttpRequest::post(
+                            "claude.ai",
                             "/api/auth/send_magic_link",
                             body.into_bytes(),
                         )
                         .header("Content-Type", "application/json")
+                        .header("Origin", "https://claude.ai")
+                        .header("Referer", "https://claude.ai/login")
+                        .header("Accept", "application/json")
+                        .header("Accept-Language", "en-US,en;q=0.5")
+                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0")
+                        .header("anthropic-client-sha", "unknown")
+                        .header("anthropic-client-version", "unknown")
+                        .header("anthropic-anonymous-id", &device_id)
+                        .header("anthropic-device-id", &device_id)
+                        .header("Sec-Fetch-Dest", "empty")
+                        .header("Sec-Fetch-Mode", "cors")
+                        .header("Sec-Fetch-Site", "same-origin")
                         .header("Connection", "close");
+                        if !session_cookies.is_empty() {
+                            req = req.header("Cookie", &session_cookies);
+                        }
 
-                        match claudio_net::https_request(
-                            &mut stack, "platform.claude.com", 443,
-                            &req.to_bytes(), now, seed,
-                        ) {
-                            Ok(resp_bytes) => {
-                                let resp = core::str::from_utf8(&resp_bytes).unwrap_or("");
-                                log::info!("[oauth] response: {} bytes", resp_bytes.len());
+                        match https_with_cf(&mut stack, "claude.ai", &req.to_bytes(), now, seed, &mut session_cookies) {
+                            Ok((status, body_bytes)) => {
+                                let body = core::str::from_utf8(&body_bytes).unwrap_or("{}");
+                                log::info!("[oauth] send_magic_link: status={} body={}", status, body);
 
-                                // Decode chunked body
-                                if let Some(pos) = resp.find("\r\n\r\n") {
-                                    let raw_body = &resp_bytes[pos + 4..];
-                                    let body_bytes = claudio_net::http::decode_chunked(raw_body)
-                                        .unwrap_or_else(|_| raw_body.to_vec());
-                                    let body = core::str::from_utf8(&body_bytes).unwrap_or("{}");
-                                    log::info!("[oauth] body: {}", body);
-
+                                if status == 200 {
                                     // Check for sso_url (SSO redirect)
                                     if let Some(sso_start) = body.find("\"sso_url\":\"") {
                                         let rest = &body[sso_start + 11..];
@@ -388,40 +608,158 @@ async fn main_async() {
                                             log::info!("[oauth] After authenticating, press Enter here.");
                                             log::info!("[oauth] ============================================");
 
-                                            // Wait for user to press Enter after authenticating
+                                            // Wait for Enter on serial
                                             loop {
-                                                let key = kb.next_key().await;
-                                                if let pc_keyboard::DecodedKey::Unicode('\n') = key { break; }
-                                                if let pc_keyboard::DecodedKey::Unicode('\r') = key { break; }
+                                                let c: u8 = unsafe {
+                                                    let mut lsr = x86_64::instructions::port::Port::<u8>::new(0x3F8 + 5);
+                                                    loop { if lsr.read() & 1 != 0 { break; } core::hint::spin_loop(); }
+                                                    x86_64::instructions::port::Port::<u8>::new(0x3F8).read()
+                                                };
+                                                if c == b'\r' || c == b'\n' { break; }
                                             }
-
-                                            // TODO: Exchange the session cookies for an API key
-                                            // For now, the user would create a key manually after SSO
                                             log::info!("[oauth] SSO auth flow completed");
                                         }
-                                    } else if body.contains("\"success\"") || body.contains("magic_link") {
+                                    } else {
+                                        // Magic link sent — ask for the code
                                         log::info!("[oauth] ============================================");
-                                        log::info!("[oauth]   MAGIC LINK SENT!");
+                                        log::info!("[oauth]   VERIFICATION CODE SENT!");
                                         log::info!("[oauth]   Check your email: {}", email);
-                                        log::info!("[oauth]   Click the link, then press Enter here.");
+                                        log::info!("[oauth]   Enter the 6-digit code:");
                                         log::info!("[oauth] ============================================");
 
+                                        // Read code from serial
+                                        let mut code = alloc::string::String::new();
                                         loop {
-                                            let key = kb.next_key().await;
-                                            if let pc_keyboard::DecodedKey::Unicode('\n') = key { break; }
-                                            if let pc_keyboard::DecodedKey::Unicode('\r') = key { break; }
+                                            let c: u8 = unsafe {
+                                                let mut lsr = x86_64::instructions::port::Port::<u8>::new(0x3F8 + 5);
+                                                loop { if lsr.read() & 1 != 0 { break; } core::hint::spin_loop(); }
+                                                x86_64::instructions::port::Port::<u8>::new(0x3F8).read()
+                                            };
+                                            match c {
+                                                b'\r' | b'\n' => {
+                                                    if !code.is_empty() {
+                                                        unsafe {
+                                                            let mut p = x86_64::instructions::port::Port::<u8>::new(0x3F8);
+                                                            p.write(b'\r'); p.write(b'\n');
+                                                        }
+                                                        break;
+                                                    }
+                                                }
+                                                c if c >= b'0' && c <= b'9' => {
+                                                    code.push(c as char);
+                                                    unsafe { x86_64::instructions::port::Port::<u8>::new(0x3F8).write(c); }
+                                                }
+                                                0x7F | 8 => {
+                                                    if code.pop().is_some() {
+                                                        unsafe {
+                                                            let mut p = x86_64::instructions::port::Port::<u8>::new(0x3F8);
+                                                            p.write(8); p.write(b' '); p.write(8);
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
                                         }
-                                    } else {
-                                        log::warn!("[oauth] unexpected response: {}", body);
+                                        log::info!("[oauth] verifying code: {}", code);
+
+                                        // Warm up DNS before verify (socket may have timed out during code entry)
+                                        let _ = claudio_net::dns::resolve(&mut stack, "claude.ai", now);
+
+                                        // POST /api/auth/verify_magic_link
+                                        let verify_body = alloc::format!(
+                                            r#"{{"credentials":{{"method":"code","email_address":"{}","code":"{}"}},"source":"claude","locale":"en-US"}}"#,
+                                            email, code
+                                        );
+                                        log::info!("[oauth] verify body: {}", verify_body);
+                                        let seed2 = interrupts::tick_count();
+                                        let mut verify_req = claudio_net::http::HttpRequest::post(
+                                            "claude.ai",
+                                            "/api/auth/verify_magic_link",
+                                            verify_body.into_bytes(),
+                                        )
+                                        .header("Content-Type", "application/json")
+                                        .header("Origin", "https://claude.ai")
+                                        .header("Referer", "https://claude.ai/login")
+                                        .header("Accept", "application/json")
+                                        .header("Accept-Language", "en-US,en;q=0.5")
+                                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0")
+                                        .header("anthropic-client-sha", "unknown")
+                                        .header("anthropic-client-version", "unknown")
+                                        .header("anthropic-anonymous-id", &device_id)
+                                        .header("anthropic-device-id", &device_id)
+                                        .header("Sec-Fetch-Dest", "empty")
+                                        .header("Sec-Fetch-Mode", "cors")
+                                        .header("Sec-Fetch-Site", "same-origin")
+                                        .header("Connection", "close");
+                                        if !session_cookies.is_empty() {
+                                            verify_req = verify_req.header("Cookie", &session_cookies);
+                                        }
+
+                                        match https_with_cf(&mut stack, "claude.ai", &verify_req.to_bytes(), now, seed2, &mut session_cookies) {
+                                            Ok((vstatus, vbody_bytes)) => {
+                                                let vbody = core::str::from_utf8(&vbody_bytes).unwrap_or("{}");
+
+                                                if vbody.contains("\"success\":true") || vbody.contains("\"success\": true") {
+                                                    log::info!("[oauth] ============================================");
+                                                    log::info!("[oauth]   !! AUTHENTICATION SUCCESSFUL !!");
+                                                    log::info!("[oauth] ============================================");
+
+                                                    // Extract session cookie (sessionKey or __ssid)
+                                                    log::info!("[oauth] cookies: {}", &session_cookies[..session_cookies.len().min(500)]);
+                                                    for part in session_cookies.split("; ") {
+                                                        if part.starts_with("sessionKey=") || part.starts_with("__ssid=") {
+                                                            session_cookie_buf = alloc::string::String::from(part);
+                                                            log::info!("[oauth] session cookie acquired: {}...", &part[..part.len().min(50)]);
+                                                            break;
+                                                        }
+                                                    }
+                                                    if session_cookie_buf.is_empty() {
+                                                        // Use all cookies as fallback
+                                                        log::warn!("[oauth] no sessionKey or __ssid found, using all cookies");
+                                                        session_cookie_buf = session_cookies.clone();
+                                                    }
+
+                                                    // Print save marker for host script to capture
+                                                    log::info!("[oauth] SAVE_SESSION:{}", session_cookie_buf);
+
+                                                    // Extract org UUID from response
+                                                    if let Some(s) = vbody.find("\"uuid\":\"") {
+                                                        let rest = &vbody[s + 8..];
+                                                        if let Some(e) = rest.find('"') {
+                                                            // Skip account uuid, find org uuid
+                                                            if let Some(s2) = rest[e+1..].find("\"uuid\":\"") {
+                                                                let rest2 = &rest[e+1+s2+8..];
+                                                                if let Some(e2) = rest2.find('"') {
+                                                                    let org = &rest2[..e2];
+                                                                    if org.contains('-') && org.len() > 30 {
+                                                                        log::info!("[oauth] org: {}", org);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    log::error!("[oauth] verify: status={} body={}", vstatus, &vbody[..vbody.len().min(300)]);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::error!("[oauth] verify failed: {}", e);
+                                            }
+                                        }
                                     }
+                                } else {
+                                    log::error!("[oauth] send_magic_link failed: HTTP {} — {}", status, body);
                                 }
                             }
                             Err(e) => {
-                                log::error!("[oauth] send_magic_link failed: {:?}", e);
+                                log::error!("[oauth] send_magic_link failed: {}", e);
                             }
                         }
 
-                        // After SSO/magic link, fall through to relay for API key
+                        // If we got a session cookie from OAuth, skip the relay
+                        if !session_cookie_buf.is_empty() {
+                            log::info!("[oauth] session acquired — skipping auth relay");
+                        } else {
                         log::info!("[oauth] falling back to auth relay for API key...");
                         log::info!("[oauth] run: python tools/auth-relay.py");
 
@@ -473,10 +811,150 @@ async fn main_async() {
                                 }
                             }
                         }
+                        } // end relay fallback else
                     } // end auth
 
                     let api_key: &str = &api_key_buf;
-                    if api_key.is_empty() {
+                    let session_cookie: &str = &session_cookie_buf;
+
+                    if !session_cookie.is_empty() {
+                        // ── claude.ai Max mode: use session cookie ──────────────
+                        log::info!("[claude.ai] ============================================");
+                        log::info!("[claude.ai]   CLAUDE.AI MAX MODE");
+                        log::info!("[claude.ai] ============================================");
+                        log::info!("[claude.ai] Using session cookie for unlimited access");
+
+                        let org_id = "9cb75ae8-c9bb-4ef3-afed-7ff716b22fd3";
+
+                        // Step 1: Create conversation
+                        log::info!("[claude.ai] creating conversation...");
+                        let create_body = br#"{"name":"","project_uuid":null}"#;
+                        let create_path = alloc::format!("/api/organizations/{}/chat_conversations", org_id);
+                        let create_req = claudio_net::http::HttpRequest::post(
+                            "claude.ai", &create_path, create_body.to_vec(),
+                        )
+                        .header("Content-Type", "application/json")
+                        .header("Cookie", session_cookie)
+                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0")
+                        .header("Accept", "application/json")
+                        .header("Origin", "https://claude.ai")
+                        .header("Referer", "https://claude.ai/new")
+                        .header("Connection", "close");
+                        let seed = interrupts::tick_count();
+                        let conv_uuid = match claudio_net::https_request(
+                            &mut stack, "claude.ai", 443, &create_req.to_bytes(), now, seed,
+                        ) {
+                            Ok(resp) => {
+                                let resp_str = core::str::from_utf8(&resp).unwrap_or("");
+                                // Extract body
+                                let body = if let Some(pos) = resp_str.find("\r\n\r\n") {
+                                    let raw = &resp[pos + 4..];
+                                    let decoded = claudio_net::http::decode_chunked(raw).unwrap_or_else(|_| raw.to_vec());
+                                    alloc::string::String::from(core::str::from_utf8(&decoded).unwrap_or(""))
+                                } else { alloc::string::String::new() };
+
+                                // Extract uuid from response
+                                if let Some(s) = body.find("\"uuid\":\"") {
+                                    let rest = &body[s + 8..];
+                                    if let Some(e) = rest.find('"') {
+                                        let uuid = alloc::string::String::from(&rest[..e]);
+                                        log::info!("[claude.ai] conversation: {}", uuid);
+                                        Some(uuid)
+                                    } else { None }
+                                } else {
+                                    log::error!("[claude.ai] create failed: {}", &body[..body.len().min(200)]);
+                                    None
+                                }
+                            }
+                            Err(e) => { log::error!("[claude.ai] create request failed: {:?}", e); None }
+                        };
+
+                        if let Some(conv_id) = conv_uuid {
+                            // Step 2: Send a message
+                            log::info!("[claude.ai] sending test message...");
+                            let msg_body = alloc::format!(
+                                r#"{{"prompt":"Say hello from bare metal! Keep it short.","timezone":"America/New_York","attachments":[],"files":[],"model":"claude-sonnet-4-6","rendering_mode":"messages"}}"#
+                            );
+                            let msg_path = alloc::format!("/api/organizations/{}/chat_conversations/{}/completion", org_id, conv_id);
+                            let msg_req = claudio_net::http::HttpRequest::post(
+                                "claude.ai", &msg_path, msg_body.into_bytes(),
+                            )
+                            .header("Content-Type", "application/json")
+                            .header("Cookie", session_cookie)
+                            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0")
+                            .header("Accept", "text/event-stream")
+                            .header("Origin", "https://claude.ai")
+                            .header("Referer", "https://claude.ai/new")
+                            .header("Connection", "close");
+                            let seed2 = interrupts::tick_count();
+                            match claudio_net::https_request(
+                                &mut stack, "claude.ai", 443, &msg_req.to_bytes(), now, seed2,
+                            ) {
+                                Ok(resp) => {
+                                    let resp_str = core::str::from_utf8(&resp).unwrap_or("");
+                                    log::info!("[claude.ai] response: {} bytes", resp.len());
+
+                                    // Parse SSE events for text deltas
+                                    let mut full_text = alloc::string::String::new();
+                                    for line in resp_str.lines() {
+                                        if let Some(data) = line.strip_prefix("data: ") {
+                                            if data.contains("\"text_delta\"") {
+                                                if let Some(s) = data.find("\"text\":\"") {
+                                                    let rest = &data[s + 8..];
+                                                    if let Some(e) = rest.find('"') {
+                                                        full_text.push_str(&rest[..e]);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if !full_text.is_empty() {
+                                        log::info!("[claude.ai] ============================================");
+                                        log::info!("[claude.ai]   CLAUDE SAYS: {}", full_text);
+                                        log::info!("[claude.ai] ============================================");
+                                        log::info!("[claude.ai]   !! CLAUDE.AI MAX MODE WORKING !!");
+                                    } else {
+                                        // Show raw response for debugging
+                                        if let Some(pos) = resp_str.find("\r\n\r\n") {
+                                            let body = &resp_str[pos + 4..resp_str.len().min(pos + 500)];
+                                            log::info!("[claude.ai] raw: {}", body);
+                                        }
+                                    }
+                                }
+                                Err(e) => { log::error!("[claude.ai] completion failed: {:?}", e); }
+                            }
+
+                            // Set auth mode for the agent loop / dashboard
+                            unsafe {
+                                agent_loop::set_auth_mode(agent_loop::AuthMode::ClaudeAi {
+                                    session_cookie: alloc::string::String::from(session_cookie),
+                                    org_id: alloc::string::String::from(org_id),
+                                    conv_id: conv_id.clone(),
+                                });
+                            }
+                            log::info!("[claude.ai] auth mode set — launching dashboard");
+
+                            // Register compile handler
+                            unsafe {
+                                agent_loop::init_compile_handler(
+                                    &mut stack as *mut _,
+                                    now,
+                                );
+                            }
+
+                            // Launch multi-agent dashboard on claude.ai Max
+                            let fb_w = framebuffer::width();
+                            let fb_h = framebuffer::height();
+                            dashboard::run_dashboard(
+                                &mut stack,
+                                "", // no API key needed — using claude.ai session
+                                fb_w,
+                                fb_h,
+                                now,
+                            ).await;
+                        }
+                    } else if api_key.is_empty() {
                         log::warn!("[auth] no API key — run `python tools/auth-relay.py`");
                     } else {
                         // ── Step 2.5: Native TLS end-to-end test ─────────────

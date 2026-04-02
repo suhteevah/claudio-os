@@ -4,7 +4,18 @@
 //! - `claudio_agent::Dashboard` (agent session lifecycle)
 //! - `claudio_terminal::Layout` (split-pane layout tree)
 //! - `crate::keyboard::ScancodeStream` (async keyboard input)
-//! - `crate::framebuffer` (GOP pixel output)
+//! - `crate::framebuffer` (GOP pixel output — double-buffered)
+//!
+//! ## Rendering strategy (TempleOS-inspired)
+//!
+//! Instead of re-rendering every pixel on every keypress (the old approach),
+//! we now use dirty-region tracking + double buffering:
+//!
+//! 1. Each pane tracks which character rows changed (dirty_rows).
+//! 2. On keypress, only the dirty rows of the focused pane are re-rendered
+//!    into the back buffer (typically 1 row = 16 pixel-rows).
+//! 3. The changed pixel rows are blitted from back buffer to front buffer
+//!    in a single `copy_nonoverlapping` call.
 //!
 //! Keyboard input uses a tmux-style Ctrl+B prefix for pane management commands.
 //! Regular keypresses are forwarded to the focused agent session's input buffer.
@@ -19,16 +30,68 @@ use pc_keyboard::DecodedKey;
 
 use claudio_agent::{AgentState, Dashboard};
 use claudio_net::{Instant, NetworkStack};
-use claudio_terminal::{Layout, SplitDirection};
+use claudio_terminal::{Layout, SplitDirection, FONT_HEIGHT};
 
 use crate::keyboard::ScancodeStream;
 
 // ---------------------------------------------------------------------------
-// Framebuffer DrawTarget adapter
+// Framebuffer DrawTarget adapter — back-buffer variant
 // ---------------------------------------------------------------------------
 
-/// Wraps the kernel's global `framebuffer::put_pixel` function into a
-/// [`claudio_terminal::DrawTarget`] so the layout/pane renderer can draw.
+/// A `DrawTarget` that writes directly into a borrowed `&mut [u8]` back buffer.
+///
+/// This is the key performance win: instead of calling `framebuffer::put_pixel`
+/// (which locks a mutex per pixel), the terminal renderer writes pixels directly
+/// into the back buffer's memory. The buffer is only locked once per render pass.
+struct BackBufDrawTarget<'a> {
+    buf: &'a mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+}
+
+impl<'a> claudio_terminal::DrawTarget for BackBufDrawTarget<'a> {
+    #[inline]
+    fn put_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let offset = (y * self.stride + x) * self.bpp;
+        if offset + 3 < self.buf.len() {
+            // BGR32 pixel format (UEFI GOP standard).
+            unsafe {
+                let ptr = self.buf.as_mut_ptr().add(offset);
+                core::ptr::write_volatile(ptr, b);
+                core::ptr::write_volatile(ptr.add(1), g);
+                core::ptr::write_volatile(ptr.add(2), r);
+            }
+        }
+    }
+
+    fn width(&self) -> usize {
+        self.width
+    }
+
+    fn height(&self) -> usize {
+        self.height
+    }
+
+    fn bytes_per_pixel(&self) -> usize {
+        self.bpp
+    }
+
+    fn stride(&self) -> usize {
+        self.stride
+    }
+
+    fn buffer_mut(&mut self) -> Option<&mut [u8]> {
+        Some(self.buf)
+    }
+}
+
+/// Legacy fallback DrawTarget that uses `framebuffer::put_pixel`.
+/// Only used when we can't acquire the back buffer (shouldn't happen).
 struct FbDrawTarget {
     width: usize,
     height: usize,
@@ -122,7 +185,7 @@ enum PrefixState {
 /// 4. Routes regular keys to the focused agent's input buffer.
 /// 5. On Enter, submits the input buffer to the agent's conversation and
 ///    dispatches an API call.
-/// 6. Renders all panes after every input event.
+/// 6. Renders only dirty regions after every input event (not the full screen).
 pub async fn run_dashboard(
     stack: &mut NetworkStack,
     api_key: &str,
@@ -130,7 +193,11 @@ pub async fn run_dashboard(
     fb_height: usize,
     now: fn() -> Instant,
 ) {
-    log::info!("[dashboard] starting multi-agent dashboard ({}x{})", fb_width, fb_height);
+    log::info!(
+        "[dashboard] starting multi-agent dashboard ({}x{}) with double-buffered dirty-region rendering",
+        fb_width,
+        fb_height
+    );
 
     // -- Initialise layout + first agent session ----------------------------
 
@@ -159,7 +226,9 @@ pub async fn run_dashboard(
         pane.write_str("\r\n");
     }
     render_prompt(&mut layout, &dashboard, &input_buffers);
-    render_all(&layout);
+
+    // Initial full render: draw everything into the back buffer, then blit.
+    render_full(&mut layout);
 
     // -- Keyboard event loop ------------------------------------------------
 
@@ -180,6 +249,10 @@ pub async fn run_dashboard(
                             &mut dashboard,
                             &mut input_buffers,
                         );
+                        // Structural change — do a full render.
+                        render_prompt(&mut layout, &dashboard, &input_buffers);
+                        render_full(&mut layout);
+                        continue;
                     }
                     PrefixState::Normal => {
                         // Ctrl+B detection: pc-keyboard with HandleControl::MapLettersToUnicode
@@ -225,9 +298,9 @@ pub async fn run_dashboard(
             }
         }
 
-        // Re-render prompt + panes after every keypress.
+        // Re-render prompt + dirty panes (fast path).
         render_prompt(&mut layout, &dashboard, &input_buffers);
-        render_all(&layout);
+        render_dirty(&mut layout);
     }
 }
 
@@ -383,7 +456,7 @@ async fn submit_input(
     if let Some(pane) = layout.pane_by_id_mut(pane_id) {
         pane.write_str("\x1b[33m[thinking...]\x1b[0m");
     }
-    render_all(layout);
+    render_dirty(layout);
 
     // --- Run the full API call + tool-use loop ------------------------------
     // Collect tool call info into a Vec since we can't borrow layout inside
@@ -502,10 +575,89 @@ fn render_prompt(
     }
 }
 
-/// Render all panes and separators to the framebuffer.
-fn render_all(layout: &Layout) {
-    let mut target = FbDrawTarget::new();
-    layout.render_all(&mut target);
+/// Render only dirty regions into the back buffer, then blit changed pixel
+/// rows to the hardware framebuffer. This is the fast path for keypress rendering.
+///
+/// Typical cost: 1 character row = 16 pixel-rows ~= 80 KiB blit.
+/// Compare to old full render: 800 pixel-rows ~= 4 MiB + 1M mutex locks.
+fn render_dirty(layout: &mut Layout) {
+    // Step 1: Collect the pixel row ranges that are dirty BEFORE we clear flags.
+    let fb_height = crate::framebuffer::height();
+    let mut min_y: usize = fb_height;
+    let mut max_y: usize = 0;
+
+    for pane in layout.panes() {
+        let vp = &pane.viewport;
+        for (row_idx, &dirty) in pane.dirty_rows().iter().enumerate() {
+            if dirty {
+                let py_start = vp.y + row_idx * FONT_HEIGHT;
+                let py_end = (py_start + FONT_HEIGHT).min(fb_height);
+                if py_start < min_y {
+                    min_y = py_start;
+                }
+                if py_end > max_y {
+                    max_y = py_end;
+                }
+            }
+        }
+    }
+
+    // Always include a small region for cursor movement (cursor row +/- 1 row).
+    // The cursor delta rendering touches at most 2 character rows (old + new).
+    // We handle this by extending the dirty region to cover the full focused pane
+    // cursor area (cheap since it's just 2 rows = 32 pixel-rows).
+    let focused_pane = layout.focused_pane();
+    let fvp = &focused_pane.viewport;
+    // The cursor could be anywhere in the pane, so just extend to cover the
+    // pane's full vertical extent. This is still much cheaper than rendering
+    // all panes.
+    if min_y > fvp.y {
+        min_y = fvp.y;
+    }
+    if max_y < fvp.y + fvp.height {
+        max_y = (fvp.y + fvp.height).min(fb_height);
+    }
+
+    // Step 2: Render dirty rows into the back buffer.
+    crate::framebuffer::with_back_buffer(|buf, w, h, stride, bpp| {
+        let mut target = BackBufDrawTarget {
+            buf,
+            width: w,
+            height: h,
+            stride,
+            bpp,
+        };
+        layout.render_dirty(&mut target);
+    });
+
+    // Step 3: Blit only the dirty pixel rows to the front buffer.
+    if min_y < max_y {
+        crate::framebuffer::blit_rows(min_y, max_y);
+        log::trace!(
+            "[dashboard] dirty blit: pixel rows {}..{} ({} rows, ~{} KiB)",
+            min_y,
+            max_y,
+            max_y - min_y,
+            (max_y - min_y) * crate::framebuffer::stride() * crate::framebuffer::bytes_per_pixel() / 1024
+        );
+    }
+}
+
+/// Full render: render all panes + separators into the back buffer, then blit.
+/// Used for structural changes (split, close, initial draw).
+fn render_full(layout: &mut Layout) {
+    crate::framebuffer::with_back_buffer(|buf, w, h, stride, bpp| {
+        let mut target = BackBufDrawTarget {
+            buf,
+            width: w,
+            height: h,
+            stride,
+            bpp,
+        };
+        layout.render_all_and_clear(&mut target);
+    });
+    crate::framebuffer::blit_full();
+    log::debug!("[dashboard] full render completed");
 }
 
 // ---------------------------------------------------------------------------

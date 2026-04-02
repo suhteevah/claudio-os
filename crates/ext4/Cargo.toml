@@ -1,0 +1,10 @@
+[package]
+name = "claudio-ext4"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "no_std ext4 filesystem implementation for ClaudioOS"
+
+[dependencies]
+log = { workspace = true }

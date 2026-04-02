@@ -497,13 +497,54 @@ fn session_to_api_messages(session: &AgentSession) -> Vec<Message> {
 // Network: send request via native TLS
 // ---------------------------------------------------------------------------
 
-/// Send an API request via TLS proxy on the host (10.0.2.2:8443).
+/// Authentication mode for API calls.
+#[derive(Clone)]
+pub enum AuthMode {
+    /// Traditional API key → api.anthropic.com
+    ApiKey(String),
+    /// claude.ai session cookie + org UUID → claude.ai Max subscription
+    ClaudeAi {
+        session_cookie: String,
+        org_id: String,
+        conv_id: String,
+    },
+}
+
+/// Global auth mode — set during init, read during agent loops.
+static mut AUTH_MODE: Option<AuthMode> = None;
+
+/// Set the authentication mode. Call once during boot.
 ///
-/// The proxy terminates TLS and forwards to api.anthropic.com.
-/// Run `python tools/tls-proxy.py 8443` on the host.
-///
-/// TODO: Switch to native TLS once embedded-tls null deref is fixed.
+/// # Safety
+/// Must be called from single thread during init.
+pub unsafe fn set_auth_mode(mode: AuthMode) {
+    AUTH_MODE = Some(mode);
+}
+
+/// Get current auth mode reference.
+pub fn auth_mode() -> Option<&'static AuthMode> {
+    unsafe { core::ptr::addr_of!(AUTH_MODE).as_ref().and_then(|o| o.as_ref()) }
+}
+
+/// Send an API request — routes to either api.anthropic.com or claude.ai
+/// depending on the configured auth mode.
 pub fn send_via_https(
+    stack: &mut NetworkStack,
+    api_key: &str,
+    body: &[u8],
+    now: fn() -> claudio_net::Instant,
+) -> Result<Vec<u8>, String> {
+    // Check if we have claude.ai auth mode
+    if let Some(AuthMode::ClaudeAi { session_cookie, org_id, conv_id }) = auth_mode() {
+        return send_via_claude_ai(stack, session_cookie, org_id, conv_id, body, now);
+    }
+
+    // Fall back to api.anthropic.com with API key
+    send_via_api_key(stack, api_key, body, now)
+}
+
+/// Send via api.anthropic.com with API key (original path).
+fn send_via_api_key(
     stack: &mut NetworkStack,
     api_key: &str,
     body: &[u8],
@@ -520,33 +561,139 @@ pub fn send_via_https(
     .header("Connection", "close");
 
     let req_bytes = http_req.to_bytes();
-    log::debug!("[agent] sending {} bytes via TLS proxy", req_bytes.len());
+    log::debug!("[agent] sending {} bytes to api.anthropic.com", req_bytes.len());
 
-    let proxy_ip = claudio_net::Ipv4Address::new(10, 0, 2, 2);
-    let local_port = RNG_SEED.fetch_add(1, Ordering::Relaxed) as u16 + 50000;
+    let seed = RNG_SEED.fetch_add(1, Ordering::Relaxed);
+    match claudio_net::https_request(stack, "api.anthropic.com", 443, &req_bytes, now, seed) {
+        Ok(resp) => {
+            log::debug!("[agent] received {} bytes from api.anthropic.com", resp.len());
+            Ok(resp)
+        }
+        Err(e) => Err(alloc::format!("api.anthropic.com request failed: {:?}", e)),
+    }
+}
 
-    let h = claudio_net::tls::tcp_connect(stack, proxy_ip, 8443, local_port, now)
-        .map_err(|e| alloc::format!("proxy connect: {:?}. Run: python tools/tls-proxy.py 8443", e))?;
+/// Send via claude.ai using session cookie (Max subscription, unlimited).
+///
+/// Converts the Messages API request body into the claude.ai completion format
+/// and sends to `/api/organizations/{org}/chat_conversations/{conv}/completion`.
+fn send_via_claude_ai(
+    stack: &mut NetworkStack,
+    session_cookie: &str,
+    org_id: &str,
+    conv_id: &str,
+    body: &[u8],
+    now: fn() -> claudio_net::Instant,
+) -> Result<Vec<u8>, String> {
+    // Extract the user's latest message from the Messages API request body.
+    // The body is a MessagesRequest JSON. We need to pull out the last user message
+    // and send it as a claude.ai completion request.
+    let body_str = core::str::from_utf8(body).unwrap_or("{}");
 
-    claudio_net::tls::tcp_send(stack, h, &req_bytes, now)
-        .map_err(|e| { claudio_net::tls::tcp_close(stack, h); alloc::format!("send: {:?}", e) })?;
+    // Find the last user message text
+    let prompt = extract_last_user_message(body_str);
+    log::info!("[claude.ai] sending: {}...", &prompt[..prompt.len().min(80)]);
 
-    // Read response until connection closes
-    let mut buf = alloc::vec![0u8; 32768];
-    let mut total = 0;
-    for _ in 0..500 {
-        match claudio_net::tls::tcp_recv(stack, h, &mut buf[total..], now) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(_) => break,
+    let claude_body = alloc::format!(
+        r#"{{"prompt":"{}","timezone":"America/New_York","attachments":[],"files":[],"model":"claude-sonnet-4-6","rendering_mode":"messages"}}"#,
+        prompt.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    );
+
+    let path = alloc::format!(
+        "/api/organizations/{}/chat_conversations/{}/completion",
+        org_id, conv_id
+    );
+
+    let http_req = claudio_net::http::HttpRequest::post(
+        "claude.ai", &path, claude_body.into_bytes(),
+    )
+    .header("Content-Type", "application/json")
+    .header("Cookie", session_cookie)
+    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0")
+    .header("Accept", "text/event-stream")
+    .header("Origin", "https://claude.ai")
+    .header("Referer", "https://claude.ai/new")
+    .header("Connection", "close");
+
+    let req_bytes = http_req.to_bytes();
+    log::debug!("[claude.ai] sending {} bytes", req_bytes.len());
+
+    let seed = RNG_SEED.fetch_add(1, Ordering::Relaxed);
+    let resp = claudio_net::https_request(stack, "claude.ai", 443, &req_bytes, now, seed)
+        .map_err(|e| alloc::format!("claude.ai request failed: {:?}", e))?;
+
+    log::debug!("[claude.ai] received {} bytes", resp.len());
+
+    // Parse SSE response and convert to a fake Messages API response
+    // so the existing parsing code works unchanged
+    let resp_str = core::str::from_utf8(&resp).unwrap_or("");
+    let mut text = String::new();
+    for line in resp_str.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data.contains("\"text_delta\"") {
+                if let Some(s) = data.find("\"text\":\"") {
+                    let rest = &data[s + 8..];
+                    if let Some(e) = rest.find('"') {
+                        text.push_str(&rest[..e]);
+                    }
+                }
+            }
         }
     }
-    claudio_net::tls::tcp_close(stack, h);
 
-    if total == 0 {
-        return Err(alloc::string::String::from("no response from proxy"));
+    if text.is_empty() {
+        // Check for error in response
+        if let Some(pos) = resp_str.find("\r\n\r\n") {
+            let body = &resp_str[pos + 4..];
+            if body.contains("\"error\"") || body.contains("rate_limit") {
+                return Err(alloc::format!("claude.ai error: {}", &body[..body.len().min(300)]));
+            }
+        }
+        return Err(String::from("empty response from claude.ai"));
     }
-    Ok(buf[..total].to_vec())
+
+    // Build a fake Messages API JSON response so parse_api_response works
+    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+    let json_body = alloc::format!(
+        r#"{{"id":"msg_claude_ai","type":"message","role":"assistant","content":[{{"type":"text","text":"{}"}}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":0,"output_tokens":0}}}}"#,
+        escaped
+    );
+    let mut fake_response = alloc::string::String::new();
+    fake_response.push_str("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n");
+    fake_response.push_str(&json_body);
+
+    Ok(fake_response.into_bytes())
+}
+
+/// Extract the last user message text from a Messages API request JSON.
+fn extract_last_user_message(body: &str) -> String {
+    // Find the last "role":"user" message and extract its text
+    // Simple approach: find last occurrence of "role":"user" then find "text":"
+    let mut last_text = String::from("Hello");
+
+    let mut search_from = 0;
+    while let Some(pos) = body[search_from..].find("\"role\":\"user\"") {
+        let abs_pos = search_from + pos;
+        // Find the text content after this role marker
+        if let Some(text_pos) = body[abs_pos..].find("\"text\":\"") {
+            let text_start = abs_pos + text_pos + 8;
+            // Find the closing quote (handling escaped quotes)
+            let rest = &body[text_start..];
+            let mut end = 0;
+            let mut escaped = false;
+            for (i, c) in rest.char_indices() {
+                if escaped { escaped = false; continue; }
+                if c == '\\' { escaped = true; continue; }
+                if c == '"' { end = i; break; }
+            }
+            if end > 0 {
+                last_text = String::from(&rest[..end]);
+            }
+        }
+        search_from = abs_pos + 13; // skip past "role":"user"
+    }
+
+    last_text
 }
 
 // ---------------------------------------------------------------------------

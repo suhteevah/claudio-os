@@ -26,3 +26,6 @@ claudio-agent = { path = "../crates/agent" }
 claudio-fs = { path = "../crates/fs-persist" }
 claudio-rustc = { path = "../crates/rustc-lite" }
 wraith-dom = { path = "../crates/wraith-dom" }
+claudio-ext4 = { path = "../crates/ext4" }
+claudio-btrfs = { path = "../crates/btrfs" }
+claudio-ntfs = { path = "../crates/ntfs" }

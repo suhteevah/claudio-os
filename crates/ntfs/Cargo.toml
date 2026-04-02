@@ -1,0 +1,10 @@
+[package]
+name = "claudio-ntfs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "no_std NTFS filesystem implementation for ClaudioOS"
+
+[dependencies]
+log = { workspace = true }

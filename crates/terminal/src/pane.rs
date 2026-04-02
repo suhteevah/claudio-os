@@ -58,10 +58,17 @@ pub struct Pane {
     scroll_offset: usize,
     /// VTE escape-sequence parser.
     vte_parser: vte::Parser,
-    /// Whether the pane needs to be redrawn.
+    /// Whether the pane needs to be redrawn (any row dirty).
     dirty: bool,
+    /// Per-row dirty flags — only dirty rows need re-rendering.
+    /// This is the key to TempleOS-style dirty-region tracking: instead of
+    /// re-rendering 1280x800 pixels on every keypress, we re-render only the
+    /// ~16 pixel-rows of the line that changed.
+    dirty_rows: Vec<bool>,
     /// Saved cursor position (row, col) for CSI s / CSI u.
     saved_cursor: Option<(usize, usize)>,
+    /// Previous cursor position for efficient cursor redraw.
+    prev_cursor: Option<(usize, usize)>,
 }
 
 impl Pane {
@@ -74,6 +81,7 @@ impl Pane {
         let rows = rows.max(1);
 
         let cells = vec![vec![Cell::default(); cols]; rows];
+        let dirty_rows = vec![true; rows]; // All rows dirty on creation.
 
         Self {
             id,
@@ -88,7 +96,9 @@ impl Pane {
             scroll_offset: 0,
             vte_parser: vte::Parser::new(),
             dirty: true,
+            dirty_rows,
             saved_cursor: None,
+            prev_cursor: None,
         }
     }
 
@@ -112,6 +122,31 @@ impl Pane {
     /// Mark the pane as clean (call after rendering).
     pub fn clear_dirty(&mut self) {
         self.dirty = false;
+        for row in self.dirty_rows.iter_mut() {
+            *row = false;
+        }
+    }
+
+    /// Mark a specific character row as dirty.
+    #[inline]
+    fn mark_row_dirty(&mut self, row: usize) {
+        if row < self.dirty_rows.len() {
+            self.dirty_rows[row] = true;
+        }
+        self.dirty = true;
+    }
+
+    /// Mark all rows as dirty (e.g. after scroll or full-screen erase).
+    fn mark_all_dirty(&mut self) {
+        for row in self.dirty_rows.iter_mut() {
+            *row = true;
+        }
+        self.dirty = true;
+    }
+
+    /// Get the per-row dirty flags.
+    pub fn dirty_rows(&self) -> &[bool] {
+        &self.dirty_rows
     }
 
     // -- input --------------------------------------------------------------
@@ -164,7 +199,9 @@ impl Pane {
             *r = (*r).min(new_rows - 1);
             *c = (*c).min(new_cols - 1);
         }
+        self.dirty_rows = vec![true; new_rows]; // All rows dirty after resize.
         self.dirty = true;
+        self.prev_cursor = None;
     }
 
     // -- internal mutation helpers ------------------------------------------
@@ -180,8 +217,8 @@ impl Pane {
             fg: self.current_fg,
             bg: self.current_bg,
         };
+        self.mark_row_dirty(self.cursor_row);
         self.cursor_col += 1;
-        self.dirty = true;
     }
 
     /// Carriage-return + line-feed.
@@ -189,10 +226,10 @@ impl Pane {
         self.cursor_col = 0;
         if self.cursor_row + 1 < self.rows {
             self.cursor_row += 1;
+            self.mark_row_dirty(self.cursor_row);
         } else {
-            self.scroll_up();
+            self.scroll_up(); // scroll_up marks all rows dirty
         }
-        self.dirty = true;
     }
 
     /// Scroll the grid up by one line, discarding the top row.
@@ -200,7 +237,8 @@ impl Pane {
         self.cells.remove(0);
         self.cells.push(vec![Cell::default(); self.cols]);
         self.scroll_offset = self.scroll_offset.saturating_add(1);
-        self.dirty = true;
+        // Scroll affects every visible row.
+        self.mark_all_dirty();
     }
 
     /// Erase cells in a region, filling with the current background colour.
@@ -216,7 +254,7 @@ impl Pane {
                 bg: self.current_bg,
             };
         }
-        self.dirty = true;
+        self.mark_row_dirty(row);
     }
 
     // -- rendering ----------------------------------------------------------
@@ -231,6 +269,47 @@ impl Pane {
                 render::render_char(target, x, y, cell.ch, cell.fg, cell.bg);
             }
         }
+    }
+
+    /// Render only the rows that have been marked dirty since the last
+    /// `clear_dirty()`. This is the hot path for typing: a single character
+    /// insert only dirties one row (~16 pixel-rows of ~1280 pixels), not the
+    /// entire 1280x800 screen.
+    pub fn render_dirty<D: super::DrawTarget>(&self, target: &mut D) {
+        for row in 0..self.rows {
+            if row < self.dirty_rows.len() && self.dirty_rows[row] {
+                for col in 0..self.cols {
+                    let cell = &self.cells[row][col];
+                    let x = self.viewport.x + col * FONT_WIDTH;
+                    let y = self.viewport.y + row * FONT_HEIGHT;
+                    render::render_char(target, x, y, cell.ch, cell.fg, cell.bg);
+                }
+            }
+        }
+    }
+
+    /// Render the cursor, and also re-render the previous cursor position to
+    /// un-invert it (avoids re-rendering the entire pane just to move the cursor).
+    pub fn render_cursor_delta<D: super::DrawTarget>(&mut self, target: &mut D) {
+        // Restore the old cursor cell to normal rendering.
+        if let Some((prev_r, prev_c)) = self.prev_cursor {
+            if prev_r < self.rows && prev_c < self.cols {
+                let cell = &self.cells[prev_r][prev_c];
+                let x = self.viewport.x + prev_c * FONT_WIDTH;
+                let y = self.viewport.y + prev_r * FONT_HEIGHT;
+                render::render_char(target, x, y, cell.ch, cell.fg, cell.bg);
+            }
+        }
+
+        // Draw the new cursor position (inverted).
+        if self.cursor_row < self.rows && self.cursor_col < self.cols {
+            let cell = &self.cells[self.cursor_row][self.cursor_col];
+            let x = self.viewport.x + self.cursor_col * FONT_WIDTH;
+            let y = self.viewport.y + self.cursor_row * FONT_HEIGHT;
+            render::render_char(target, x, y, cell.ch, cell.bg, cell.fg);
+        }
+
+        self.prev_cursor = Some((self.cursor_row, self.cursor_col));
     }
 
     /// Render a visible cursor block (inverted colours).
@@ -298,20 +377,20 @@ impl<'a> vte::Perform for PanePerformer<'a> {
             b'\n' | 0x0B | 0x0C => self.pane.newline(), // LF, VT, FF
             b'\r' => {
                 self.pane.cursor_col = 0;
-                self.pane.dirty = true;
+                // CR doesn't change cell content, cursor delta handles it.
             }
             0x08 => {
                 // Backspace
                 if self.pane.cursor_col > 0 {
                     self.pane.cursor_col -= 1;
-                    self.pane.dirty = true;
+                    self.pane.mark_row_dirty(self.pane.cursor_row);
                 }
             }
             0x09 => {
                 // Tab — advance to next 8-column stop.
                 let next = (self.pane.cursor_col + 8) & !7;
                 self.pane.cursor_col = next.min(self.pane.cols - 1);
-                self.pane.dirty = true;
+                // Tab doesn't change cell content.
             }
             0x07 => {} // BEL — ignored
             _ => {}
@@ -405,6 +484,8 @@ impl<'a> vte::Perform for PanePerformer<'a> {
             }
 
             // -- Cursor positioning -----------------------------------------
+            // Pure cursor moves don't change cell data. The cursor is rendered
+            // separately via render_cursor_delta, so no row dirtying needed.
             'H' | 'f' => {
                 // CUP — Cursor Position. CSI row ; col H
                 let mut iter = params.iter();
@@ -420,43 +501,36 @@ impl<'a> vte::Perform for PanePerformer<'a> {
                     .saturating_sub(1) as usize;
                 pane.cursor_row = row.min(pane.rows.saturating_sub(1));
                 pane.cursor_col = col.min(pane.cols.saturating_sub(1));
-                pane.dirty = true;
             }
             'A' => {
                 // CUU — Cursor Up
                 let n = first_param(params, 1) as usize;
                 pane.cursor_row = pane.cursor_row.saturating_sub(n);
-                pane.dirty = true;
             }
             'B' => {
                 // CUD — Cursor Down
                 let n = first_param(params, 1) as usize;
                 pane.cursor_row = (pane.cursor_row + n).min(pane.rows.saturating_sub(1));
-                pane.dirty = true;
             }
             'C' => {
                 // CUF — Cursor Forward
                 let n = first_param(params, 1) as usize;
                 pane.cursor_col = (pane.cursor_col + n).min(pane.cols.saturating_sub(1));
-                pane.dirty = true;
             }
             'D' => {
                 // CUB — Cursor Back
                 let n = first_param(params, 1) as usize;
                 pane.cursor_col = pane.cursor_col.saturating_sub(n);
-                pane.dirty = true;
             }
             'G' => {
                 // CHA — Cursor Character Absolute
                 let col = first_param(params, 1).saturating_sub(1) as usize;
                 pane.cursor_col = col.min(pane.cols.saturating_sub(1));
-                pane.dirty = true;
             }
             'd' => {
                 // VPA — Vertical Position Absolute
                 let row = first_param(params, 1).saturating_sub(1) as usize;
                 pane.cursor_row = row.min(pane.rows.saturating_sub(1));
-                pane.dirty = true;
             }
 
             // -- Erase sequences --------------------------------------------
@@ -519,29 +593,34 @@ impl<'a> vte::Perform for PanePerformer<'a> {
                 if let Some((row, col)) = pane.saved_cursor {
                     pane.cursor_row = row.min(pane.rows.saturating_sub(1));
                     pane.cursor_col = col.min(pane.cols.saturating_sub(1));
-                    pane.dirty = true;
+                    // Cursor move only — no cell data change.
                 }
             }
 
             // -- Insert/Delete Lines ----------------------------------------
             'L' => {
-                // IL — Insert Lines
+                // IL — Insert Lines (shifts content down, affects all rows from cursor)
                 let n = (first_param(params, 1) as usize).min(pane.rows - pane.cursor_row);
                 for _ in 0..n {
                     pane.cells
                         .insert(pane.cursor_row, vec![Cell::default(); pane.cols]);
                     pane.cells.pop();
                 }
-                pane.dirty = true;
+                // All rows from cursor downward are affected.
+                for r in pane.cursor_row..pane.rows {
+                    pane.mark_row_dirty(r);
+                }
             }
             'M' => {
-                // DL — Delete Lines
+                // DL — Delete Lines (shifts content up, affects all rows from cursor)
                 let n = (first_param(params, 1) as usize).min(pane.rows - pane.cursor_row);
                 for _ in 0..n {
                     pane.cells.remove(pane.cursor_row);
                     pane.cells.push(vec![Cell::default(); pane.cols]);
                 }
-                pane.dirty = true;
+                for r in pane.cursor_row..pane.rows {
+                    pane.mark_row_dirty(r);
+                }
             }
 
             _ => {
@@ -577,7 +656,7 @@ impl<'a> vte::Perform for PanePerformer<'a> {
                 if let Some((row, col)) = pane.saved_cursor {
                     pane.cursor_row = row.min(pane.rows.saturating_sub(1));
                     pane.cursor_col = col.min(pane.cols.saturating_sub(1));
-                    pane.dirty = true;
+                    // Cursor move only — no cell data change.
                 }
             }
             _ => {}
