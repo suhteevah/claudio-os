@@ -338,19 +338,21 @@ impl Fadt {
             x_dsdt,
             flags,
         );
+        let reset_reg_addr = reset_register.address;
         log::debug!(
             "fadt: PM profile={} century_idx={} reset_reg={:#X} reset_val={:#X}",
             preferred_pm_profile,
             century,
-            reset_register.address,
+            reset_reg_addr,
             reset_value,
         );
 
         if reset_register.is_valid() {
+            let reset_reg_addr2 = reset_register.address;
             log::info!(
                 "fadt: reset register: space={} addr={:#X} value={:#X}",
                 reset_register.address_space,
-                reset_register.address,
+                reset_reg_addr2,
                 reset_value,
             );
         }

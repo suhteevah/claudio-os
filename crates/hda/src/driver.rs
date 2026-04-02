@@ -308,15 +308,29 @@ impl<'a> HdaOutput<'a> {
         sample_rate: u32,
         channels: u16,
     ) -> Result<(), &'static str> {
-        let output = self
-            .controller
-            .output
-            .as_mut()
-            .ok_or("no output path")?;
+        // Extract output path info and stop any existing stream first,
+        // then drop the mutable borrow so we can use self freely below.
+        let (codec_addr, dac_nid, pin_nid) = {
+            let output = self
+                .controller
+                .output
+                .as_mut()
+                .ok_or("no output path")?;
 
-        let codec_addr = output.codec_addr;
-        let dac_nid = output.dac_nid;
-        let pin_nid = output.pin_nid;
+            let codec_addr = output.codec_addr;
+            let dac_nid = output.dac_nid;
+            let pin_nid = output.pin_nid;
+
+            // Stop any existing stream
+            if let Some(ref mut stream) = output.stream {
+                unsafe {
+                    stream.stop();
+                }
+            }
+
+            (codec_addr, dac_nid, pin_nid)
+        };
+
         let bar0 = self.controller.bar0;
 
         info!(
@@ -349,13 +363,6 @@ impl<'a> HdaOutput<'a> {
 
         let fmt_val = format.encode();
         debug!("hda: stream format register value = 0x{:04x}", fmt_val);
-
-        // Stop any existing stream
-        if let Some(ref mut stream) = output.stream {
-            unsafe {
-                stream.stop();
-            }
-        }
 
         // Use the first output stream descriptor
         // Output streams start after input streams
@@ -417,23 +424,23 @@ impl<'a> HdaOutput<'a> {
             debug!("hda: Pin NID={}: output + HP enabled", pin_nid);
 
             // Enable EAPD if the pin supports it
-            let pin_widget = self
+            let needs_eapd = self
                 .controller
                 .codecs
                 .iter()
                 .find(|c| c.address == codec_addr)
-                .and_then(|c| c.widgets.iter().find(|w| w.nid == pin_nid));
+                .and_then(|c| c.widgets.iter().find(|w| w.nid == pin_nid))
+                .map(|pw| pw.pin_caps & PIN_CAP_EAPD != 0)
+                .unwrap_or(false);
 
-            if let Some(pw) = pin_widget {
-                if pw.pin_caps & PIN_CAP_EAPD != 0 {
-                    self.controller.corb_rirb.set_verb(
-                        codec_addr,
-                        pin_nid,
-                        VERB_SET_EAPDBTL,
-                        0x02, // EAPD enable
-                    );
-                    debug!("hda: Pin NID={}: EAPD enabled", pin_nid);
-                }
+            if needs_eapd {
+                self.controller.corb_rirb.set_verb(
+                    codec_addr,
+                    pin_nid,
+                    VERB_SET_EAPDBTL,
+                    0x02, // EAPD enable
+                );
+                debug!("hda: Pin NID={}: EAPD enabled", pin_nid);
             }
 
             // Unmute and set gain on output amps along the path
@@ -445,7 +452,9 @@ impl<'a> HdaOutput<'a> {
             stream.start();
         }
 
-        output.stream = Some(stream);
+        if let Some(ref mut output) = self.controller.output {
+            output.stream = Some(stream);
+        }
         info!("hda: PCM playback started");
         Ok(())
     }

@@ -231,7 +231,7 @@ impl PowerManager {
     /// # Safety
     ///
     /// This will power off the machine. Ensure all state is saved.
-    pub unsafe fn shutdown(&self) -> Result<!, AcpiError> {
+    pub unsafe fn shutdown(&self) -> Result<core::convert::Infallible, AcpiError> {
         let slp_typ_a = self.s5_slp_typ_a.ok_or_else(|| {
             log::error!("power: cannot shutdown, S5 SLP_TYPa not found (call parse_s5_from_dsdt first)");
             AcpiError::S5NotFound
@@ -272,7 +272,7 @@ impl PowerManager {
     /// # Safety
     ///
     /// This will reboot the machine.
-    pub unsafe fn reboot(&self) -> Result<!, AcpiError> {
+    pub unsafe fn reboot(&self) -> Result<core::convert::Infallible, AcpiError> {
         if !self.fadt.reset_supported() {
             log::error!("power: reset register not supported (FADT flags bit 10 not set)");
             return Err(AcpiError::IoError);
@@ -286,10 +286,11 @@ impl PowerManager {
             return Err(AcpiError::InvalidPointer);
         }
 
+        let reg_addr = reg.address;
         log::info!(
             "power: REBOOT: space={} addr={:#X} value={:#X}",
             reg.address_space,
-            reg.address,
+            reg_addr,
             value,
         );
 
@@ -486,14 +487,16 @@ unsafe fn write_gas(gas: &GenericAddressStructure, value: u8) {
     match gas.address_space {
         0 => {
             // System Memory
-            log::trace!("power: MMIO write {:#X} <- {:#X}", gas.address, value);
+            let gas_addr = gas.address;
+            log::trace!("power: MMIO write {:#X} <- {:#X}", gas_addr, value);
             unsafe {
                 core::ptr::write_volatile(gas.address as *mut u8, value);
             }
         }
         1 => {
             // System I/O
-            log::trace!("power: I/O write port {:#X} <- {:#X}", gas.address, value);
+            let gas_addr = gas.address;
+            log::trace!("power: I/O write port {:#X} <- {:#X}", gas_addr, value);
             unsafe {
                 outb(gas.address as u16, value);
             }

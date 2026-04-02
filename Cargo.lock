@@ -153,6 +153,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "claudio-acpi"
+version = "0.1.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "claudio-agent"
 version = "0.1.0"
 dependencies = [
@@ -225,6 +232,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "claudio-gpu"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "spin",
+]
+
+[[package]]
+name = "claudio-hda"
+version = "0.1.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "claudio-intel-nic"
+version = "0.1.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "claudio-net"
 version = "0.1.0"
 dependencies = [
@@ -257,6 +286,7 @@ name = "claudio-os"
 version = "0.1.0"
 dependencies = [
  "bootloader_api",
+ "claudio-acpi",
  "claudio-agent",
  "claudio-ahci",
  "claudio-api",
@@ -264,11 +294,16 @@ dependencies = [
  "claudio-btrfs",
  "claudio-ext4",
  "claudio-fs",
+ "claudio-gpu",
+ "claudio-hda",
+ "claudio-intel-nic",
  "claudio-net",
  "claudio-ntfs",
  "claudio-nvme",
  "claudio-rustc",
+ "claudio-smp",
  "claudio-terminal",
+ "claudio-xhci",
  "conquer-once",
  "linked_list_allocator",
  "log",
@@ -292,12 +327,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "claudio-smp"
+version = "0.1.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "claudio-terminal"
 version = "0.1.0"
 dependencies = [
  "log",
  "spin",
  "vte",
+]
+
+[[package]]
+name = "claudio-xhci"
+version = "0.1.0"
+dependencies = [
+ "log",
 ]
 
 [[package]]

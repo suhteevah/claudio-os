@@ -292,12 +292,13 @@ impl LocalApic {
         let ecx: u32;
         unsafe {
             core::arch::asm!(
+                "push rbx",
                 "cpuid",
+                "pop rbx",
                 inout("eax") 1u32 => _,
-                out("ebx") _,
                 out("ecx") ecx,
                 out("edx") _,
-                options(nomem, nostack, preserves_flags),
+                options(nomem, preserves_flags),
             );
         }
         let supported = (ecx & (1 << 21)) != 0;

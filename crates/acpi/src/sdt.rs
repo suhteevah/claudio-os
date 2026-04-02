@@ -51,12 +51,14 @@ impl SdtHeader {
         };
 
         let sig_str = core::str::from_utf8(&header.signature).unwrap_or("????");
+        let hdr_length = header.length;
+        let hdr_revision = header.revision;
         log::trace!(
             "sdt: header at {:#X}: sig='{}' len={} rev={}",
             phys_addr,
             sig_str,
-            header.length,
-            header.revision,
+            hdr_length,
+            hdr_revision,
         );
 
         Ok(header)
@@ -127,7 +129,8 @@ impl Rsdt {
 
         let entry_count =
             (header.length as usize - SDT_HEADER_SIZE) / core::mem::size_of::<u32>();
-        log::debug!("rsdt: {} entries (table length={})", entry_count, header.length);
+        let hdr_length = header.length;
+        log::debug!("rsdt: {} entries (table length={})", entry_count, hdr_length);
 
         let entry_base = phys_addr + SDT_HEADER_SIZE as u64;
         let mut entries = Vec::with_capacity(entry_count);
@@ -180,7 +183,8 @@ impl Xsdt {
 
         let entry_count =
             (header.length as usize - SDT_HEADER_SIZE) / core::mem::size_of::<u64>();
-        log::debug!("xsdt: {} entries (table length={})", entry_count, header.length);
+        let hdr_length = header.length;
+        log::debug!("xsdt: {} entries (table length={})", entry_count, hdr_length);
 
         let entry_base = phys_addr + SDT_HEADER_SIZE as u64;
         let mut entries = Vec::with_capacity(entry_count);
@@ -237,11 +241,12 @@ impl AcpiTables {
                 match unsafe { SdtHeader::from_address(entry_addr) } {
                     Ok(header) => {
                         let sig = String::from(header.signature_str());
+                        let hdr_length = header.length;
                         log::info!(
                             "acpi: found table '{}' at {:#X} (len={})",
                             sig,
                             entry_addr,
-                            header.length,
+                            hdr_length,
                         );
                         tables_out.tables.push((sig, entry_addr));
                     }
@@ -265,11 +270,12 @@ impl AcpiTables {
                 match unsafe { SdtHeader::from_address(entry_addr_64) } {
                     Ok(header) => {
                         let sig = String::from(header.signature_str());
+                        let hdr_length = header.length;
                         log::info!(
                             "acpi: found table '{}' at {:#X} (len={})",
                             sig,
                             entry_addr_64,
-                            header.length,
+                            hdr_length,
                         );
                         tables_out.tables.push((sig, entry_addr_64));
                     }

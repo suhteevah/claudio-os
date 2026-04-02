@@ -457,8 +457,9 @@ impl XhciController {
             }
         };
 
-        // Check if this is a keyboard
-        let keyboard_info = parsed_config.find_hid_keyboard();
+        // Check if this is a keyboard (clone the result so parsed_config can be moved later)
+        let keyboard_info = parsed_config.find_hid_keyboard()
+            .map(|(iface_num, ep_desc)| (iface_num, ep_desc.clone()));
 
         // --- SET_CONFIGURATION ---
         let config_val = parsed_config.config.b_configuration_value;
@@ -478,7 +479,7 @@ impl XhciController {
                 "xhci: setting up HID keyboard on slot={} interface={}",
                 slot_id, iface_num
             );
-            self.setup_keyboard(slot_id, iface_num, ep_desc);
+            self.setup_keyboard(slot_id, iface_num, &ep_desc);
         }
     }
 
