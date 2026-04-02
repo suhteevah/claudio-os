@@ -1,7 +1,8 @@
-//! Multi-agent dashboard — keyboard routing, pane management, agent sessions.
+//! Multi-agent dashboard — keyboard routing, pane management, agent & shell sessions.
 //!
 //! This module wires together:
 //! - `claudio_agent::Dashboard` (agent session lifecycle)
+//! - `claudio_shell::Shell` (hybrid AI/command shell)
 //! - `claudio_terminal::Layout` (split-pane layout tree)
 //! - `crate::keyboard::ScancodeStream` (async keyboard input)
 //! - `crate::framebuffer` (GOP pixel output — double-buffered)
@@ -18,18 +19,27 @@
 //!    in a single `copy_nonoverlapping` call.
 //!
 //! Keyboard input uses a tmux-style Ctrl+B prefix for pane management commands.
-//! Regular keypresses are forwarded to the focused agent session's input buffer.
-//! Enter submits the buffered input to the focused agent's conversation.
+//! Regular keypresses are forwarded to the focused pane's input buffer.
+//! Enter submits the buffered input to either the agent conversation or the shell.
+//!
+//! ## Pane types
+//!
+//! Each pane is either:
+//! - **Agent** — Claude chat session (API calls, tool use loop)
+//! - **Shell** — ClaudioOS shell (builtins, env vars, natural language)
+//!
+//! Pane 0 starts as a shell. Ctrl+B c = new agent, Ctrl+B s = new shell.
 
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 use pc_keyboard::DecodedKey;
 
 use claudio_agent::{AgentState, Dashboard};
 use claudio_net::{Instant, NetworkStack};
+use claudio_shell::{Shell, Vfs, SystemInfo};
 use claudio_terminal::{Layout, SplitDirection, FONT_HEIGHT};
 
 use crate::keyboard::ScancodeStream;
@@ -121,22 +131,195 @@ impl claudio_terminal::DrawTarget for FbDrawTarget {
 }
 
 // ---------------------------------------------------------------------------
-// Per-agent input buffer
+// Pane type — Agent or Shell
 // ---------------------------------------------------------------------------
 
-/// Input line buffer for each agent session. Characters accumulate here until
+/// Each dashboard pane is either an agent chat session or a shell session.
+enum PaneType {
+    /// An agent chat session. The usize is the agent session id in the Dashboard.
+    Agent(usize),
+    /// A shell session with its own Shell state.
+    Shell(ShellPaneState),
+}
+
+/// State for a shell pane. Wraps `claudio_shell::Shell` and adapts it to the
+/// event-driven dashboard model (no blocking run loop).
+struct ShellPaneState {
+    /// The shell instance (env, history, prompt, builtins).
+    shell: Shell,
+    /// Layout pane id this shell is bound to.
+    pane_id: usize,
+    /// Unique shell id for tracking.
+    id: usize,
+}
+
+impl ShellPaneState {
+    fn new(id: usize, pane_id: usize) -> Self {
+        Self {
+            shell: Shell::new(),
+            pane_id,
+            id,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stub VFS for shell builtins (no filesystem mounted yet)
+// ---------------------------------------------------------------------------
+
+/// Minimal VFS that returns "no filesystem mounted" for all operations.
+/// This is sufficient for builtins like echo, help, clear, ps, history, env.
+struct StubVfs;
+
+impl Vfs for StubVfs {
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, String> {
+        Err(format!("ls: {}: no filesystem mounted", path))
+    }
+
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        Err(format!("cat: {}: no filesystem mounted", path))
+    }
+
+    fn write_file(&mut self, path: &str, _data: &[u8]) -> Result<(), String> {
+        Err(format!("write: {}: no filesystem mounted", path))
+    }
+
+    fn append_file(&mut self, path: &str, _data: &[u8]) -> Result<(), String> {
+        Err(format!("append: {}: no filesystem mounted", path))
+    }
+
+    fn copy_file(&mut self, src: &str, _dst: &str) -> Result<(), String> {
+        Err(format!("cp: {}: no filesystem mounted", src))
+    }
+
+    fn move_file(&mut self, src: &str, _dst: &str) -> Result<(), String> {
+        Err(format!("mv: {}: no filesystem mounted", src))
+    }
+
+    fn remove(&mut self, path: &str) -> Result<(), String> {
+        Err(format!("rm: {}: no filesystem mounted", path))
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<(), String> {
+        Err(format!("mkdir: {}: no filesystem mounted", path))
+    }
+
+    fn touch(&mut self, path: &str) -> Result<(), String> {
+        Err(format!("touch: {}: no filesystem mounted", path))
+    }
+
+    fn exists(&self, _path: &str) -> bool {
+        false
+    }
+
+    fn is_dir(&self, _path: &str) -> bool {
+        false
+    }
+
+    fn mount(&mut self, _device: &str, _path: &str, _fstype: &str) -> Result<(), String> {
+        Err(String::from("mount: not yet implemented"))
+    }
+
+    fn umount(&mut self, _path: &str) -> Result<(), String> {
+        Err(String::from("umount: not yet implemented"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SystemInfo implementation — wired to the agent Dashboard
+// ---------------------------------------------------------------------------
+
+/// SystemInfo wired to the agent Dashboard for ps/kill. Stubs the rest.
+struct DashboardSystemInfoMut<'a> {
+    dashboard: &'a Dashboard,
+}
+
+impl<'a> SystemInfo for DashboardSystemInfoMut<'a> {
+    fn list_agents(&self) -> Vec<(u64, String, String)> {
+        self.dashboard
+            .sessions
+            .iter()
+            .map(|s| {
+                let status = match s.state {
+                    AgentState::Idle => "idle",
+                    AgentState::WaitingForInput => "waiting",
+                    AgentState::Thinking => "thinking",
+                    AgentState::ToolExecuting => "tool",
+                    AgentState::Streaming => "streaming",
+                    AgentState::Error => "ERROR",
+                };
+                (s.id as u64, s.name.clone(), String::from(status))
+            })
+            .collect()
+    }
+
+    fn kill_agent(&mut self, _id: u64) -> Result<(), String> {
+        Err(String::from("kill: use Ctrl+B x to close panes"))
+    }
+
+    fn clear_screen(&mut self) {}
+
+    fn reboot(&mut self) -> ! {
+        unsafe {
+            x86_64::instructions::port::Port::<u8>::new(0x64).write(0xFE);
+        }
+        loop {
+            x86_64::instructions::hlt();
+        }
+    }
+
+    fn shutdown(&mut self) -> ! {
+        unsafe {
+            x86_64::instructions::port::Port::<u16>::new(0x604).write(0x2000);
+        }
+        loop {
+            x86_64::instructions::hlt();
+        }
+    }
+
+    fn ifconfig(&self) -> Vec<(String, String, String, String)> {
+        Vec::new()
+    }
+
+    fn ping(&self, host: &str) -> Result<String, String> {
+        Err(format!("ping: {}: not yet implemented", host))
+    }
+
+    fn date(&self) -> String {
+        String::from("(no RTC driver)")
+    }
+
+    fn uptime_secs(&self) -> u64 {
+        crate::interrupts::tick_count() / 18
+    }
+
+    fn memory_info(&self) -> (u64, u64, u64) {
+        let total = crate::memory::HEAP_SIZE as u64;
+        (total, 0, total)
+    }
+
+    fn disk_usage(&self) -> Vec<(String, u64, u64, u64)> {
+        Vec::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-pane input buffer
+// ---------------------------------------------------------------------------
+
+/// Input line buffer for each pane. Characters accumulate here until
 /// Enter is pressed, at which point the buffer is drained and submitted.
 struct InputBuffer {
-    /// The agent session id this buffer belongs to.
-    agent_id: usize,
+    /// The pane id this buffer belongs to.
+    pane_id: usize,
     /// Characters typed so far (before Enter).
     buf: String,
 }
 
 impl InputBuffer {
-    fn new(agent_id: usize) -> Self {
+    fn new(pane_id: usize) -> Self {
         Self {
-            agent_id,
+            pane_id,
             buf: String::new(),
         }
     }
@@ -166,7 +349,7 @@ impl InputBuffer {
 /// the next key to determine the command).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PrefixState {
-    /// Normal mode — keys go to the focused agent.
+    /// Normal mode — keys go to the focused pane.
     Normal,
     /// Prefix key (Ctrl+B) was pressed — next key is a command.
     AwaitingCommand,
@@ -179,12 +362,11 @@ enum PrefixState {
 /// Main entry point for the multi-agent dashboard.
 ///
 /// This replaces the simple keyboard echo loop in `main_async`. It:
-/// 1. Creates the initial layout (single pane) and agent session.
+/// 1. Creates the initial layout (single pane) with a shell session.
 /// 2. Enters an async loop reading keyboard events.
 /// 3. Routes prefix-key commands to layout/dashboard operations.
-/// 4. Routes regular keys to the focused agent's input buffer.
-/// 5. On Enter, submits the input buffer to the agent's conversation and
-///    dispatches an API call.
+/// 4. Routes regular keys to the focused pane's input buffer.
+/// 5. On Enter, submits the input buffer to the shell or agent conversation.
 /// 6. Renders only dirty regions after every input event (not the full screen).
 pub async fn run_dashboard(
     stack: &mut NetworkStack,
@@ -199,18 +381,23 @@ pub async fn run_dashboard(
         fb_height
     );
 
-    // -- Initialise layout + first agent session ----------------------------
+    // -- Initialise layout + pane tracking -----------------------------------
 
     let mut layout = Layout::new(fb_width, fb_height);
     let mut dashboard = Dashboard::new();
+    let mut pane_types: Vec<PaneType> = Vec::new();
     let mut input_buffers: Vec<InputBuffer> = Vec::new();
+    let mut next_shell_id: usize = 0;
+    let mut vfs = StubVfs;
 
-    // Create the first agent session bound to pane 0.
+    // Create the first pane as a shell session.
     let first_pane_id = layout.focused_pane_id();
-    let first_agent_id = dashboard.create_session(String::from("agent-0"), first_pane_id);
-    input_buffers.push(InputBuffer::new(first_agent_id));
+    let shell_state = ShellPaneState::new(next_shell_id, first_pane_id);
+    next_shell_id += 1;
+    pane_types.push(PaneType::Shell(shell_state));
+    input_buffers.push(InputBuffer::new(first_pane_id));
 
-    // Draw welcome banner + initial prompt into the first pane.
+    // Draw welcome banner into the first pane.
     {
         let pane = layout.pane_by_id_mut(first_pane_id).unwrap();
         pane.write_str("\x1b[96mClaudioOS v0.1.0\x1b[0m — \x1b[93mBare Metal AI Agent Terminal\x1b[0m\r\n");
@@ -221,11 +408,11 @@ pub async fn run_dashboard(
         pane.write_str("  \x1b[32mPhase 3\x1b[0m: TLS + API .................... \x1b[92mOK\x1b[0m\r\n");
         pane.write_str("  \x1b[32mPhase 4\x1b[0m: Multi-agent dashboard ........ \x1b[92mOK\x1b[0m\r\n");
         pane.write_str("\r\n");
-        pane.write_str("\x1b[90mCtrl+B then \" = split | n/p = focus | c = new agent | x = close\x1b[0m\r\n");
-        pane.write_str("\x1b[90mType a message and press Enter to talk to Claude.\x1b[0m\r\n");
+        pane.write_str("\x1b[90mCtrl+B then \" = split | n/p = focus | c = new agent | s = new shell | x = close\x1b[0m\r\n");
+        pane.write_str("\x1b[90mType commands or natural language. Type 'help' for builtins.\x1b[0m\r\n");
         pane.write_str("\r\n");
     }
-    render_prompt(&mut layout, &dashboard, &input_buffers);
+    render_prompt_for_pane(&mut layout, &pane_types, &input_buffers, first_pane_id, &dashboard);
 
     // Initial full render: draw everything into the back buffer, then blit.
     render_full(&mut layout);
@@ -247,10 +434,13 @@ pub async fn run_dashboard(
                             c,
                             &mut layout,
                             &mut dashboard,
+                            &mut pane_types,
                             &mut input_buffers,
+                            &mut next_shell_id,
                         );
                         // Structural change — do a full render.
-                        render_prompt(&mut layout, &dashboard, &input_buffers);
+                        let focused_pane_id = layout.focused_pane_id();
+                        render_prompt_for_pane(&mut layout, &pane_types, &input_buffers, focused_pane_id, &dashboard);
                         render_full(&mut layout);
                         continue;
                     }
@@ -263,24 +453,28 @@ pub async fn run_dashboard(
                             continue;
                         }
 
-                        // Enter key — submit input to focused agent.
+                        let focused_pane_id = layout.focused_pane_id();
+
+                        // Enter key — submit input.
                         if c == '\n' || c == '\r' {
-                            submit_input(
+                            submit_input_for_focused(
                                 &mut layout,
                                 &mut dashboard,
+                                &mut pane_types,
                                 &mut input_buffers,
+                                &mut vfs,
                                 stack,
                                 api_key,
                                 now,
                             ).await;
                         } else if c == '\x08' || c == '\x7f' {
                             // Backspace / DEL — remove last character from input buffer.
-                            if let Some(buf) = focused_input_buffer_mut(&mut input_buffers, &dashboard) {
+                            if let Some(buf) = input_buffers.iter_mut().find(|b| b.pane_id == focused_pane_id) {
                                 buf.backspace();
                             }
                         } else if !c.is_control() || c == '\t' {
                             // Regular printable character or tab — append to input buffer.
-                            if let Some(buf) = focused_input_buffer_mut(&mut input_buffers, &dashboard) {
+                            if let Some(buf) = input_buffers.iter_mut().find(|b| b.pane_id == focused_pane_id) {
                                 buf.push(c);
                             }
                         }
@@ -299,7 +493,8 @@ pub async fn run_dashboard(
         }
 
         // Re-render prompt + dirty panes (fast path).
-        render_prompt(&mut layout, &dashboard, &input_buffers);
+        let focused_pane_id = layout.focused_pane_id();
+        render_prompt_for_pane(&mut layout, &pane_types, &input_buffers, focused_pane_id, &dashboard);
         render_dirty(&mut layout);
     }
 }
@@ -313,12 +508,14 @@ fn handle_prefix_command(
     c: char,
     layout: &mut Layout,
     dashboard: &mut Dashboard,
+    pane_types: &mut Vec<PaneType>,
     input_buffers: &mut Vec<InputBuffer>,
+    next_shell_id: &mut usize,
 ) {
     match c {
         // Split horizontal: Ctrl+B then "
         '"' => {
-            log::info!("[dashboard] split horizontal");
+            log::info!("[dashboard] split horizontal (agent)");
             layout.split(SplitDirection::Horizontal);
             let new_pane_id = layout.focused_pane_id();
             let n = dashboard.sessions.len();
@@ -326,14 +523,13 @@ fn handle_prefix_command(
                 format!("agent-{}", n),
                 new_pane_id,
             );
-            input_buffers.push(InputBuffer::new(agent_id));
-            // Move dashboard focus to match the new layout focus.
-            sync_dashboard_focus(layout, dashboard);
+            pane_types.push(PaneType::Agent(agent_id));
+            input_buffers.push(InputBuffer::new(new_pane_id));
         }
 
         // Split vertical: Ctrl+B then %
         '%' => {
-            log::info!("[dashboard] split vertical");
+            log::info!("[dashboard] split vertical (agent)");
             layout.split(SplitDirection::Vertical);
             let new_pane_id = layout.focused_pane_id();
             let n = dashboard.sessions.len();
@@ -341,27 +537,25 @@ fn handle_prefix_command(
                 format!("agent-{}", n),
                 new_pane_id,
             );
-            input_buffers.push(InputBuffer::new(agent_id));
-            sync_dashboard_focus(layout, dashboard);
+            pane_types.push(PaneType::Agent(agent_id));
+            input_buffers.push(InputBuffer::new(new_pane_id));
         }
 
         // Focus next pane: Ctrl+B then n
         'n' => {
             log::info!("[dashboard] focus next");
             layout.focus_next();
-            sync_dashboard_focus(layout, dashboard);
         }
 
         // Focus previous pane: Ctrl+B then p
         'p' => {
             log::info!("[dashboard] focus prev");
             layout.focus_prev();
-            sync_dashboard_focus(layout, dashboard);
         }
 
         // New agent session: Ctrl+B then c
         'c' => {
-            log::info!("[dashboard] new agent (split horizontal)");
+            log::info!("[dashboard] new agent pane (split horizontal)");
             layout.split(SplitDirection::Horizontal);
             let new_pane_id = layout.focused_pane_id();
             let n = dashboard.sessions.len();
@@ -369,8 +563,31 @@ fn handle_prefix_command(
                 format!("agent-{}", n),
                 new_pane_id,
             );
-            input_buffers.push(InputBuffer::new(agent_id));
-            sync_dashboard_focus(layout, dashboard);
+            pane_types.push(PaneType::Agent(agent_id));
+            input_buffers.push(InputBuffer::new(new_pane_id));
+
+            // Write agent welcome into the new pane.
+            if let Some(pane) = layout.pane_by_id_mut(new_pane_id) {
+                pane.write_str("\x1b[96mClaude Agent\x1b[0m — type a message and press Enter\r\n");
+                pane.write_str("\x1b[90m────────────────────────────────────────────────────\x1b[0m\r\n");
+            }
+        }
+
+        // New shell session: Ctrl+B then s
+        's' => {
+            log::info!("[dashboard] new shell pane (split horizontal)");
+            layout.split(SplitDirection::Horizontal);
+            let new_pane_id = layout.focused_pane_id();
+            let shell_state = ShellPaneState::new(*next_shell_id, new_pane_id);
+            *next_shell_id += 1;
+            pane_types.push(PaneType::Shell(shell_state));
+            input_buffers.push(InputBuffer::new(new_pane_id));
+
+            // Write shell welcome into the new pane.
+            if let Some(pane) = layout.pane_by_id_mut(new_pane_id) {
+                pane.write_str("\x1b[96mClaudioOS Shell\x1b[0m\r\n");
+                pane.write_str("\x1b[90mType 'help' for built-in commands.\x1b[0m\r\n");
+            }
         }
 
         // Close focused pane: Ctrl+B then x
@@ -381,14 +598,28 @@ fn handle_prefix_command(
             }
             log::info!("[dashboard] close focused pane");
 
-            // Remove the agent session and its input buffer.
-            if let Some(session) = dashboard.focused_session() {
-                let agent_id = session.id;
-                input_buffers.retain(|b| b.agent_id != agent_id);
+            let focused_pane_id = layout.focused_pane_id();
+
+            // Remove the pane type entry and input buffer.
+            // Also remove the agent session if it was an agent pane.
+            if let Some(idx) = pane_types.iter().position(|pt| match pt {
+                PaneType::Agent(aid) => {
+                    dashboard.session_by_id(*aid).map(|s| s.pane_id) == Some(focused_pane_id)
+                }
+                PaneType::Shell(ss) => ss.pane_id == focused_pane_id,
+            }) {
+                if let PaneType::Agent(_) = &pane_types[idx] {
+                    // Find and close the agent session matching this pane.
+                    // We need to find the dashboard index for the session.
+                    if let Some(si) = dashboard.sessions.iter().position(|s| s.pane_id == focused_pane_id) {
+                        dashboard.focused = si;
+                        dashboard.close_focused();
+                    }
+                }
+                pane_types.remove(idx);
             }
-            dashboard.close_focused();
+            input_buffers.retain(|b| b.pane_id != focused_pane_id);
             layout.close_focused();
-            sync_dashboard_focus(layout, dashboard);
         }
 
         other => {
@@ -398,33 +629,25 @@ fn handle_prefix_command(
 }
 
 // ---------------------------------------------------------------------------
-// Input submission
+// Input submission — dispatches to agent or shell
 // ---------------------------------------------------------------------------
 
-/// Submit the focused agent's input buffer: add it to the conversation,
-/// transition to Thinking, and run the full API call + tool-use loop.
-///
-/// This replaces the previous single-shot API call with the tool-use loop
-/// from `agent_loop::run_tool_loop`. The model can now invoke tools
-/// (file_read, file_write, list_directory, execute_command) and have the
-/// results fed back automatically until a final text response is produced.
-async fn submit_input(
+/// Submit the focused pane's input buffer.
+/// Dispatches to either `submit_agent_input` or `submit_shell_input`.
+async fn submit_input_for_focused(
     layout: &mut Layout,
     dashboard: &mut Dashboard,
+    pane_types: &mut Vec<PaneType>,
     input_buffers: &mut Vec<InputBuffer>,
+    vfs: &mut StubVfs,
     stack: &mut NetworkStack,
     api_key: &str,
     now: fn() -> Instant,
 ) {
-    use crate::agent_loop::{run_tool_loop, ToolLoopOutcome};
-
-    let agent_id = match dashboard.focused_session() {
-        Some(s) => s.id,
-        None => return,
-    };
+    let focused_pane_id = layout.focused_pane_id();
 
     // Drain the input buffer.
-    let input_text = match input_buffers.iter_mut().find(|b| b.agent_id == agent_id) {
+    let input_text = match input_buffers.iter_mut().find(|b| b.pane_id == focused_pane_id) {
         Some(buf) => buf.drain(),
         None => return,
     };
@@ -433,10 +656,56 @@ async fn submit_input(
         return;
     }
 
+    // Find the pane type for the focused pane.
+    let pane_type_idx = pane_types.iter().position(|pt| match pt {
+        PaneType::Agent(aid) => {
+            dashboard.session_by_id(*aid).map(|s| s.pane_id) == Some(focused_pane_id)
+        }
+        PaneType::Shell(ss) => ss.pane_id == focused_pane_id,
+    });
+
+    let pane_type_idx = match pane_type_idx {
+        Some(i) => i,
+        None => {
+            log::warn!("[dashboard] no pane type for focused pane {}", focused_pane_id);
+            return;
+        }
+    };
+
+    // Check if this is an agent or shell pane.
+    let is_agent = matches!(&pane_types[pane_type_idx], PaneType::Agent(_));
+
+    if is_agent {
+        let agent_id = match &pane_types[pane_type_idx] {
+            PaneType::Agent(aid) => *aid,
+            _ => unreachable!(),
+        };
+        submit_agent_input(
+            layout, dashboard, agent_id, focused_pane_id, input_text, stack, api_key, now,
+        ).await;
+    } else {
+        submit_shell_input(
+            layout, dashboard, pane_types, pane_type_idx, focused_pane_id, input_text, vfs,
+        );
+    }
+}
+
+/// Submit input to an agent session — API call + tool-use loop.
+async fn submit_agent_input(
+    layout: &mut Layout,
+    dashboard: &mut Dashboard,
+    agent_id: usize,
+    pane_id: usize,
+    input_text: String,
+    stack: &mut NetworkStack,
+    api_key: &str,
+    now: fn() -> Instant,
+) {
+    use crate::agent_loop::{run_tool_loop, ToolLoopOutcome};
+
     log::info!("[dashboard] agent {} input: {}", agent_id, input_text);
 
     // Write the user's input into the pane as a visual echo.
-    let pane_id = dashboard.focused_session().map(|s| s.pane_id).unwrap_or(0);
     if let Some(pane) = layout.pane_by_id_mut(pane_id) {
         pane.write_str(&format!("\r\n\x1b[32m> {}\x1b[0m\r\n", input_text));
     }
@@ -459,8 +728,6 @@ async fn submit_input(
     render_dirty(layout);
 
     // --- Run the full API call + tool-use loop ------------------------------
-    // Collect tool call info into a Vec since we can't borrow layout inside
-    // the closure (the session borrow from dashboard would conflict).
     let mut tool_log: Vec<(String, String, String, bool)> = Vec::new();
 
     let outcome = {
@@ -518,57 +785,153 @@ async fn submit_input(
     }
 }
 
+/// Submit input to a shell session — execute the command and write output to the pane.
+fn submit_shell_input(
+    layout: &mut Layout,
+    dashboard: &Dashboard,
+    pane_types: &mut Vec<PaneType>,
+    pane_type_idx: usize,
+    pane_id: usize,
+    input_text: String,
+    vfs: &mut StubVfs,
+) {
+    log::info!("[dashboard] shell input: {}", input_text);
+
+    // Echo the input.
+    if let Some(pane) = layout.pane_by_id_mut(pane_id) {
+        pane.write_str(&format!("\r\n\x1b[32m$ {}\x1b[0m\r\n", input_text));
+    }
+
+    // Special handling for `history` — we need to read from the shell state.
+    let shell_state = match &mut pane_types[pane_type_idx] {
+        PaneType::Shell(ss) => ss,
+        _ => return,
+    };
+
+    // Handle `history` specially since it reads from shell state directly.
+    let trimmed = input_text.trim();
+    if trimmed == "history" {
+        let entries = shell_state.shell.history.entries();
+        let mut output = String::new();
+        for (i, entry) in entries.iter().enumerate() {
+            output.push_str(&format!("  {:>4}  {}\r\n", i + 1, entry));
+        }
+        if let Some(pane) = layout.pane_by_id_mut(pane_id) {
+            pane.write_str(&output);
+        }
+        // Still add to history.
+        shell_state.shell.history.push(trimmed);
+        return;
+    }
+
+    // Execute using Shell::execute_input which handles both commands and natural language.
+    // We need a dummy LineReader since execute_input takes one for AI confirmation.
+    let mut dummy_reader = DummyLineReader;
+    let mut sys = DashboardSystemInfoMut { dashboard };
+
+    let (output, exit_code) = shell_state.shell.execute_input(
+        trimmed,
+        vfs,
+        &mut sys,
+        &mut dummy_reader,
+    );
+
+    // Add to history.
+    shell_state.shell.history.push(trimmed);
+
+    // Write output to the pane.
+    if !output.is_empty() {
+        if let Some(pane) = layout.pane_by_id_mut(pane_id) {
+            // Convert \n to \r\n for the terminal pane.
+            let terminal_output = output.replace('\n', "\r\n");
+            pane.write_str(&terminal_output);
+            if !output.ends_with('\n') {
+                pane.write_str("\r\n");
+            }
+        }
+    }
+
+    if exit_code != 0 {
+        log::debug!("[dashboard] shell command exited with code {}", exit_code);
+    }
+}
+
+/// Dummy LineReader for shell commands that don't need interactive input.
+/// AI natural language proposals will auto-cancel since read_line returns None.
+struct DummyLineReader;
+
+impl claudio_shell::LineReader for DummyLineReader {
+    fn read_line(&mut self, _prompt: &str) -> Option<String> {
+        None // Cancel any AI proposals that need confirmation.
+    }
+
+    fn write_output(&mut self, _text: &str) {
+        // Output is captured via execute_input return value instead.
+    }
+
+    fn check_interrupt(&self) -> bool {
+        false
+    }
+
+    fn clear_interrupt(&mut self) {}
+}
+
 // ---------------------------------------------------------------------------
 // Rendering helpers
 // ---------------------------------------------------------------------------
 
-/// Render the prompt line (with input buffer contents) into the focused pane.
-///
-/// This writes the prompt at the bottom of the pane content. For simplicity,
-/// we render the prompt as part of the pane's VTE stream — the cursor is
-/// already managed by the pane.
-fn render_prompt(
+/// Render the prompt line for a specific pane (agent or shell).
+fn render_prompt_for_pane(
     layout: &mut Layout,
-    dashboard: &Dashboard,
+    pane_types: &[PaneType],
     input_buffers: &[InputBuffer],
+    pane_id: usize,
+    dashboard: &Dashboard,
 ) {
-    let session = match dashboard.focused_session() {
-        Some(s) => s,
-        None => return,
-    };
-
     let input_text = input_buffers
         .iter()
-        .find(|b| b.agent_id == session.id)
+        .find(|b| b.pane_id == pane_id)
         .map(|b| b.as_str())
         .unwrap_or("");
 
-    let state_indicator = match session.state {
-        AgentState::Idle => "[idle]",
-        AgentState::WaitingForInput => "",
-        AgentState::Thinking => "[thinking]",
-        AgentState::ToolExecuting => "[tool]",
-        AgentState::Streaming => "[streaming]",
-        AgentState::Error => "[ERROR]",
+    // Find the pane type.
+    let pane_type = pane_types.iter().find(|pt| match pt {
+        PaneType::Agent(aid) => {
+            dashboard.session_by_id(*aid).map(|s| s.pane_id) == Some(pane_id)
+        }
+        PaneType::Shell(ss) => ss.pane_id == pane_id,
+    });
+
+    let (name, state_indicator, prompt_char) = match pane_type {
+        Some(PaneType::Agent(aid)) => {
+            if let Some(session) = dashboard.session_by_id(*aid) {
+                let state = match session.state {
+                    AgentState::Idle => "[idle]",
+                    AgentState::WaitingForInput => "",
+                    AgentState::Thinking => "[thinking]",
+                    AgentState::ToolExecuting => "[tool]",
+                    AgentState::Streaming => "[streaming]",
+                    AgentState::Error => "[ERROR]",
+                };
+                (session.name.as_str(), state, ">")
+            } else {
+                ("agent", "", ">")
+            }
+        }
+        Some(PaneType::Shell(_ss)) => {
+            ("shell", "", "$")
+        }
+        None => ("???", "", ">"),
     };
 
-    // Build the status/prompt line. We use ANSI escapes to:
-    //   - Save cursor position (\x1b[s)
-    //   - Move to the last row (\x1b[{rows};1H)
-    //   - Clear the line (\x1b[2K)
-    //   - Write the prompt
-    //   - Restore cursor position (\x1b[u)
-    //
-    // This way the prompt is always at the bottom without disrupting content.
-    let pane_id = session.pane_id;
     if let Some(pane) = layout.pane_by_id_mut(pane_id) {
         let rows = pane.rows();
-        // Save cursor, move to last row, clear line, draw prompt, restore.
         let prompt_line = format!(
-            "\x1b[s\x1b[{};1H\x1b[2K\x1b[33m{}\x1b[37m {} \x1b[32m> \x1b[0m{}\x1b[u",
+            "\x1b[s\x1b[{};1H\x1b[2K\x1b[33m{}\x1b[37m {} \x1b[32m{} \x1b[0m{}\x1b[u",
             rows,
-            session.name,
+            name,
             state_indicator,
+            prompt_char,
             input_text,
         );
         pane.write_str(&prompt_line);
@@ -603,14 +966,8 @@ fn render_dirty(layout: &mut Layout) {
     }
 
     // Always include a small region for cursor movement (cursor row +/- 1 row).
-    // The cursor delta rendering touches at most 2 character rows (old + new).
-    // We handle this by extending the dirty region to cover the full focused pane
-    // cursor area (cheap since it's just 2 rows = 32 pixel-rows).
     let focused_pane = layout.focused_pane();
     let fvp = &focused_pane.viewport;
-    // The cursor could be anywhere in the pane, so just extend to cover the
-    // pane's full vertical extent. This is still much cheaper than rendering
-    // all panes.
     if min_y > fvp.y {
         min_y = fvp.y;
     }
@@ -658,42 +1015,4 @@ fn render_full(layout: &mut Layout) {
     });
     crate::framebuffer::blit_full();
     log::debug!("[dashboard] full render completed");
-}
-
-// ---------------------------------------------------------------------------
-// Focus synchronisation
-// ---------------------------------------------------------------------------
-
-/// After a layout operation (split, close), sync the dashboard's focused
-/// session to match the layout's focused pane.
-///
-/// The layout tracks focus by pane id; the dashboard tracks focus by session
-/// index. We find which session owns the layout's focused pane and set
-/// dashboard focus to that session's index.
-fn sync_dashboard_focus(layout: &Layout, dashboard: &mut Dashboard) {
-    let focused_pane_id = layout.focused_pane_id();
-    for (idx, session) in dashboard.sessions.iter().enumerate() {
-        if session.pane_id == focused_pane_id {
-            dashboard.focused = idx;
-            return;
-        }
-    }
-    // If no session matches (shouldn't happen), leave focus as-is.
-    log::warn!(
-        "[dashboard] no session found for pane {}, focus unchanged",
-        focused_pane_id
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Input buffer helpers
-// ---------------------------------------------------------------------------
-
-/// Get a mutable reference to the input buffer for the currently focused agent.
-fn focused_input_buffer_mut<'a>(
-    input_buffers: &'a mut Vec<InputBuffer>,
-    dashboard: &Dashboard,
-) -> Option<&'a mut InputBuffer> {
-    let agent_id = dashboard.focused_session()?.id;
-    input_buffers.iter_mut().find(|b| b.agent_id == agent_id)
 }

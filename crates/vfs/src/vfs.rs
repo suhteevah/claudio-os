@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use crate::device::{BlockDevice, PartitionEntry, detect_partition_scheme, parse_gpt, parse_mbr, PartitionScheme};
 use crate::dir::DirEntry;
 use crate::file::{FileDescriptor, FileInfo, FileType, OpenFile, OpenFlags, SeekWhence};
-use crate::fs_trait::{Filesystem, FsError, FsType};
+use crate::fs_trait::{Filesystem, FsError};
 use crate::mount::{MountOptions, MountTable, MountError};
 use crate::path::Path;
 
@@ -111,8 +111,8 @@ impl Vfs {
         };
         let mut closed = 0usize;
         for slot in self.open_files.iter_mut() {
-            if let Some(ref of) = slot {
-                if of.path.starts_with(normalized) {
+            if let Some(open_file) = slot.as_ref() {
+                if open_file.path.starts_with(normalized) {
                     *slot = None;
                     closed += 1;
                 }
@@ -263,8 +263,8 @@ impl Vfs {
         let n = resolved.filesystem.read_file(rel_path.as_str(), position, buf)?;
 
         // Update position
-        if let Some(Some(ref mut of)) = self.open_files.get_mut(fd.0) {
-            of.position += n as u64;
+        if let Some(Some(open_file)) = self.open_files.get_mut(fd.0) {
+            open_file.position += n as u64;
         }
 
         log::trace!("vfs: read fd={}: {} bytes at offset {}", fd.0, n, position);
@@ -291,10 +291,10 @@ impl Vfs {
         let n = resolved.filesystem.write_file(rel_path.as_str(), position, data)?;
 
         // Update position and cached size
-        if let Some(Some(ref mut of)) = self.open_files.get_mut(fd.0) {
-            of.position += n as u64;
-            if of.position > of.size {
-                of.size = of.position;
+        if let Some(Some(open_file)) = self.open_files.get_mut(fd.0) {
+            open_file.position += n as u64;
+            if open_file.position > open_file.size {
+                open_file.size = open_file.position;
             }
         }
 

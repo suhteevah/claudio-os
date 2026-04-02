@@ -48,7 +48,7 @@ pub struct Shell {
     /// Whether the shell should keep running.
     pub running: bool,
     /// AI callback (optional — defaults to NoOp).
-    ai_callback: Box<dyn AiShellCallback>,
+    ai_callback: Box<dyn AiShellCallback + Send>,
 }
 
 impl Shell {
@@ -75,7 +75,7 @@ impl Shell {
     }
 
     /// Set the AI callback for natural language processing.
-    pub fn set_ai_callback(&mut self, callback: Box<dyn AiShellCallback>) {
+    pub fn set_ai_callback(&mut self, callback: Box<dyn AiShellCallback + Send>) {
         log::info!("shell: AI callback connected");
         self.ai_callback = callback;
     }

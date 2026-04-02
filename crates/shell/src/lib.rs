@@ -19,9 +19,10 @@ pub mod script;
 pub mod shell;
 
 pub use shell::Shell;
+pub use shell::LineReader;
 pub use env::Environment;
 pub use parser::{Command, Pipeline};
-pub use builtin::execute_builtin;
+pub use builtin::{execute_builtin, Vfs, SystemInfo};
 pub use ai::AiShellCallback;
 pub use pipe::PipelineExecutor;
 pub use prompt::Prompt;

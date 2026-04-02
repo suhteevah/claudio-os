@@ -13,7 +13,7 @@ spin = { workspace = true }
 # Post-quantum KEM
 ml-kem = { version = "0.2", default-features = false }
 # Post-quantum signatures
-ml-dsa = { version = "0.1", default-features = false, features = ["ml-dsa-65"] }
+ml-dsa = { version = "0.1.0-rc.8", default-features = false }
 
 # Classical crypto
 x25519-dalek = { version = "2", default-features = false }
