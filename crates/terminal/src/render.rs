@@ -13,6 +13,7 @@
 //! framebuffer as a flat array and memcpy scanlines.
 
 use super::terminus;
+use super::unicode_font;
 
 /// Height of each character cell in pixels.
 pub const FONT_HEIGHT: usize = terminus::CHAR_HEIGHT;
@@ -79,7 +80,7 @@ pub fn render_char<D: super::DrawTarget>(
     fg: Color,
     bg: Color,
 ) {
-    let glyph = terminus::get_glyph(c);
+    let glyph = unicode_font::get_glyph(c);
 
     let stride = target.stride();
     let bpp = target.bytes_per_pixel();

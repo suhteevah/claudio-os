@@ -996,6 +996,27 @@ async fn submit_input_for_focused(
             return;
         }
 
+        // Intercept /model command — per-agent model switching.
+        {
+            let trimmed = input_text.trim();
+            if trimmed == "/model" || trimmed.starts_with("/model ") {
+                let model_args = trimmed.strip_prefix("/model").unwrap_or("").trim();
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    pane.write_str(&format!("\r\n\x1b[32m> {}\x1b[0m\r\n", trimmed));
+                }
+                let output = if let Some(session) = dashboard.session_by_id_mut(agent_id) {
+                    crate::model_select::handle_agent_command(session, model_args)
+                } else {
+                    alloc::string::String::from("Agent session not found.\n")
+                };
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    let terminal_output = output.replace('\n', "\r\n");
+                    pane.write_str(&format!("\x1b[36m{}\x1b[0m", terminal_output));
+                }
+                return;
+            }
+        }
+
         submit_agent_input(
             layout, dashboard, agent_id, focused_pane_id, input_text, stack, api_key, now,
         ).await;
@@ -1061,6 +1082,52 @@ async fn submit_input_for_focused(
             }
         }
 
+        // Intercept `ntpdate` NTP time sync command.
+        {
+            let trimmed_ntp = input_text.trim();
+            if trimmed_ntp == "ntpdate" || trimmed_ntp.starts_with("ntpdate ") {
+                let ntp_args = trimmed_ntp.strip_prefix("ntpdate").unwrap_or("").trim();
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    pane.write_str(&format!("\r\n\x1b[32m$ {}\x1b[0m\r\n", trimmed_ntp));
+                }
+                let ntp_output = crate::ntp::handle_command(ntp_args, stack, now);
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    let terminal_output = ntp_output.replace('\n', "\r\n");
+                    pane.write_str(&terminal_output);
+                    if !ntp_output.ends_with('\n') {
+                        pane.write_str("\r\n");
+                    }
+                }
+                if let PaneType::Shell(ss) = &mut pane_types[pane_type_idx] {
+                    ss.shell.history.push(trimmed_ntp);
+                }
+                return;
+            }
+        }
+
+        // Intercept `model` command for model selection.
+        {
+            let trimmed_model = input_text.trim();
+            if trimmed_model == "model" || trimmed_model.starts_with("model ") {
+                let model_args = trimmed_model.strip_prefix("model").unwrap_or("").trim();
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    pane.write_str(&format!("\r\n\x1b[32m$ {}\x1b[0m\r\n", trimmed_model));
+                }
+                let model_output = crate::model_select::handle_command(model_args);
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    let terminal_output = model_output.replace('\n', "\r\n");
+                    pane.write_str(&terminal_output);
+                    if !model_output.ends_with('\n') {
+                        pane.write_str("\r\n");
+                    }
+                }
+                if let PaneType::Shell(ss) = &mut pane_types[pane_type_idx] {
+                    ss.shell.history.push(trimmed_model);
+                }
+                return;
+            }
+        }
+
         // Intercept `man` and enhanced `help` commands.
         {
             let trimmed_man = input_text.trim();
@@ -1101,6 +1168,61 @@ async fn submit_input_for_focused(
             }
         }
 
+        // Intercept `notifications` / `notif` commands.
+        {
+            let trimmed_notif = input_text.trim();
+            if trimmed_notif == "notifications" || trimmed_notif == "notif"
+                || trimmed_notif.starts_with("notif ")
+                || trimmed_notif.starts_with("notifications ")
+            {
+                let notif_args = if let Some(rest) = trimmed_notif.strip_prefix("notifications") {
+                    rest.trim()
+                } else if let Some(rest) = trimmed_notif.strip_prefix("notif") {
+                    rest.trim()
+                } else {
+                    ""
+                };
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    pane.write_str(&format!("\r\n\x1b[32m$ {}\x1b[0m\r\n", trimmed_notif));
+                }
+                let notif_output = crate::notifications::handle_command(notif_args);
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    let terminal_output = notif_output.replace('\n', "\r\n");
+                    pane.write_str(&terminal_output);
+                    if !notif_output.ends_with('\n') {
+                        pane.write_str("\r\n");
+                    }
+                }
+                if let PaneType::Shell(ss) = &mut pane_types[pane_type_idx] {
+                    ss.shell.history.push(trimmed_notif);
+                }
+                return;
+            }
+        }
+
+        // Intercept `view <path>` image viewer command.
+        {
+            let trimmed_view = input_text.trim();
+            if trimmed_view == "view" || trimmed_view.starts_with("view ") {
+                let view_args = trimmed_view.strip_prefix("view").unwrap_or("").trim();
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    pane.write_str(&format!("\r\n\x1b[32m$ {}\x1b[0m\r\n", trimmed_view));
+                }
+                let view_output = crate::image_viewer::handle_command(view_args);
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    let terminal_output = view_output.replace('\n', "\r\n");
+                    pane.write_str(&terminal_output);
+                    if !view_output.ends_with('\n') {
+                        pane.write_str("\r\n");
+                    }
+                }
+                if let PaneType::Shell(ss) = &mut pane_types[pane_type_idx] {
+                    ss.shell.history.push(trimmed_view);
+                }
+                return;
+            }
+        }
+
         submit_shell_input(
             layout, dashboard, pane_types, pane_type_idx, focused_pane_id, input_text, vfs,
         );
@@ -1108,6 +1230,10 @@ async fn submit_input_for_focused(
 }
 
 /// Submit input to an agent session — API call + tool-use loop.
+///
+/// Uses **streaming** so tokens appear in real-time as Claude generates them.
+/// Each text chunk is written directly to the pane and the dirty region is
+/// flushed to the framebuffer immediately, giving the user instant feedback.
 async fn submit_agent_input(
     layout: &mut Layout,
     dashboard: &mut Dashboard,
@@ -1118,7 +1244,7 @@ async fn submit_agent_input(
     api_key: &str,
     now: fn() -> Instant,
 ) {
-    use crate::agent_loop::{run_tool_loop, ToolLoopOutcome};
+    use crate::agent_loop::{run_tool_loop_streaming, ToolLoopOutcome};
 
     log::info!("[dashboard] agent {} input: {}", agent_id, input_text);
 
@@ -1147,7 +1273,9 @@ async fn submit_agent_input(
     }
     render_dirty(layout);
 
-    // --- Run the full API call + tool-use loop ------------------------------
+    // --- Run the streaming API call + tool-use loop -------------------------
+    // `streaming_started` tracks whether we've begun writing cyan text.
+    let mut streaming_started = false;
     let mut tool_log: Vec<(String, String, String, bool)> = Vec::new();
 
     let outcome = {
@@ -1156,21 +1284,52 @@ async fn submit_agent_input(
             None => return,
         };
 
-        run_tool_loop(session, stack, api_key, now, |info| {
-            log::info!(
-                "[dashboard] tool: {}({}) -> {}",
-                info.name,
-                info.summary,
-                if info.is_error { "ERROR" } else { "ok" }
-            );
-            tool_log.push((
-                info.name.clone(),
-                info.summary.clone(),
-                info.result_preview.clone(),
-                info.is_error,
-            ));
-        })
+        run_tool_loop_streaming(
+            session,
+            stack,
+            api_key,
+            now,
+            // on_token: write each chunk to the pane immediately + re-render.
+            |chunk| {
+                if !streaming_started {
+                    // Start the cyan text block and clear the "[thinking...]" line.
+                    if let Some(pane) = layout.pane_by_id_mut(pane_id) {
+                        pane.write_str("\r\n\x1b[36m");
+                    }
+                    streaming_started = true;
+                }
+                if let Some(pane) = layout.pane_by_id_mut(pane_id) {
+                    // Convert \n to \r\n for the terminal.
+                    let display = chunk.replace('\n', "\r\n");
+                    pane.write_str(&display);
+                }
+                // Flush to framebuffer so the user sees each token immediately.
+                render_dirty(layout);
+            },
+            // on_tool_call: collect for display after the loop.
+            |info| {
+                log::info!(
+                    "[dashboard] tool: {}({}) -> {}",
+                    info.name,
+                    info.summary,
+                    if info.is_error { "ERROR" } else { "ok" }
+                );
+                tool_log.push((
+                    info.name.clone(),
+                    info.summary.clone(),
+                    info.result_preview.clone(),
+                    info.is_error,
+                ));
+            },
+        )
     };
+
+    // Close the cyan text block if streaming was active.
+    if streaming_started {
+        if let Some(pane) = layout.pane_by_id_mut(pane_id) {
+            pane.write_str("\x1b[0m\r\n");
+        }
+    }
 
     // Display tool calls in the pane.
     for (name, summary, preview, is_error) in &tool_log {
@@ -1189,12 +1348,11 @@ async fn submit_agent_input(
         }
     }
 
-    // Display the final outcome.
+    // Display the final outcome — only for errors, since streaming already
+    // wrote the text directly to the pane.
     match outcome {
-        ToolLoopOutcome::Text(text) => {
-            if let Some(pane) = layout.pane_by_id_mut(pane_id) {
-                pane.write_str(&format!("\r\n\x1b[36m{}\x1b[0m\r\n", text));
-            }
+        ToolLoopOutcome::Text(_text) => {
+            // Already streamed to the pane token-by-token, nothing more to do.
         }
         ToolLoopOutcome::Error(e) => {
             log::error!("[dashboard] agent {} tool loop error: {}", agent_id, e);
@@ -1203,6 +1361,8 @@ async fn submit_agent_input(
             }
         }
     }
+
+    render_dirty(layout);
 }
 
 /// Submit input to a shell session — execute the command and write output to the pane.
@@ -1560,9 +1720,11 @@ fn render_prompt_for_pane(
 
     if let Some(pane) = layout.pane_by_id_mut(pane_id) {
         let rows = pane.rows();
+        let notif_indicator = crate::notifications::prompt_indicator();
         let prompt_line = format!(
-            "\x1b[s\x1b[{};1H\x1b[2K\x1b[33m{}\x1b[37m {} \x1b[32m{} \x1b[0m{}\x1b[u",
+            "\x1b[s\x1b[{};1H\x1b[2K{}\x1b[33m{}\x1b[37m {} \x1b[32m{} \x1b[0m{}\x1b[u",
             rows,
+            notif_indicator,
             name,
             state_indicator,
             prompt_char,

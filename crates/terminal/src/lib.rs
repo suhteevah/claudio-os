@@ -10,6 +10,7 @@ pub mod layout;
 pub mod pane;
 pub mod render;
 pub mod terminus;
+pub mod unicode_font;
 
 // Re-export the main public types for convenient use from the kernel.
 pub use layout::Layout;

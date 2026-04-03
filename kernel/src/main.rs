@@ -51,8 +51,17 @@ mod clipboard;
 mod firewall;
 mod manpages;
 mod cron;
+mod email;
 mod encryption;
+mod image_viewer;
+mod model_select;
+mod notifications;
+mod ntp;
+mod search;
+mod streaming;
 mod swap;
+mod git;
+mod agent_memory;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
@@ -978,8 +987,10 @@ async fn main_async() {
 
                             // Step 2: Send a message
                             log::info!("[claude.ai] sending test message...");
+                            let test_model = model_select::claude_ai_model_id();
                             let msg_body = alloc::format!(
-                                r#"{{"prompt":"Say hello from bare metal! Keep it short.","timezone":"America/New_York","attachments":[],"files":[],"model":"claude-sonnet-4-6","rendering_mode":"messages"}}"#
+                                r#"{{"prompt":"Say hello from bare metal! Keep it short.","timezone":"America/New_York","attachments":[],"files":[],"model":"{}","rendering_mode":"messages"}}"#,
+                                test_model
                             );
                             let msg_path = alloc::format!("/api/organizations/{}/chat_conversations/{}/completion", org_id, conv_id);
                             let msg_req = claudio_net::http::HttpRequest::post(

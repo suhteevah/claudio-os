@@ -169,6 +169,165 @@ pub struct ToolCallInfo {
     pub is_error: bool,
 }
 
+/// Run the API-call + tool-execution loop **with real-time streaming**.
+///
+/// Same as [`run_tool_loop`] but uses SSE streaming: each text token is
+/// delivered to `on_token` as it arrives from the API, so the dashboard
+/// can render Claude's response in real-time instead of waiting for the
+/// full response.
+///
+/// `on_token` is called with each text fragment. `on_tool_call` is called
+/// for each tool execution (same as the non-streaming version).
+pub fn run_tool_loop_streaming(
+    session: &mut AgentSession,
+    stack: &mut NetworkStack,
+    api_key: &str,
+    now: fn() -> claudio_net::Instant,
+    mut on_token: impl FnMut(&str),
+    mut on_tool_call: impl FnMut(&ToolCallInfo),
+) -> ToolLoopOutcome {
+    let tool_defs = builtin_tool_definitions();
+    let mut tool_rounds = 0;
+
+    loop {
+        session.state = AgentState::Thinking;
+
+        // Build the Messages API request with stream=true.
+        let mut request = build_request(session, &tool_defs);
+        request.stream = true;
+
+        let body_bytes = match request.to_json() {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("[agent_loop] failed to serialize request: {}", e);
+                session.set_error();
+                return ToolLoopOutcome::Error(format!("failed to build request: {}", e));
+            }
+        };
+
+        // Try streaming path first.
+        let stream_result = send_streaming(stack, api_key, &body_bytes, now, |chunk| {
+            on_token(chunk);
+        });
+
+        match stream_result {
+            Ok(result) => {
+                let text = result.text.clone();
+
+                // Record usage (streaming doesn't give us exact counts easily,
+                // estimate 0 and let the non-streaming fallback path handle it).
+                session.record_usage(0, 0);
+
+                // For streaming, we get plain text — no tool_use detection.
+                // Record it and return.
+                session.handle_response_text(text.clone(), 0);
+                session.state = AgentState::WaitingForInput;
+                return ToolLoopOutcome::Text(text);
+            }
+            Err(e) => {
+                // Streaming failed — fall back to non-streaming path.
+                log::warn!("[agent_loop] streaming failed, falling back: {}", e);
+
+                // Re-build without stream=true.
+                let request = build_request(session, &tool_defs);
+                let body_bytes = match request.to_json() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        session.set_error();
+                        return ToolLoopOutcome::Error(format!("failed to build request: {}", e));
+                    }
+                };
+
+                let response_bytes = match send_via_https(stack, api_key, &body_bytes, now) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        session.set_error();
+                        return ToolLoopOutcome::Error(e);
+                    }
+                };
+
+                let api_response = match parse_api_response(&response_bytes) {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        session.set_error();
+                        return ToolLoopOutcome::Error(format!("bad API response: {}", e));
+                    }
+                };
+
+                session.record_usage(
+                    api_response.usage.input_tokens,
+                    api_response.usage.output_tokens,
+                );
+
+                if api_response.needs_tool_use() {
+                    tool_rounds += 1;
+                    if tool_rounds > MAX_TOOL_ROUNDS {
+                        session.set_error();
+                        return ToolLoopOutcome::Error(format!(
+                            "too many tool calls ({} rounds)",
+                            MAX_TOOL_ROUNDS
+                        ));
+                    }
+
+                    let tool_calls = extract_tool_calls_from_response(&api_response);
+                    for tc in &tool_calls {
+                        let input_str = serde_json::to_string(&tc.input).unwrap_or_default();
+                        session.handle_tool_use(tc.id.clone(), tc.name.clone(), input_str, 0);
+                    }
+                    for tc in &tool_calls {
+                        session.state = AgentState::ToolExecuting;
+                        let result = execute_tool(tc);
+                        let summary = tool_call_summary(tc);
+                        let preview = tool_result_preview(&result.content);
+                        on_tool_call(&ToolCallInfo {
+                            name: tc.name.clone(),
+                            summary,
+                            result_preview: preview,
+                            is_error: result.is_error,
+                        });
+                        session.handle_tool_result(
+                            result.tool_use_id.clone(),
+                            result.content.clone(),
+                            result.is_error,
+                            0,
+                        );
+                    }
+                    continue;
+                }
+
+                let text = api_response.text();
+                // Emit text token-by-token for the fallback path too.
+                on_token(&text);
+                session.handle_response_text(text.clone(), 0);
+                return ToolLoopOutcome::Text(text);
+            }
+        }
+    }
+}
+
+/// Build a one-line summary of a tool call for UI display.
+fn tool_call_summary(tc: &claudio_api::tools::ToolCall) -> String {
+    if let Some(path) = tc.input.get("path").and_then(|v| v.as_str()) {
+        format!("\"{}\"", path)
+    } else if let Some(cmd) = tc.input.get("command").and_then(|v| v.as_str()) {
+        format!("\"{}\"", cmd)
+    } else if let Some(src) = tc.input.get("source").and_then(|v| v.as_str()) {
+        let lines = src.lines().count();
+        format!("{} bytes, {} lines", src.len(), lines)
+    } else {
+        String::from("...")
+    }
+}
+
+/// Truncate a tool result for UI preview.
+fn tool_result_preview(content: &str) -> String {
+    if content.len() > 120 {
+        format!("{}...", &content[..120])
+    } else {
+        String::from(content)
+    }
+}
+
 /// Run the API-call + tool-execution loop for a session whose conversation
 /// already contains the latest user message.
 ///
@@ -594,9 +753,11 @@ fn send_via_claude_ai(
     let prompt = extract_last_user_message(body_str);
     log::info!("[claude.ai] sending: {}...", &prompt[..prompt.len().min(80)]);
 
+    let selected_model = crate::model_select::claude_ai_model_id();
     let claude_body = alloc::format!(
-        r#"{{"prompt":"{}","timezone":"America/New_York","attachments":[],"files":[],"model":"claude-sonnet-4-6","rendering_mode":"messages"}}"#,
-        prompt.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+        r#"{{"prompt":"{}","timezone":"America/New_York","attachments":[],"files":[],"model":"{}","rendering_mode":"messages"}}"#,
+        prompt.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"),
+        selected_model
     );
 
     let path = alloc::format!(
@@ -654,15 +815,135 @@ fn send_via_claude_ai(
 
     // Build a fake Messages API JSON response so parse_api_response works
     let escaped = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+    let resp_model = crate::model_select::claude_ai_model_id();
     let json_body = alloc::format!(
-        r#"{{"id":"msg_claude_ai","type":"message","role":"assistant","content":[{{"type":"text","text":"{}"}}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":0,"output_tokens":0}}}}"#,
-        escaped
+        r#"{{"id":"msg_claude_ai","type":"message","role":"assistant","content":[{{"type":"text","text":"{}"}}],"model":"{}","stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":0,"output_tokens":0}}}}"#,
+        escaped, resp_model
     );
     let mut fake_response = alloc::string::String::new();
     fake_response.push_str("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n");
     fake_response.push_str(&json_body);
 
     Ok(fake_response.into_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Streaming: send request and read SSE tokens incrementally
+// ---------------------------------------------------------------------------
+
+/// Send an API request via streaming SSE, calling `on_token` for each text
+/// chunk as it arrives.  Routes to either api.anthropic.com or claude.ai.
+pub fn send_streaming(
+    stack: &mut NetworkStack,
+    api_key: &str,
+    body: &[u8],
+    now: fn() -> claudio_net::Instant,
+    on_token: impl FnMut(&str),
+) -> Result<crate::streaming::StreamResult, String> {
+    if let Some(AuthMode::ClaudeAi { session_cookie, org_id, conv_id }) = auth_mode() {
+        return send_streaming_claude_ai(stack, session_cookie, org_id, conv_id, body, now, on_token);
+    }
+    send_streaming_api_key(stack, api_key, body, now, on_token)
+}
+
+/// Streaming via api.anthropic.com with API key.
+fn send_streaming_api_key(
+    stack: &mut NetworkStack,
+    api_key: &str,
+    body: &[u8],
+    now: fn() -> claudio_net::Instant,
+    on_token: impl FnMut(&str),
+) -> Result<crate::streaming::StreamResult, String> {
+    let http_req = claudio_net::http::HttpRequest::post(
+        "api.anthropic.com",
+        "/v1/messages",
+        body.to_vec(),
+    )
+    .header("Content-Type", "application/json")
+    .header("x-api-key", api_key)
+    .header("anthropic-version", "2023-06-01")
+    .header("Accept", "text/event-stream")
+    .header("Connection", "close");
+
+    let req_bytes = http_req.to_bytes();
+    log::debug!("[streaming] sending {} bytes to api.anthropic.com", req_bytes.len());
+
+    let seed = RNG_SEED.fetch_add(1, Ordering::Relaxed);
+
+    // DNS resolve.
+    let ip = claudio_net::dns::resolve(stack, "api.anthropic.com", || now())
+        .map_err(|e| alloc::format!("DNS failed: {:?}", e))?;
+
+    // TLS connect (returns a TlsStream we can read incrementally).
+    let mut tls = claudio_net::TlsStream::connect(stack, ip, 443, "api.anthropic.com", now, seed)
+        .map_err(|e| alloc::format!("TLS connect failed: {:?}", e))?;
+
+    // Send the HTTP request.
+    tls.send(stack, &req_bytes, now)
+        .map_err(|e| alloc::format!("TLS send failed: {:?}", e))?;
+
+    // Stream the response.
+    let result = crate::streaming::stream_sse_response(&mut tls, stack, now, on_token)?;
+
+    tls.close(stack);
+    Ok(result)
+}
+
+/// Streaming via claude.ai using session cookie.
+fn send_streaming_claude_ai(
+    stack: &mut NetworkStack,
+    session_cookie: &str,
+    org_id: &str,
+    conv_id: &str,
+    body: &[u8],
+    now: fn() -> claudio_net::Instant,
+    on_token: impl FnMut(&str),
+) -> Result<crate::streaming::StreamResult, String> {
+    let body_str = core::str::from_utf8(body).unwrap_or("{}");
+    let prompt = extract_last_user_message(body_str);
+    log::info!("[streaming] claude.ai: {}...", &prompt[..prompt.len().min(80)]);
+
+    let selected_model = crate::model_select::claude_ai_model_id();
+    let claude_body = alloc::format!(
+        r#"{{"prompt":"{}","timezone":"America/New_York","attachments":[],"files":[],"model":"{}","rendering_mode":"messages"}}"#,
+        prompt.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"),
+        selected_model
+    );
+
+    let path = alloc::format!(
+        "/api/organizations/{}/chat_conversations/{}/completion",
+        org_id, conv_id
+    );
+
+    let http_req = claudio_net::http::HttpRequest::post(
+        "claude.ai", &path, claude_body.into_bytes(),
+    )
+    .header("Content-Type", "application/json")
+    .header("Cookie", session_cookie)
+    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0")
+    .header("Accept", "text/event-stream")
+    .header("Origin", "https://claude.ai")
+    .header("Referer", "https://claude.ai/new")
+    .header("Connection", "close");
+
+    let req_bytes = http_req.to_bytes();
+    log::debug!("[streaming] sending {} bytes to claude.ai", req_bytes.len());
+
+    let seed = RNG_SEED.fetch_add(1, Ordering::Relaxed);
+
+    let ip = claudio_net::dns::resolve(stack, "claude.ai", || now())
+        .map_err(|e| alloc::format!("DNS failed: {:?}", e))?;
+
+    let mut tls = claudio_net::TlsStream::connect(stack, ip, 443, "claude.ai", now, seed)
+        .map_err(|e| alloc::format!("TLS connect failed: {:?}", e))?;
+
+    tls.send(stack, &req_bytes, now)
+        .map_err(|e| alloc::format!("TLS send failed: {:?}", e))?;
+
+    let result = crate::streaming::stream_sse_response(&mut tls, stack, now, on_token)?;
+
+    tls.close(stack);
+    Ok(result)
 }
 
 /// Extract the last user message text from a Messages API request JSON.
