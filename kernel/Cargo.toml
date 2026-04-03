@@ -43,3 +43,5 @@ claudio-vfs = { path = "../crates/vfs" }
 claudio-shell = { path = "../crates/shell" }
 claudio-usb-storage = { path = "../crates/usb-storage" }
 claudio-bluetooth = { path = "../crates/bluetooth" }
+claudio-elf-loader = { path = "../crates/elf-loader" }
+claudio-linux-compat = { path = "../crates/linux-compat" }

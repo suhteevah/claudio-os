@@ -1,0 +1,10 @@
+[package]
+name = "claudio-elf-loader"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "no_std ELF64 binary loader for ClaudioOS"
+
+[dependencies]
+log = { workspace = true }

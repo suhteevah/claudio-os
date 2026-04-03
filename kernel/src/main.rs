@@ -63,6 +63,7 @@ mod swap;
 mod git;
 mod agent_memory;
 mod vectordb;
+mod linux_compat;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;

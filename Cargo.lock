@@ -269,6 +269,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "claudio-elf-loader"
+version = "0.1.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "claudio-ext4"
 version = "0.1.0"
 dependencies = [
@@ -304,6 +311,15 @@ dependencies = [
 name = "claudio-intel-nic"
 version = "0.1.0"
 dependencies = [
+ "log",
+]
+
+[[package]]
+name = "claudio-linux-compat"
+version = "0.1.0"
+dependencies = [
+ "claudio-elf-loader",
+ "claudio-vfs",
  "log",
 ]
 
@@ -347,11 +363,13 @@ dependencies = [
  "claudio-auth",
  "claudio-bluetooth",
  "claudio-btrfs",
+ "claudio-elf-loader",
  "claudio-ext4",
  "claudio-fs",
  "claudio-gpu",
  "claudio-hda",
  "claudio-intel-nic",
+ "claudio-linux-compat",
  "claudio-net",
  "claudio-ntfs",
  "claudio-nvme",

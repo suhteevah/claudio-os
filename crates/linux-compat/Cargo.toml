@@ -1,0 +1,12 @@
+[package]
+name = "claudio-linux-compat"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Linux syscall compatibility layer for ClaudioOS"
+
+[dependencies]
+log = { workspace = true }
+claudio-vfs = { path = "../vfs" }
+claudio-elf-loader = { path = "../elf-loader" }
