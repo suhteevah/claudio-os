@@ -13,13 +13,11 @@ use alloc::vec::Vec;
 use ed25519_dalek::{SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey};
 use ed25519_dalek::{Signer as Ed25519Signer, Verifier as Ed25519Verifier};
 
-use ml_dsa::{MlDsa65, ExpandedSigningKey as MlDsaExpandedSigningKey, VerifyingKey as MlDsaVerifyingKey};
+use ml_dsa::{MlDsa65, VerifyingKey as MlDsaVerifyingKey};
 use ml_dsa::{EncodedSignature as MlDsaEncodedSignature, EncodedVerifyingKey as MlDsaEncodedVerifyingKey};
-use ml_dsa::signature::Signer as MlDsaSigner;
-use ml_dsa::signature::Verifier as MlDsaVerifier;
+use ml_dsa::signature::Signer as _;
+use ml_dsa::signature::Verifier as _;
 use ml_dsa::KeyGen;
-
-use crate::kex::FnRng;
 use crate::wire::SshWriter;
 
 // ---------------------------------------------------------------------------

@@ -746,7 +746,13 @@ impl XhciController {
             add_flags |= 1 << dci;
 
             // Allocate transfer ring for this endpoint
-            let tr = unsafe { TransferRing::new() };
+            let tr = match unsafe { TransferRing::new() } {
+                Some(r) => r,
+                None => {
+                    log::error!("xhci: failed to allocate transfer ring for DCI {}", dci);
+                    return false;
+                }
+            };
             let tr_phys = tr.phys_addr_with_dcs();
 
             // Build endpoint context
@@ -891,7 +897,13 @@ impl XhciController {
         }
 
         // Allocate report buffer for interrupt transfers
-        let (report_va, report_phys) = unsafe { alloc_dma_buffer(8) };
+        let (report_va, report_phys) = match unsafe { alloc_dma_buffer(8) } {
+            Some(b) => b,
+            None => {
+                log::error!("xhci: failed to allocate keyboard report buffer");
+                return;
+            }
+        };
 
         // Queue the first interrupt IN transfer
         if let Some(ring) = self.transfer_rings[slot_id as usize].get_mut(dci as usize) {

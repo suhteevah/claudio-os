@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Post-Quantum SSH from Scratch: ML-KEM + X25519 Hybrid Key Exchange on Bare Metal | ClaudioOS</title>
+  <meta name="description" content="Building a complete SSH implementation with hybrid post-quantum key exchange in no_std Rust. ML-KEM-768, X25519, ML-DSA-65 host keys, no OpenSSL.">
+  <meta property="og:title" content="Post-Quantum SSH from Scratch: ML-KEM + X25519 Hybrid Key Exchange on Bare Metal">
+  <meta property="og:description" content="We built SSH from scratch with post-quantum crypto on bare metal. ML-KEM-768 + X25519 hybrid KEX, ML-DSA-65 host keys, pure Rust no_std. 29 crates published.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://claudioos.vercel.app/blog/post-quantum-ssh-from-scratch.html">
+  <meta property="og:image" content="https://claudioos.vercel.app/og-image.png">
+  <meta property="article:author" content="Matt Gates">
+  <meta property="article:published_time" content="2026-04-03">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Post-Quantum SSH from Scratch on Bare Metal">
+  <meta name="twitter:description" content="Hybrid ML-KEM + X25519 key exchange, ML-DSA-65 signatures, pure no_std Rust. 29 crates published.">
+  <link rel="stylesheet" href="../style.css">
+  <style>
+    .blog-header {
+      padding: 56px 0 40px;
+      border-bottom: 1px solid var(--border);
+      background: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(0, 255, 65, 0.04), transparent);
+    }
+    .blog-header .back-link {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      margin-bottom: 24px;
+      display: block;
+    }
+    .blog-header h1 {
+      font-size: 2.2rem;
+      color: var(--accent);
+      margin-bottom: 16px;
+      letter-spacing: -1px;
+      line-height: 1.25;
+    }
+    .blog-meta {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+    }
+    .blog-meta strong { color: var(--text); }
+    .blog-body {
+      padding: 48px 0 64px;
+      max-width: 760px;
+      margin: 0 auto;
+    }
+    .blog-body h2 {
+      font-size: 1.4rem;
+      color: var(--accent);
+      margin-top: 48px;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .blog-body h3 {
+      font-size: 1.1rem;
+      color: var(--text);
+      margin-top: 32px;
+      margin-bottom: 12px;
+    }
+    .blog-body p {
+      font-size: 0.9rem;
+      color: var(--text-dim);
+      margin-bottom: 16px;
+      line-height: 1.8;
+    }
+    .blog-body p strong { color: var(--text); }
+    .blog-body p em { color: var(--text); font-style: italic; }
+    .blog-body ul, .blog-body ol {
+      margin-bottom: 16px;
+      padding-left: 24px;
+    }
+    .blog-body li {
+      font-size: 0.9rem;
+      color: var(--text-dim);
+      margin-bottom: 6px;
+      line-height: 1.7;
+    }
+    .blog-body li strong { color: var(--text); }
+    .blog-body blockquote {
+      border-left: 3px solid var(--accent);
+      background: var(--bg-surface);
+      padding: 16px 24px;
+      margin: 24px 0;
+      border-radius: 0 6px 6px 0;
+    }
+    .blog-body blockquote p {
+      color: var(--text);
+      margin-bottom: 0;
+      font-style: italic;
+    }
+    .blog-body pre {
+      margin: 20px 0;
+    }
+    .blog-body .highlight-box {
+      background: var(--bg-surface);
+      border: 1px solid var(--accent-dim);
+      border-radius: 6px;
+      padding: 20px 24px;
+      margin: 24px 0;
+    }
+    .blog-body .highlight-box p { margin-bottom: 0; }
+    .proto-diagram {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 24px;
+      margin: 24px 0;
+      overflow-x: auto;
+    }
+    .proto-diagram pre {
+      color: var(--accent);
+      font-size: 0.72rem;
+      line-height: 1.4;
+      margin: 0;
+      border: none;
+      background: none;
+      padding: 0;
+    }
+    .crate-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 8px;
+      margin: 20px 0;
+    }
+    .crate-item {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px 14px;
+      font-size: 0.78rem;
+    }
+    .crate-item .name {
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .crate-item .desc {
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
+    .kw { color: var(--magenta); }
+    .fn { color: var(--cyan); }
+    .str { color: var(--yellow); }
+    .cmt { color: var(--text-dim); }
+    .mac { color: var(--orange); }
+    .num { color: var(--blue); }
+    .typ { color: var(--cyan); }
+  </style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-inner">
+    <a href="https://claudioos.vercel.app" class="nav-logo" style="text-decoration:none;">ClaudioOS</a>
+    <div class="nav-links">
+      <a href="https://claudioos.vercel.app">Home</a>
+      <a href="/blog" class="active">Blog</a>
+      <a href="https://claudioos.vercel.app/docs.html">Docs</a>
+      <a href="https://github.com/suhteevah/baremetal-claude" class="nav-github">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="blog-header">
+  <div class="container" style="max-width:760px;">
+    <a href="/blog" class="back-link">&larr; Back to Blog</a>
+    <h1>Post-Quantum SSH from Scratch: ML-KEM + X25519 Hybrid Key Exchange on Bare Metal</h1>
+    <div class="blog-meta">
+      <strong>Matt Gates</strong> &middot; April 3, 2026 &middot; 14 min read
+    </div>
+  </div>
+</header>
+
+<article class="blog-body container">
+
+  <p>
+    Quantum computers aren't here yet. But the data you encrypt today can be captured and decrypted
+    later -- the "harvest now, decrypt later" attack. NIST finalized ML-KEM (formerly CRYSTALS-Kyber)
+    and ML-DSA (formerly CRYSTALS-Dilithium) as post-quantum standards in 2024. OpenSSH 9.x added
+    support. The industry is moving.
+  </p>
+  <p>
+    ClaudioOS needed SSH for remote access to agent sessions. We could have ported OpenSSH and its
+    dependency tree (OpenSSL, zlib, PAM...) to bare metal. Instead, we wrote the entire SSH protocol
+    stack from scratch in <code>no_std</code> Rust, with <strong>hybrid post-quantum key exchange</strong>
+    as a first-class feature. Then we published 29 of the crates we built along the way.
+  </p>
+
+  <h2>Why Post-Quantum Matters Now</h2>
+
+  <p>
+    The threat model is straightforward:
+  </p>
+  <ol>
+    <li><strong>Today:</strong> An adversary records your encrypted SSH traffic. It's gibberish to them.</li>
+    <li><strong>2030-2035:</strong> A cryptographically relevant quantum computer comes online.</li>
+    <li><strong>Then:</strong> They decrypt everything they captured. Session keys, commands, file transfers, credentials.</li>
+  </ol>
+  <p>
+    If your SSH sessions contain anything that's still sensitive in 10 years -- infrastructure access,
+    signing keys, proprietary source code -- you need post-quantum protection <em>now</em>, not when
+    quantum computers arrive.
+  </p>
+  <p>
+    The hybrid approach is the conservative play: combine a post-quantum algorithm (ML-KEM-768) with
+    a classical algorithm (X25519). If the post-quantum math turns out to be broken, you still have
+    X25519. If quantum computers arrive, you still have ML-KEM. Belt and suspenders.
+  </p>
+
+  <h2>The SSH Protocol Stack</h2>
+
+  <p>
+    SSH is four protocols stacked on top of each other:
+  </p>
+
+  <div class="proto-diagram">
+<pre>
+  +--------------------------------------------------+
+  |              Channel Layer (SSH-CONNECT)           |
+  |   Shell sessions, port forwarding, SCP/SFTP       |
+  +--------------------------------------------------+
+  |            Authentication Layer (SSH-USERAUTH)     |
+  |   Public key, password, keyboard-interactive       |
+  +--------------------------------------------------+
+  |            Transport Layer (SSH-TRANS)              |
+  |   Key exchange, encryption, MAC, compression       |
+  +--------------------------------------------------+
+  |                 TCP Connection                     |
+  +--------------------------------------------------+
+</pre>
+  </div>
+
+  <p>
+    We implemented all four layers. The transport layer is where the crypto lives -- key exchange,
+    symmetric encryption, message authentication. The auth layer validates who you are. The channel
+    layer multiplexes interactive sessions over a single encrypted connection.
+  </p>
+
+  <h2>Hybrid Key Exchange: ML-KEM-768 + X25519</h2>
+
+  <p>
+    The key exchange is the most critical part. It's where client and server agree on a shared
+    secret without ever transmitting it. Our hybrid scheme works like this:
+  </p>
+
+  <h3>Step 1: Key Exchange Init</h3>
+  <p>
+    The client sends <code>SSH_MSG_KEXINIT</code> proposing the algorithm
+    <code>mlkem768x25519-sha256</code>. This tells the server we want hybrid post-quantum KEX.
+  </p>
+
+  <h3>Step 2: Dual Key Generation</h3>
+  <p>
+    Both sides generate two key pairs simultaneously:
+  </p>
+  <ul>
+    <li><strong>X25519:</strong> 32-byte ephemeral private key, 32-byte public key. Classical Diffie-Hellman on Curve25519.</li>
+    <li><strong>ML-KEM-768:</strong> Lattice-based key encapsulation. Public key is 1,184 bytes. The security comes from the hardness of the Module Learning with Errors (MLWE) problem -- believed to be quantum-resistant.</li>
+  </ul>
+
+<pre><span class="cmt">// Generating both key pairs for hybrid KEX</span>
+<span class="kw">let</span> x25519_secret = <span class="typ">EphemeralSecret</span>::<span class="fn">random</span>(&amp;<span class="kw">mut</span> rng);
+<span class="kw">let</span> x25519_public = <span class="typ">PublicKey</span>::<span class="fn">from</span>(&amp;x25519_secret);
+
+<span class="kw">let</span> (mlkem_dk, mlkem_ek) = <span class="fn">ml_kem_768_keygen</span>(&amp;<span class="kw">mut</span> rng);
+
+<span class="cmt">// Client sends both public keys concatenated</span>
+<span class="kw">let mut</span> client_ephemeral = <span class="typ">Vec</span>::<span class="fn">new</span>();
+client_ephemeral.<span class="fn">extend_from_slice</span>(x25519_public.<span class="fn">as_bytes</span>());    <span class="cmt">// 32 bytes</span>
+client_ephemeral.<span class="fn">extend_from_slice</span>(mlkem_ek.<span class="fn">as_bytes</span>());        <span class="cmt">// 1,184 bytes</span></pre>
+
+  <h3>Step 3: Server Encapsulates</h3>
+  <p>
+    The server performs X25519 Diffie-Hellman with the client's classical public key, and
+    ML-KEM encapsulation with the client's post-quantum public key. This produces two
+    independent shared secrets:
+  </p>
+
+<pre><span class="cmt">// Server side: derive both shared secrets</span>
+<span class="kw">let</span> x25519_shared = server_x25519_secret
+    .<span class="fn">diffie_hellman</span>(&amp;client_x25519_public);         <span class="cmt">// 32 bytes</span>
+
+<span class="kw">let</span> (mlkem_ciphertext, mlkem_shared) =
+    <span class="fn">ml_kem_768_encapsulate</span>(&amp;client_mlkem_ek, &amp;<span class="kw">mut</span> rng); <span class="cmt">// 32 bytes</span>
+
+<span class="cmt">// Combine: hash both secrets together</span>
+<span class="kw">let</span> combined = <span class="typ">Sha256</span>::<span class="fn">new</span>()
+    .<span class="fn">chain_update</span>(x25519_shared.<span class="fn">as_bytes</span>())
+    .<span class="fn">chain_update</span>(mlkem_shared.<span class="fn">as_bytes</span>())
+    .<span class="fn">finalize</span>();</pre>
+
+  <h3>Step 4: Key Derivation</h3>
+  <p>
+    The combined secret feeds into SSH's standard key derivation function (RFC 4253, Section 7.2)
+    to produce encryption keys, IV, and MAC keys for both directions. From this point forward,
+    the session is encrypted with AES-256-GCM using keys that are quantum-resistant.
+  </p>
+
+  <div class="highlight-box">
+    <p>
+      <strong>The key property:</strong> An attacker needs to break <em>both</em> X25519 and ML-KEM-768
+      to recover the session keys. A quantum computer breaks X25519 but not ML-KEM. A breakthrough
+      in lattice cryptanalysis breaks ML-KEM but not X25519. Neither alone is sufficient.
+    </p>
+  </div>
+
+  <h2>ML-DSA-65 Host Keys: Dual Signatures</h2>
+
+  <p>
+    Host keys prove the server is who it claims to be. Traditional SSH uses Ed25519 or RSA.
+    We support those for compatibility, but our primary host key type is <strong>ML-DSA-65</strong>
+    (formerly Dilithium3) -- a lattice-based digital signature scheme.
+  </p>
+  <p>
+    ML-DSA-65 signatures are larger than Ed25519 (3,293 bytes vs. 64 bytes), but the security
+    margin against quantum attacks justifies the overhead for an SSH connection where bandwidth
+    is not the bottleneck.
+  </p>
+  <p>
+    For maximum compatibility, we offer dual host key signatures during key exchange: the server
+    signs the exchange hash with both an Ed25519 key and an ML-DSA-65 key. Clients that understand
+    post-quantum verify both. Legacy clients fall back to Ed25519 only.
+  </p>
+
+<pre><span class="cmt">// Dual host key signature during key exchange</span>
+<span class="kw">let</span> exchange_hash = <span class="fn">compute_exchange_hash</span>(
+    &amp;client_version, &amp;server_version,
+    &amp;client_kexinit, &amp;server_kexinit,
+    &amp;host_key_blob,
+    &amp;client_ephemeral, &amp;server_ephemeral,
+    &amp;shared_secret,
+);
+
+<span class="cmt">// Sign with Ed25519 (classical)</span>
+<span class="kw">let</span> ed25519_sig = ed25519_host_key.<span class="fn">sign</span>(&amp;exchange_hash);
+
+<span class="cmt">// Sign with ML-DSA-65 (post-quantum)</span>
+<span class="kw">let</span> mldsa_sig = mldsa65_host_key.<span class="fn">sign</span>(&amp;exchange_hash);
+
+<span class="cmt">// Both signatures sent in the host key proof</span>
+<span class="kw">let</span> signature_blob = <span class="fn">encode_dual_signature</span>(
+    &amp;ed25519_sig,  <span class="cmt">// 64 bytes</span>
+    &amp;mldsa_sig,    <span class="cmt">// 3,293 bytes</span>
+);</pre>
+
+  <h2>Building It Without OpenSSL</h2>
+
+  <p>
+    The hardest constraint wasn't the algorithms -- it was the environment. ClaudioOS is
+    <code>#![no_std]</code>. No file system for certificate stores. No OS random number generator.
+    No dynamic linking for <code>libcrypto</code>. Everything had to be pure Rust, compiled for
+    <code>x86_64-unknown-none</code>.
+  </p>
+
+  <h3>The Crypto Stack</h3>
+  <ul>
+    <li><strong>RNG:</strong> RDRAND/RDSEED hardware instructions, fed into a ChaCha20-based CSPRNG for uniform distribution</li>
+    <li><strong>X25519:</strong> <code>x25519-dalek</code> with <code>no_std</code> feature</li>
+    <li><strong>Ed25519:</strong> <code>ed25519-dalek</code> with <code>no_std</code> feature</li>
+    <li><strong>ML-KEM-768:</strong> Our own implementation following FIPS 203, verified against NIST test vectors</li>
+    <li><strong>ML-DSA-65:</strong> Our own implementation following FIPS 204, verified against NIST test vectors</li>
+    <li><strong>AES-256-GCM:</strong> Hardware-accelerated via AES-NI + CLMUL instructions</li>
+    <li><strong>SHA-256/SHA-512:</strong> <code>sha2</code> crate with <code>no_std</code></li>
+    <li><strong>ChaCha20-Poly1305:</strong> <code>chacha20poly1305</code> crate as alternative cipher</li>
+  </ul>
+
+  <h3>The Protocol Implementation</h3>
+  <ul>
+    <li><strong>Packet framing:</strong> SSH binary packet protocol with sequence numbers, padding, MAC</li>
+    <li><strong>Rekeying:</strong> Automatic rekey after 1 GB of data or 1 hour, whichever comes first</li>
+    <li><strong>Channel multiplexing:</strong> Multiple shell sessions, port forwards over one connection</li>
+    <li><strong>Terminal emulation:</strong> PTY allocation maps to our split-pane terminal</li>
+    <li><strong>SFTP subsystem:</strong> File transfer to/from the FAT32 partition</li>
+  </ul>
+
+  <h2>The 29 Crates We Published</h2>
+
+  <p>
+    Building SSH from scratch on bare metal forced us to create a lot of infrastructure. Rather
+    than keep it all internal, we published 29 crates that other <code>no_std</code> projects
+    can use:
+  </p>
+
+  <div class="crate-list">
+    <div class="crate-item">
+      <div class="name">claudio-ssh-transport</div>
+      <div class="desc">SSH transport layer, no_std</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-ssh-auth</div>
+      <div class="desc">SSH authentication, pubkey + password</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-ssh-channel</div>
+      <div class="desc">SSH channel multiplexing</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-mlkem</div>
+      <div class="desc">ML-KEM-512/768/1024 (FIPS 203)</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-mldsa</div>
+      <div class="desc">ML-DSA-44/65/87 (FIPS 204)</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-hybrid-kex</div>
+      <div class="desc">ML-KEM + X25519 hybrid KEX</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-ssh-sftp</div>
+      <div class="desc">SFTP subsystem, no_std</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-packet</div>
+      <div class="desc">SSH binary packet framing</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-kdf</div>
+      <div class="desc">SSH key derivation (RFC 4253)</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-hostkey</div>
+      <div class="desc">Host key management + storage</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-rng-hw</div>
+      <div class="desc">RDRAND/RDSEED hardware RNG</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-aes-gcm-hw</div>
+      <div class="desc">AES-GCM via AES-NI + CLMUL</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-ntt</div>
+      <div class="desc">Number Theoretic Transform for lattice crypto</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-poly</div>
+      <div class="desc">Polynomial arithmetic for ML-KEM/ML-DSA</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-compress</div>
+      <div class="desc">Lattice compression/decompression</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-sampling</div>
+      <div class="desc">CBD and rejection sampling</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">cranelift-codegen-nostd</div>
+      <div class="desc">Cranelift codegen for no_std</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">cranelift-frontend-nostd</div>
+      <div class="desc">Cranelift frontend for no_std</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">cranelift-control-nostd</div>
+      <div class="desc">Cranelift control for no_std</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">cranelift-codegen-shared-nostd</div>
+      <div class="desc">Cranelift shared types, no_std</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">rustc-hash-nostd</div>
+      <div class="desc">Fast hash for no_std</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">arbitrary-stub</div>
+      <div class="desc">Arbitrary trait stub for no_std</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-virtio-net</div>
+      <div class="desc">VirtIO-net driver</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-terminal</div>
+      <div class="desc">Framebuffer terminal + split panes</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">wraith-dom</div>
+      <div class="desc">no_std HTML parser + CSS selectors</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">wraith-transport</div>
+      <div class="desc">HTTP/HTTPS over smoltcp</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">wraith-render</div>
+      <div class="desc">HTML to text-mode renderer</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-python-lite</div>
+      <div class="desc">Minimal Python interpreter, no_std</div>
+    </div>
+    <div class="crate-item">
+      <div class="name">claudio-editor</div>
+      <div class="desc">Nano-like text editor, no_std</div>
+    </div>
+  </div>
+
+  <h2>Lessons from the Trenches</h2>
+
+  <p>
+    <strong>Post-quantum key sizes are manageable.</strong> ML-KEM-768 public keys are 1,184 bytes.
+    ML-DSA-65 signatures are 3,293 bytes. On an SSH connection that transfers megabytes of data,
+    an extra few KB during handshake is invisible. The "post-quantum keys are too big" narrative
+    applies to constrained IoT devices, not to x86_64 machines with gigabit networking.
+  </p>
+  <p>
+    <strong>Lattice crypto is fast.</strong> ML-KEM-768 encapsulation takes about 50 microseconds
+    on our i9-11900K. That's faster than RSA-2048 key generation. The Number Theoretic Transform
+    (NTT) at the heart of these algorithms is essentially an FFT over a finite field -- it
+    parallelizes beautifully and has great cache behavior.
+  </p>
+  <p>
+    <strong>The <code>no_std</code> Rust crypto ecosystem is ready.</strong> Between
+    <code>x25519-dalek</code>, <code>ed25519-dalek</code>, <code>sha2</code>,
+    <code>chacha20poly1305</code>, and <code>aes-gcm</code>, the classical side is well-covered.
+    The post-quantum side required our own implementations, but FIPS 203 and 204 are clear
+    specifications with excellent test vectors. If you can implement AES, you can implement ML-KEM.
+  </p>
+  <p>
+    <strong>SSH is more protocol than crypto.</strong> The hardest part wasn't the key exchange --
+    it was the channel multiplexing state machine, the window size management, the terminal
+    mode encoding, and the dozen edge cases in the SFTP subsystem. The crypto was the easy
+    part. Getting the <code>SSH_MSG_CHANNEL_WINDOW_ADJUST</code> flow control right was the hard part.
+  </p>
+
+  <div class="highlight-box">
+    <p>
+      <strong>Our recommendation:</strong> If you're building anything that handles SSH connections,
+      add hybrid post-quantum key exchange now. The standards are finalized. The performance overhead
+      is negligible. And the protection against future quantum threats is real. Don't wait for the
+      quantum computer to ship before you start protecting against it.
+    </p>
+  </div>
+
+  <h2>What's Next</h2>
+
+  <p>
+    We're working on SLH-DSA (SPHINCS+) as a hash-based signature alternative for environments
+    that want to avoid lattice assumptions entirely. We're also implementing SSH agent forwarding
+    so that ClaudioOS can chain SSH connections for multi-hop access to cloud infrastructure.
+  </p>
+  <p>
+    All 29 crates are open source. If you're building <code>no_std</code> Rust systems that need
+    post-quantum crypto or SSH, they're yours to use.
+  </p>
+
+  <p style="margin-top:48px; padding-top:24px; border-top:1px solid var(--border); font-size:0.82rem; color:var(--text-dim);">
+    <strong style="color:var(--text);">Matt Gates</strong> builds ClaudioOS at Ridge Cell Repair LLC.
+    He believes the best time to adopt post-quantum crypto was yesterday; the second best time is now.
+    <br><br>
+    <a href="/blog">&larr; Back to Blog</a> &middot; <a href="https://claudioos.vercel.app">ClaudioOS Home</a> &middot; <a href="https://github.com/suhteevah/baremetal-claude">GitHub</a>
+  </p>
+
+</article>
+
+<footer>
+  <div class="footer-inner container">
+    <p><a href="https://claudioos.vercel.app">ClaudioOS</a> &mdash; Bare metal AI agent OS</p>
+    <p class="footer-sub">Built with Rust, Claude, and zero lines of C.</p>
+  </div>
+</footer>
+
+</body>
+</html>

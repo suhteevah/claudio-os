@@ -492,25 +492,13 @@ fn create_listen_socket(stack: &mut NetworkStack, port: u16) -> SocketHandle {
     stack.sockets.add(socket)
 }
 
-/// RNG fill function using PIT tick counter + simple mixing.
+/// Cryptographically secure RNG fill function for SSH key generation
+/// and session key material.
 ///
-/// This is NOT cryptographically secure -- it uses the PIT timer ticks
-/// mixed with a counter for entropy. For production, integrate with
-/// RDRAND or a proper CSPRNG seeded from hardware entropy.
+/// Delegates to the kernel's CSPRNG module which uses RDRAND (if available)
+/// or a ChaCha20-based PRNG seeded from hardware entropy (TSC + PIT + RTC).
 fn rng_fill(buf: &mut [u8]) {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let ticks = crate::interrupts::tick_count();
-    let mut state = ticks ^ COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    for byte in buf.iter_mut() {
-        // xorshift64
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        *byte = state as u8;
-    }
+    crate::csprng::random_bytes(buf);
 }
 
 // ---------------------------------------------------------------------------

@@ -900,6 +900,7 @@ fn btrfs_err_to_vfs(e: claudio_btrfs::BtrfsError) -> FsError {
         claudio_btrfs::BtrfsError::InvalidPath | claudio_btrfs::BtrfsError::NameTooLong => FsError::NotFound,
         claudio_btrfs::BtrfsError::UnsupportedFeature(_) | claudio_btrfs::BtrfsError::CompressedExtent => FsError::Unsupported,
         claudio_btrfs::BtrfsError::UnmappedLogical(_) => FsError::IoError,
+        claudio_btrfs::BtrfsError::DecompressError(_) => FsError::IoError,
     }
 }
 

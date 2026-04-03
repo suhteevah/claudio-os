@@ -817,11 +817,11 @@ async fn main_async() {
                                                     log::info!("[oauth] ============================================");
 
                                                     // Extract session cookie (sessionKey or __ssid)
-                                                    log::info!("[oauth] cookies: {}", &session_cookies[..session_cookies.len().min(500)]);
+                                                    log::info!("[oauth] cookies received ({} bytes) [REDACTED]", session_cookies.len());
                                                     for part in session_cookies.split("; ") {
                                                         if part.starts_with("sessionKey=") || part.starts_with("__ssid=") {
                                                             session_cookie_buf = alloc::string::String::from(part);
-                                                            log::info!("[oauth] session cookie acquired: {}...", &part[..part.len().min(50)]);
+                                                            log::info!("[oauth] session cookie acquired ({} bytes) [REDACTED]", part.len());
                                                             break;
                                                         }
                                                     }
@@ -832,7 +832,12 @@ async fn main_async() {
                                                     }
 
                                                     // Print save marker for host script to capture
+                                                    // NOTE: This line intentionally prints the full cookie for the host
+                                                    // save-session script to capture via serial. It is the ONLY place
+                                                    // where the full cookie is emitted.
                                                     log::info!("[oauth] SAVE_SESSION:{}", session_cookie_buf);
+                                                    // Immediately log a redacted confirmation
+                                                    log::info!("[oauth] session persisted ({} bytes)", session_cookie_buf.len());
 
                                                     // Extract org UUID from response
                                                     if let Some(s) = vbody.find("\"uuid\":\"") {
@@ -911,7 +916,7 @@ async fn main_async() {
                                                         let rest = &body[s + needle.len()..];
                                                         if let Some(e) = rest.find('"') {
                                                             api_key_buf = alloc::string::String::from(&rest[..e]);
-                                                            log::info!("[auth] token: {}...{} ({} chars)", &api_key_buf[..6], &api_key_buf[api_key_buf.len()-4..], api_key_buf.len());
+                                                            log::info!("[auth] API key acquired ({} chars) [REDACTED]", api_key_buf.len());
                                                             break;
                                                         }
                                                     }

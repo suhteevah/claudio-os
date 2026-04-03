@@ -21,8 +21,8 @@ use alloc::vec::Vec;
 use sha2::{Sha256, Digest};
 
 use ml_kem::{KemCore, MlKem768, EncodedSizeUser as MlKemEncodedSizeUser};
-use ml_kem::kem::{Decapsulate, Encapsulate};
-use x25519_dalek::{EphemeralSecret as X25519Secret, PublicKey as X25519PublicKey};
+use ml_kem::kem::Decapsulate;
+use x25519_dalek::PublicKey as X25519PublicKey;
 
 use crate::transport::{KexInit, TransportError};
 use crate::wire::*;
@@ -452,10 +452,18 @@ impl HybridKexServerState {
         );
 
         // Decapsulate ML-KEM-768 using real ml-kem crate
-        let dk = <MlKem768 as KemCore>::DecapsulationKey::from_bytes(
-            ml_kem::Encoded::<<MlKem768 as KemCore>::DecapsulationKey>::from_slice(&self.mlkem_dk_bytes),
-        );
-        let ct = ml_kem::Ciphertext::<MlKem768>::from_slice(mlkem_ct);
+        let dk_encoded: &ml_kem::Encoded::<<MlKem768 as KemCore>::DecapsulationKey> =
+            self.mlkem_dk_bytes.as_slice().try_into()
+                .map_err(|_| {
+                    log::error!("kex: ML-KEM-768 decapsulation key wrong size");
+                    KexError::MlKemDecapsulationFailed
+                })?;
+        let dk = <MlKem768 as KemCore>::DecapsulationKey::from_bytes(dk_encoded);
+        let ct: &ml_kem::Ciphertext::<MlKem768> = mlkem_ct.try_into()
+            .map_err(|_| {
+                log::error!("kex: ML-KEM-768 ciphertext wrong size");
+                KexError::MlKemDecapsulationFailed
+            })?;
         let mlkem_shared = dk.decapsulate(ct)
             .map_err(|_| {
                 log::error!("kex: ML-KEM-768 decapsulation failed");

@@ -184,7 +184,7 @@ impl VirtQueue {
     /// mapped at a different virtual range (0x4444_4444_0000).
     ///
     /// We use the x86_64 page table registers to do the translation.
-    fn virt_to_phys(&self, virt: usize) -> u64 {
+    fn virt_to_phys(&self, virt: usize) -> Option<u64> {
         // For addresses in the physical memory mapping region
         // (phys_mem_offset .. phys_mem_offset + phys_mem_size),
         // the formula is: phys = virt - phys_mem_offset.
@@ -205,7 +205,8 @@ impl VirtQueue {
         let l4_idx = virt_addr.p4_index();
         let l4_entry = &l4_table[l4_idx];
         if l4_entry.is_unused() {
-            panic!("[virtio-net] virt_to_phys: L4 entry unused for {:#x}", virt);
+            log::error!("[virtio-net] virt_to_phys: L4 entry unused for {:#x}", virt);
+            return None;
         }
         let l3_phys = l4_entry.addr();
         let l3_virt = phys_mem_offset + l3_phys.as_u64();
@@ -215,13 +216,14 @@ impl VirtQueue {
         let l3_idx = virt_addr.p3_index();
         let l3_entry = &l3_table[l3_idx];
         if l3_entry.is_unused() {
-            panic!("[virtio-net] virt_to_phys: L3 entry unused for {:#x}", virt);
+            log::error!("[virtio-net] virt_to_phys: L3 entry unused for {:#x}", virt);
+            return None;
         }
         // Check for 1GiB huge page
         if l3_entry.flags().contains(x86_64::structures::paging::PageTableFlags::HUGE_PAGE) {
             let base = l3_entry.addr().as_u64();
             let offset = virt as u64 & 0x3FFF_FFFF; // 30-bit offset within 1GiB page
-            return base + offset;
+            return Some(base + offset);
         }
 
         let l2_phys = l3_entry.addr();
@@ -232,13 +234,14 @@ impl VirtQueue {
         let l2_idx = virt_addr.p2_index();
         let l2_entry = &l2_table[l2_idx];
         if l2_entry.is_unused() {
-            panic!("[virtio-net] virt_to_phys: L2 entry unused for {:#x}", virt);
+            log::error!("[virtio-net] virt_to_phys: L2 entry unused for {:#x}", virt);
+            return None;
         }
         // Check for 2MiB huge page
         if l2_entry.flags().contains(x86_64::structures::paging::PageTableFlags::HUGE_PAGE) {
             let base = l2_entry.addr().as_u64();
             let offset = virt as u64 & 0x1F_FFFF; // 21-bit offset within 2MiB page
-            return base + offset;
+            return Some(base + offset);
         }
 
         let l1_phys = l2_entry.addr();
@@ -249,16 +252,21 @@ impl VirtQueue {
         let l1_idx = virt_addr.p1_index();
         let l1_entry = &l1_table[l1_idx];
         if l1_entry.is_unused() {
-            panic!("[virtio-net] virt_to_phys: L1 entry unused for {:#x}", virt);
+            log::error!("[virtio-net] virt_to_phys: L1 entry unused for {:#x}", virt);
+            return None;
         }
         let frame_phys = l1_entry.addr().as_u64();
         let page_offset = virt as u64 & 0xFFF; // 12-bit offset within 4KiB page
-        frame_phys + page_offset
+        Some(frame_phys + page_offset)
     }
 
     /// Physical address of the descriptor table.
     fn descs_phys(&self) -> u64 {
         self.virt_to_phys(self.descs as usize)
+            .unwrap_or_else(|| {
+                log::error!("[virtio-net] descs_phys: failed to translate descriptor table address");
+                0
+            })
     }
 
     /// The legacy VirtIO address register receives the queue's physical page
@@ -332,7 +340,7 @@ impl VirtQueue {
 ///   - Available ring:   6 + 2 * queue_size bytes (2-byte aligned)
 ///   - Padding to next page boundary
 ///   - Used ring:        6 + 8 * queue_size bytes (4-byte aligned)
-fn alloc_legacy_virtqueue(queue_size: u16, phys_mem_offset: u64) -> VirtQueue {
+fn alloc_legacy_virtqueue(queue_size: u16, phys_mem_offset: u64) -> Option<VirtQueue> {
     let qs = queue_size as usize;
 
     let desc_size = 16 * qs;
@@ -344,10 +352,18 @@ fn alloc_legacy_virtqueue(queue_size: u16, phys_mem_offset: u64) -> VirtQueue {
     let total_size = used_offset + used_size;
 
     // Allocate page-aligned memory
-    let layout = alloc::alloc::Layout::from_size_align(total_size, 4096)
-        .expect("invalid virtqueue layout");
+    let layout = match alloc::alloc::Layout::from_size_align(total_size, 4096) {
+        Ok(l) => l,
+        Err(_) => {
+            log::error!("[virtio-net] invalid virtqueue layout (size={}, align=4096)", total_size);
+            return None;
+        }
+    };
     let base = unsafe { alloc::alloc::alloc_zeroed(layout) };
-    assert!(!base.is_null(), "failed to allocate virtqueue memory");
+    if base.is_null() {
+        log::error!("[virtio-net] failed to allocate virtqueue memory ({} bytes)", total_size);
+        return None;
+    }
 
     let descs = base as *mut VirtqDesc;
     let avail = unsafe { base.add(desc_size) } as *mut VirtqAvail;
@@ -375,7 +391,7 @@ fn alloc_legacy_virtqueue(queue_size: u16, phys_mem_offset: u64) -> VirtQueue {
         buffers.push(Box::new([0u8; BUF_SIZE]));
     }
 
-    VirtQueue {
+    Some(VirtQueue {
         base,
         descs,
         avail,
@@ -386,7 +402,7 @@ fn alloc_legacy_virtqueue(queue_size: u16, phys_mem_offset: u64) -> VirtQueue {
         last_used_idx: 0,
         buffers,
         phys_mem_offset,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -614,7 +630,14 @@ impl VirtioNet {
 
             // Point the descriptor at the buffer's physical address.
             let buf_ptr = rx_queue.buffers[idx as usize].as_ptr() as usize;
-            let buf_phys = rx_queue.virt_to_phys(buf_ptr);
+            let buf_phys = match rx_queue.virt_to_phys(buf_ptr) {
+                Some(p) => p,
+                None => {
+                    log::error!("[virtio-net] populate_rx: failed to translate buffer {}", idx);
+                    rx_queue.free_desc(idx);
+                    continue;
+                }
+            };
 
             unsafe {
                 let desc = &mut *rx_queue.descs.add(idx as usize);
@@ -690,7 +713,14 @@ impl NicDriver for VirtioNet {
 
         // Set up the descriptor with the physical address.
         let buf_ptr = buf.as_ptr() as usize;
-        let buf_phys = self.tx_queue.virt_to_phys(buf_ptr);
+        let buf_phys = match self.tx_queue.virt_to_phys(buf_ptr) {
+            Some(p) => p,
+            None => {
+                log::error!("[virtio-net] send: failed to translate TX buffer address");
+                self.tx_queue.free_desc(desc_idx);
+                return Err(NicError::DeviceError);
+            }
+        };
         unsafe {
             let desc = &mut *self.tx_queue.descs.add(desc_idx as usize);
             desc.addr = buf_phys;
@@ -761,7 +791,13 @@ impl VirtioNet {
     /// Recycle a received descriptor back into the RX available ring.
     fn recycle_rx_desc(&mut self, desc_idx: u16) {
         let buf_ptr = self.rx_queue.buffers[desc_idx as usize].as_ptr() as usize;
-        let buf_phys = self.rx_queue.virt_to_phys(buf_ptr);
+        let buf_phys = match self.rx_queue.virt_to_phys(buf_ptr) {
+            Some(p) => p,
+            None => {
+                log::error!("[virtio-net] recycle_rx: failed to translate buffer {} address", desc_idx);
+                return;
+            }
+        };
 
         unsafe {
             let desc = &mut *self.rx_queue.descs.add(desc_idx as usize);

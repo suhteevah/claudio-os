@@ -49,9 +49,16 @@ const MAX_TOOL_ROUNDS: usize = 20;
 /// capture the network stack. We store a pointer here during init.
 ///
 /// SAFETY: Set once during single-threaded boot, read during tool execution.
-/// The network stack outlives all agent sessions.
-static mut BUILD_STACK: Option<*mut NetworkStack> = None;
-static mut BUILD_NOW_FN: Option<fn() -> claudio_net::Instant> = None;
+/// The network stack outlives all agent sessions. Using spin::Once ensures
+/// safe one-time initialization without `static mut`.
+static BUILD_STACK: spin::Once<*mut NetworkStack> = spin::Once::new();
+// SAFETY: The raw pointer is only dereferenced in the single-threaded executor
+// context. We need Send+Sync for the static.
+struct SendNetPtr(*mut NetworkStack);
+unsafe impl Send for SendNetPtr {}
+unsafe impl Sync for SendNetPtr {}
+
+static BUILD_NOW_FN: spin::Once<fn() -> claudio_net::Instant> = spin::Once::new();
 
 /// Initialize the compile_rust tool handler.
 ///
@@ -66,8 +73,8 @@ pub unsafe fn init_compile_handler(
     stack: *mut NetworkStack,
     now: fn() -> claudio_net::Instant,
 ) {
-    BUILD_STACK = Some(stack);
-    BUILD_NOW_FN = Some(now);
+    BUILD_STACK.call_once(|| stack);
+    BUILD_NOW_FN.call_once(|| now);
     claudio_api::tools::set_compile_handler(compile_handler);
     log::info!("[agent_loop] compile_rust handler registered (build server port {})", build_server_port());
 }
@@ -77,14 +84,16 @@ pub unsafe fn init_compile_handler(
 /// Sends an HTTP POST to the build server at 10.0.2.2:{BUILD_SERVER_PORT}
 /// and returns the raw HTTP response bytes.
 fn compile_handler(body: &[u8]) -> Result<Vec<u8>, String> {
+    let stack_ptr = BUILD_STACK
+        .get()
+        .ok_or_else(|| String::from("network stack not initialized"))?;
     let stack = unsafe {
-        BUILD_STACK
-            .and_then(|p| p.as_mut())
-            .ok_or_else(|| String::from("network stack not initialized"))?
+        stack_ptr.as_mut()
+            .ok_or_else(|| String::from("network stack pointer is null"))?
     };
-    let now = unsafe {
-        BUILD_NOW_FN.ok_or_else(|| String::from("time function not initialized"))?
-    };
+    let now = *BUILD_NOW_FN
+        .get()
+        .ok_or_else(|| String::from("time function not initialized"))?;
 
     let port = build_server_port();
 
@@ -724,19 +733,21 @@ pub enum AuthMode {
 }
 
 /// Global auth mode — set during init, read during agent loops.
-pub(crate) static mut AUTH_MODE: Option<AuthMode> = None;
+/// Protected by spin::Once for safe one-time initialization.
+static AUTH_MODE: spin::Once<AuthMode> = spin::Once::new();
 
 /// Set the authentication mode. Call once during boot.
 ///
 /// # Safety
-/// Must be called from single thread during init.
+/// Safe to call — uses spin::Once which handles synchronization.
+/// Kept as `unsafe fn` to preserve API compatibility with callers.
 pub unsafe fn set_auth_mode(mode: AuthMode) {
-    AUTH_MODE = Some(mode);
+    AUTH_MODE.call_once(|| mode);
 }
 
 /// Get current auth mode reference.
 pub fn auth_mode() -> Option<&'static AuthMode> {
-    unsafe { core::ptr::addr_of!(AUTH_MODE).as_ref().and_then(|o| o.as_ref()) }
+    AUTH_MODE.get()
 }
 
 /// Send an API request — routes to either api.anthropic.com or claude.ai
