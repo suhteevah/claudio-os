@@ -7,6 +7,10 @@ terminal pane with independent conversation state. The system supports two
 authentication modes: direct claude.ai Max subscription access, and standard
 Anthropic API key.
 
+The multi-agent system includes inter-agent IPC (message bus, named channels,
+shared memory), conversation management (list/select/rename/delete), and
+automatic session refresh with JWT expiry detection.
+
 ---
 
 ## Authentication Modes

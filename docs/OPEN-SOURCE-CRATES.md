@@ -1,6 +1,6 @@
 # ClaudioOS Open-Source Crates
 
-ClaudioOS has published 19 crates as standalone, reusable libraries. Each crate is
+ClaudioOS has published 22 crates as standalone, reusable libraries. Each crate is
 `#![no_std]` and can be used independently of ClaudioOS in any bare-metal or
 embedded Rust project.
 
@@ -25,34 +25,37 @@ embedded Rust project.
 | 4 | **ahci-nostd** | 2,139 | AHCI/SATA driver: HBA register access, port command engine, ATA IDENTIFY, sector read/write |
 | 5 | **nvme-nostd** | 2,563 | NVMe driver: admin/IO queue pairs, doorbell registers, PRP scatter-gather, sector I/O |
 | 6 | **intel-nic-nostd** | 1,986 | Intel NIC driver: e1000/e1000e (I219-V)/igc (I225-V), DMA descriptor rings, PHY config |
-| 7 | **xhci-nostd** | 4,204 | xHCI USB 3.0 host controller: TRB rings, device enumeration, HID keyboard driver |
-| 8 | **acpi-nostd** | 2,433 | ACPI table parser: RSDP, RSDT/XSDT, MADT, FADT, MCFG, HPET, shutdown/reboot |
-| 9 | **hda-nostd** | 2,631 | Intel HD Audio: CORB/RIRB command protocol, codec discovery, stream setup, PCM playback |
-| 10 | **smp-nostd** | 3,391 | SMP support: Local APIC init, AP trampoline boot, per-CPU data, work-stealing scheduler |
-| 11 | **gpu-compute-nostd** | 3,392 | NVIDIA GPU compute: MMIO registers, Falcon microcontroller, GPFIFO channels, tensor operations |
+| 7 | **wifi-nostd** | 3,513 | WiFi driver: Intel AX201/AX200, IEEE 802.11, WPA2/WPA3, scanning, association, tx/rx rings |
+| 8 | **bluetooth-nostd** | 3,075 | Bluetooth stack: HCI commands/events, L2CAP channels, GAP discovery, GATT services, HID over USB |
+| 9 | **usb-storage-nostd** | 1,357 | USB mass storage: Bulk-Only Transport, SCSI command set (INQUIRY, READ/WRITE), sector I/O |
+| 10 | **xhci-nostd** | 4,204 | xHCI USB 3.0 host controller: TRB rings, device enumeration, HID keyboard driver |
+| 11 | **acpi-nostd** | 2,433 | ACPI table parser: RSDP, RSDT/XSDT, MADT, FADT, MCFG, HPET, shutdown/reboot |
+| 12 | **hda-nostd** | 2,631 | Intel HD Audio: CORB/RIRB command protocol, codec discovery, stream setup, PCM playback |
+| 13 | **smp-nostd** | 3,391 | SMP support: Local APIC init, AP trampoline boot, per-CPU data, work-stealing scheduler |
+| 14 | **gpu-compute-nostd** | 3,392 | NVIDIA GPU compute: MMIO registers, Falcon microcontroller, GPFIFO channels, tensor operations |
 
 ### Networking / Security Crates
 
 | # | Crate | Lines | Description |
 |---|-------|-------|-------------|
-| 12 | **sshd-pqc** | 4,191 | Post-quantum SSH daemon: ML-KEM-768 + X25519 hybrid KEX, ML-DSA-65 + Ed25519 host keys, RFC 4253/4252/4254 |
+| 15 | **sshd-pqc** | 4,191 | Post-quantum SSH daemon: ML-KEM-768 + X25519 hybrid KEX, ML-DSA-65 + Ed25519 host keys, RFC 4253/4252/4254 |
 
 ### Language / Tool Crates
 
 | # | Crate | Lines | Description |
 |---|-------|-------|-------------|
-| 13 | **python-lite** | 2,388 | Minimal Python interpreter: tokenizer, parser, AST evaluator, variables, loops, functions (28 tests) |
-| 14 | **js-lite** | 5,229 | Minimal JavaScript evaluator for Cloudflare challenge solving: tokenizer, parser, eval |
-| 15 | **rustc-lite** | 142 | Bare-metal Rust compiler using Cranelift code generator backend |
-| 16 | **editor-nostd** | 534 | Nano-like text editor: insert/delete, line navigation, save/load (11 tests) |
+| 16 | **python-lite** | 2,388 | Minimal Python interpreter: tokenizer, parser, AST evaluator, variables, loops, functions (28 tests) |
+| 17 | **js-lite** | 5,229 | Minimal JavaScript evaluator for Cloudflare challenge solving: tokenizer, parser, eval |
+| 18 | **rustc-lite** | 142 | Bare-metal Rust compiler using Cranelift code generator backend |
+| 19 | **editor-nostd** | 534 | Nano-like text editor: insert/delete, line navigation, save/load (11 tests) |
 
 ### Web / Browser Crates
 
 | # | Crate | Lines | Description |
 |---|-------|-------|-------------|
-| 17 | **wraith-dom** | 2,070 | no_std HTML parser with CSS selector matching and form field detection (32 tests) |
-| 18 | **wraith-render** | 1,225 | HTML document to text-mode character grid renderer (12 tests) |
-| 19 | **wraith-transport** | 572 | HTTP/HTTPS client over smoltcp TCP/IP stack |
+| 20 | **wraith-dom** | 2,070 | no_std HTML parser with CSS selector matching and form field detection (32 tests) |
+| 21 | **wraith-render** | 1,225 | HTML document to text-mode character grid renderer (12 tests) |
+| 22 | **wraith-transport** | 572 | HTTP/HTTPS client over smoltcp TCP/IP stack |
 
 ---
 

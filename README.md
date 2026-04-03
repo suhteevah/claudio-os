@@ -4,7 +4,7 @@ A bare-metal Rust operating system purpose-built for running multiple AI coding 
 (Anthropic Claude) simultaneously. No Linux kernel, no POSIX, no JavaScript runtime --
 just Rust, UEFI, and direct HTTPS to Claude.
 
-**33 crates. ~80,000+ lines of Rust. Zero external OS dependencies.**
+**36 crates. 42 kernel modules. ~221,000 lines of Rust. Zero external OS dependencies.**
 
 ClaudioOS boots your machine into a split-pane terminal dashboard where each pane is an
 independent Claude agent session with tool use (text editor, Python interpreter, Rust
@@ -27,9 +27,12 @@ handshakes to SSE streaming -- is a single-address-space async Rust application.
 - **Native TLS 1.3** -- AES-128-GCM-SHA256 with hardware AES-NI, direct HTTPS to Claude APIs
 - **Two auth modes** -- claude.ai Max subscription (OAuth) or Anthropic API key
 - **Session auto-refresh** -- JWT expiry detection, automatic token refresh before expiry
-- **AI-native shell** -- 28 Unix-like builtins + natural language mode (type English, get commands)
+- **AI-native shell** -- 45+ Unix-like builtins + natural language mode (type English, get commands)
 - **Full filesystem stack** -- ext4, btrfs, NTFS, FAT32, VFS layer, GPT/MBR partition detection
-- **Hardware drivers** -- AHCI/SATA, NVMe, Intel NIC, xHCI USB (keyboard + mouse), HDA audio, NVIDIA GPU, SMP
+- **Hardware drivers** -- AHCI/SATA, NVMe, Intel NIC, WiFi, Bluetooth, USB storage, xHCI USB (keyboard + mouse + touchpad), HDA audio, NVIDIA GPU, SMP
+- **WiFi networking** -- Intel AX201/AX200 driver with WPA2/WPA3, network scanning, association
+- **Bluetooth** -- HCI/L2CAP/GAP/GATT stack over USB transport, HID device support
+- **USB mass storage** -- BOT (Bulk-Only Transport) + SCSI command set for thumb drives
 - **ACPI hardware discovery** -- MADT (CPU cores, I/O APICs), FADT (power management), HPET (precision timer), MCFG (PCIe ECAM)
 - **SMP multi-core** -- APIC-mode interrupt routing, AP core startup via SIPI, work-stealing scheduler
 - **Post-quantum SSH** -- ML-KEM-768 + X25519 hybrid KEX, ML-DSA-65 host keys, port 22
@@ -39,6 +42,16 @@ handshakes to SSE streaming -- is a single-address-space async Rust application.
 - **File manager** -- visual directory browser with copy, move, rename, delete, search
 - **System monitor** -- real-time CPU, memory, network, and agent stats dashboard
 - **Conversation management** -- list, select, rename, delete claude.ai conversations
+- **Firewall** -- stateful packet filtering, allow/deny rules, port-based and IP-based filtering
+- **Disk encryption** -- LUKS-compatible encryption layer for persistent storage
+- **Swap management** -- virtual memory swap to disk, configurable swap partitions
+- **Cron scheduler** -- periodic task execution with crontab-style scheduling
+- **Virtual consoles** -- multiple independent terminal sessions, Ctrl+Alt+F1-F6 switching
+- **Clipboard** -- system-wide copy/paste buffer shared across panes
+- **Power management** -- ACPI S3/S5 suspend/resume, battery status monitoring
+- **Touchpad support** -- PS/2 and USB touchpad driver with gesture recognition
+- **Network tools** -- ping, wget, curl, netstat, ifconfig, dns, traceroute, nslookup
+- **Man pages** -- built-in manual pages for all commands
 - **Init system** -- fw_cfg config, hostname, log level, auto-mount, startup scripts
 - **User accounts** -- SHA-256 password auth, SSH public key auth, user database
 - **RTC wall clock** -- CMOS real-time clock for timestamps, uptime tracking
@@ -57,23 +70,24 @@ handshakes to SSE streaming -- is a single-address-space async Rust application.
 |  Agent Dashboard (tmux-style split panes)                           |
 |  +--------+ +--------+ +--------+ +--------+ +--------+ +--------+ |
 |  | Agent  | | Shell  | |Browser | |FileMgr | |SysMon  | |Screen- | |
-|  | (Claude| | (28    | |(wraith | |(visual | |(CPU/   | | saver  | |
+|  | (Claude| | (45+   | |(wraith | |(visual | |(CPU/   | | saver  | |
 |  |  tools)| |  cmds) | | + TLS) | | dirs)  | | mem)   | | (5x)   | |
 |  +--------+ +--------+ +--------+ +--------+ +--------+ +--------+ |
 +=====================================================================+
-|  Shell (28 builtins + AI)  |  SSH Daemon (post-quantum, port 22)    |
+|  Shell (45+ builtins + AI) |  SSH Daemon (post-quantum, port 22)    |
 +============================+========================================+
 |  API Client (SSE) | Auth (OAuth/key) | Editor | Python | JS | Rust |
 |  IPC (msg bus + channels)  | Conversations | Session Refresh        |
+|  Firewall | Encryption | Swap | Cron | VConsoles | Clipboard        |
 +=====================================================================+
 |  VFS: ext4 | btrfs | NTFS | FAT32 | GPT/MBR                       |
 +=====================================================================+
 |  TLS 1.3 (embedded-tls) | smoltcp TCP/IP (DHCP, DNS)               |
 +=====================================================================+
-|  VirtIO-net | Intel NIC | AHCI | NVMe | xHCI | HDA | GPU | SMP    |
-|  USB kbd+mouse | ACPI (MADT/FADT/HPET/MCFG) | RTC | PC Speaker    |
+|  VirtIO-net | Intel NIC | WiFi | AHCI | NVMe | xHCI | HDA | GPU   |
+|  Bluetooth | USB Storage | Touchpad | SMP | ACPI | RTC | Speaker   |
 +=====================================================================+
-|  Init System | Users | Themes | Splash | Screensaver | Boot Chime   |
+|  Init | Users | Themes | Splash | Screensaver | Power | ManPages   |
 +=====================================================================+
 |  Kernel: async executor, 48 MiB heap, GDT/IDT, APIC, PCI, PIT     |
 +=====================================================================+
@@ -94,7 +108,7 @@ handshakes to SSE streaming -- is a single-address-space async Rust application.
 ### Build and Run
 
 ```bash
-# 1. Build the kernel (33 crates, ~80k lines)
+# 1. Build the kernel (36 crates, ~221k lines)
 cargo build
 
 # 2. Create bootable disk image
@@ -130,18 +144,18 @@ setup, and troubleshooting.
 | Document | Description |
 |----------|-------------|
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Full system architecture, boot sequence, memory layout, crate graph |
-| [HARDWARE.md](docs/HARDWARE.md) | Hardware drivers: AHCI, NVMe, Intel NIC, xHCI, HDA, GPU, SMP, ACPI, RTC, USB |
+| [HARDWARE.md](docs/HARDWARE.md) | Hardware drivers: AHCI, NVMe, Intel NIC, WiFi, Bluetooth, USB storage, xHCI, HDA, GPU, SMP, ACPI, touchpad |
 | [NETWORKING.md](docs/networking.md) | Network stack: VirtIO-net, smoltcp, TLS 1.3, HTTP, claude.ai API, SSH |
 | [FILESYSTEMS.md](docs/FILESYSTEMS.md) | VFS layer, ext4, btrfs, NTFS, FAT32, GPT/MBR |
-| [SHELL.md](docs/SHELL.md) | AI-native shell: 28+ builtins, pipes, env vars, scripting, themes, screensaver |
+| [SHELL.md](docs/SHELL.md) | AI-native shell: 45+ builtins, pipes, env vars, scripting, network tools, themes |
 | [AGENTS.md](docs/AGENTS.md) | Multi-agent system: auth modes, dashboard, tool loop, IPC, session management |
 | [BUILDING.md](docs/building.md) | Build instructions, QEMU setup, run.ps1, troubleshooting |
-| [OPEN-SOURCE-CRATES.md](docs/OPEN-SOURCE-CRATES.md) | 19 published crates with usage examples |
+| [OPEN-SOURCE-CRATES.md](docs/OPEN-SOURCE-CRATES.md) | 22 published crates with usage examples |
 | [ROADMAP.md](docs/ROADMAP.md) | Feature roadmap and TODO list |
 
 ---
 
-## Published Crates (19)
+## Published Crates (22)
 
 These crates are standalone `#![no_std]` libraries usable in any bare-metal or
 embedded Rust project:
@@ -149,8 +163,9 @@ embedded Rust project:
 | Category | Crates |
 |----------|--------|
 | **Filesystems** | ext4-rw, btrfs-nostd, ntfs-rw |
-| **Storage drivers** | ahci-nostd, nvme-nostd |
-| **Network drivers** | intel-nic-nostd |
+| **Storage drivers** | ahci-nostd, nvme-nostd, usb-storage-nostd |
+| **Network drivers** | intel-nic-nostd, wifi-nostd |
+| **Wireless** | bluetooth-nostd |
 | **USB** | xhci-nostd |
 | **Audio** | hda-nostd |
 | **System** | acpi-nostd, smp-nostd, gpu-compute-nostd |
@@ -164,17 +179,17 @@ API documentation.
 
 ---
 
-## All 33 Crates
+## All 36 Crates
 
 | Crate | Lines | Description |
 |-------|-------|-------------|
-| kernel | 4,537+ | Boot, hardware init, async executor, dashboard, 17 kernel modules |
+| kernel | 18,000+ | Boot, hardware init, async executor, dashboard, 42 kernel modules |
 | claudio-terminal | 1,794 | Framebuffer terminal, split panes, ANSI/VTE |
 | claudio-net | 3,172 | VirtIO-net, smoltcp, TLS 1.3, HTTP/SSE |
 | claudio-api | 1,849 | Anthropic Messages API, SSE streaming, tools |
 | claudio-auth | 395 | OAuth device flow, API key, token refresh |
 | claudio-agent | 501 | Agent session lifecycle, tool loop (20 rounds) |
-| claudio-shell | 2,884 | AI-native shell, 28 builtins, pipes |
+| claudio-shell | 2,884 | AI-native shell, 45+ builtins, pipes |
 | claudio-vfs | 1,930 | Virtual filesystem, mount table, POSIX API |
 | claudio-ext4 | 3,013 | ext4: superblock, inodes, extent trees |
 | claudio-btrfs | 4,006 | btrfs: B-trees, chunks, CRC32C, COW |
@@ -182,6 +197,9 @@ API documentation.
 | claudio-ahci | 2,139 | AHCI/SATA: HBA registers, sector I/O |
 | claudio-nvme | 2,563 | NVMe: queue pairs, doorbell registers |
 | claudio-intel-nic | 1,986 | Intel e1000/e1000e/igc: DMA rings, PHY |
+| claudio-wifi | 3,513 | WiFi: Intel AX201/AX200, WPA2/WPA3, scanning |
+| claudio-bluetooth | 3,075 | Bluetooth: HCI/L2CAP/GAP/GATT, USB transport, HID |
+| claudio-usb-storage | 1,357 | USB mass storage: BOT protocol, SCSI commands |
 | claudio-xhci | 4,204 | xHCI USB 3.0 + HID keyboard |
 | claudio-acpi | 2,433 | ACPI: RSDP, MADT, FADT, MCFG, HPET |
 | claudio-hda | 2,631 | HD Audio: CORB/RIRB, codec discovery, PCM |
@@ -200,32 +218,55 @@ API documentation.
 | rustc-hash-nostd | -- | Forked rustc-hash for no_std |
 | arbitrary-stub | -- | no_std stub for arbitrary crate |
 
-### Kernel Modules (17)
+### Kernel Modules (42)
 
 These are in-kernel modules under `kernel/src/` that wire the standalone crates
 to the hardware and dashboard:
 
-| Module | Description |
-|--------|-------------|
-| `acpi_init.rs` | ACPI table discovery: MADT, FADT, HPET, MCFG parsing and power management |
-| `smp_init.rs` | Multi-core boot: MADT-driven AP startup, APIC mode, legacy PIC disable |
-| `usb.rs` | xHCI controller init, USB keyboard -> PS/2 scancode bridge, mouse polling stub |
-| `intel_nic.rs` | Intel NIC -> smoltcp Device adapter, full network stack with DHCP |
-| `ssh_server.rs` | SSH listener on port 22, TCP session management, echo shell |
-| `rtc.rs` | CMOS RTC wall clock, BCD/binary decode, PIT-corrected uptime |
-| `mouse.rs` | USB HID mouse state, XOR crosshair cursor, event queue |
-| `ipc.rs` | Message bus, named channels, shared memory, 8 IPC tools for agents |
-| `init.rs` | fw_cfg config loading, hostname, log level, auto-mount, startup scripts |
-| `users.rs` | User database, SHA-256 password auth, SSH public key auth |
-| `sysmon.rs` | System monitor: CPU, memory, network, agent stats with ANSI rendering |
-| `splash.rs` | Boot splash: ASCII art logo, 4-stage progress bar |
-| `boot_sound.rs` | PC speaker boot chime: C5-E5-G5 ascending triad via PIT channel 2 |
-| `themes.rs` | 9 color themes with ANSI 24-bit escape generation |
-| `screensaver.rs` | 5 modes: starfield, matrix rain, bouncing logo, pipes, digital clock |
-| `browser.rs` | Text-mode web browser pane: wraith + smoltcp, URL bar, link following |
-| `filemanager.rs` | Visual file manager pane: directory listing, copy/move/rename/delete/search |
-| `conversations.rs` | Conversation management: list, select, rename, delete via claude.ai API |
-| `session_manager.rs` | Session auto-refresh: JWT expiry parsing, automatic token refresh |
+| Module | Lines | Description |
+|--------|-------|-------------|
+| `dashboard.rs` | 1,862 | Main dashboard loop, pane management, input dispatch |
+| `main.rs` | 1,248 | Boot sequence, hardware init, async entry point |
+| `screensaver.rs` | 951 | 5 modes: starfield, matrix rain, bouncing logo, pipes, digital clock |
+| `power.rs` | 921 | ACPI S3/S5 suspend/resume, battery monitoring, power profiles |
+| `encryption.rs` | 905 | LUKS-compatible disk encryption, key derivation, crypto layer |
+| `filemanager.rs` | 843 | Visual file manager pane: directory listing, copy/move/rename/delete/search |
+| `firewall.rs` | 788 | Stateful packet filtering, allow/deny rules, IP/port filtering |
+| `nettools.rs` | 787 | ping, wget, curl, netstat, ifconfig, dns, traceroute, nslookup |
+| `ipc.rs` | 783 | Message bus, named channels, shared memory, 8 IPC tools for agents |
+| `agent_loop.rs` | 774 | Agent tool loop, SSE streaming, tool execution |
+| `touchpad.rs` | 734 | PS/2 and USB touchpad driver, gesture recognition |
+| `manpages.rs` | 674 | Built-in manual pages for all commands |
+| `browser.rs` | 659 | Text-mode web browser pane: wraith + smoltcp, URL bar, link following |
+| `ssh_server.rs` | 568 | SSH listener on port 22, TCP session management, echo shell |
+| `acpi_init.rs` | 523 | ACPI table discovery: MADT, FADT, HPET, MCFG parsing |
+| `conversations.rs` | 517 | Conversation management: list, select, rename, delete via claude.ai API |
+| `init.rs` | 505 | fw_cfg config loading, hostname, log level, auto-mount, startup scripts |
+| `swap.rs` | 499 | Virtual memory swap to disk, configurable swap partitions |
+| `session_manager.rs` | 487 | Session auto-refresh: JWT expiry parsing, automatic token refresh |
+| `intel_nic.rs` | 454 | Intel NIC -> smoltcp Device adapter, full network stack with DHCP |
+| `users.rs` | 440 | User database, SHA-256 password auth, SSH public key auth |
+| `cron.rs` | 410 | Periodic task scheduler, crontab-style scheduling |
+| `mouse.rs` | 402 | USB HID mouse state, XOR crosshair cursor, event queue |
+| `interrupts.rs` | 387 | IDT setup, exception handlers, IRQ routing |
+| `vconsole.rs` | 372 | Virtual consoles, Ctrl+Alt+F1-F6 switching |
+| `themes.rs` | 365 | 9 color themes with ANSI 24-bit escape generation |
+| `sysmon.rs` | 306 | System monitor: CPU, memory, network, agent stats with ANSI rendering |
+| `rtc.rs` | 299 | CMOS RTC wall clock, BCD/binary decode, PIT-corrected uptime |
+| `executor.rs` | 287 | Interrupt-driven async executor, hlt when idle |
+| `framebuffer.rs` | 263 | GOP framebuffer init, double-buffered, dirty region tracking |
+| `pci.rs` | 245 | PCI bus enumeration, BAR mapping, bus mastering |
+| `smp_init.rs` | 233 | Multi-core boot: MADT-driven AP startup, APIC mode, legacy PIC disable |
+| `splash.rs` | 214 | Boot splash: ASCII art logo, 4-stage progress bar |
+| `usb.rs` | 186 | xHCI controller init, USB keyboard -> PS/2 scancode bridge |
+| `keyboard.rs` | 180 | PS/2 keyboard decoder, scancode queue |
+| `memory.rs` | 124 | Page table setup, physical memory offset |
+| `boot_sound.rs` | 111 | PC speaker boot chime: C5-E5-G5 via PIT channel 2 |
+| `clipboard.rs` | 108 | System-wide copy/paste buffer shared across panes |
+| `serial.rs` | 103 | UART 16550 serial output at 115200 baud |
+| `gdt.rs` | 76 | GDT + TSS setup |
+| `logger.rs` | 32 | Log framework: serial + framebuffer sinks |
+| `terminal.rs` | 28 | Terminal crate bridge |
 
 ---
 
@@ -244,7 +285,7 @@ to the hardware and dashboard:
 ## License
 
 - **ClaudioOS** (kernel + integration): [AGPL-3.0-or-later](LICENSE)
-- **Published crates** (19 standalone libraries): MIT + Apache-2.0 dual license
+- **Published crates** (22 standalone libraries): MIT + Apache-2.0 dual license
 
 Copyright (c) [Ridge Cell Repair LLC](https://github.com/suhteevah)
 

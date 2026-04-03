@@ -6,19 +6,148 @@
 |--------|----------------|-------|--------|----------|
 | AHCI/SATA | `claudio-ahci` | 2,139 | Complete | Any AHCI controller (Intel PCH, AMD) |
 | NVMe | `claudio-nvme` | 2,563 | Complete | NVMe 1.4+ SSDs (Samsung, WD, Intel) |
-| Intel NIC | `claudio-intel-nic` + `kernel/src/intel_nic.rs` | 1,986 + 455 | Complete + Wired | e1000, e1000e (I219-V), igc (I225-V) |
+| Intel NIC | `claudio-intel-nic` + `kernel/src/intel_nic.rs` | 1,986 + 454 | Complete + Wired | e1000, e1000e (I219-V), igc (I225-V) |
+| WiFi | `claudio-wifi` | 3,513 | Complete | Intel AX201, AX200, 802.11ac/ax |
+| Bluetooth | `claudio-bluetooth` | 3,075 | Complete | Bluetooth 5.0+ over USB transport |
 | VirtIO-net | `claudio-net` | 3,172 | Complete | QEMU virtio-net-pci (legacy 0.9.5) |
-| xHCI USB | `claudio-xhci` + `kernel/src/usb.rs` | 4,204 + 187 | Complete + Wired | USB 3.0 host controllers + HID keyboard |
-| USB Mouse | `kernel/src/mouse.rs` | 400 | Complete (awaiting xHCI mouse polling) | USB HID boot protocol mouse |
+| xHCI USB | `claudio-xhci` + `kernel/src/usb.rs` | 4,204 + 186 | Complete + Wired | USB 3.0 host controllers + HID keyboard |
+| USB Mouse | `kernel/src/mouse.rs` | 402 | Complete | USB HID boot protocol mouse |
+| USB Storage | `claudio-usb-storage` | 1,357 | Complete | USB mass storage (BOT + SCSI) |
+| Touchpad | `kernel/src/touchpad.rs` | 734 | Complete | PS/2 and USB touchpad with gestures |
 | HDA Audio | `claudio-hda` | 2,631 | Complete | Intel HD Audio (Realtek, etc.) |
 | NVIDIA GPU | `claudio-gpu` | 3,392 | Complete | NVIDIA GPUs (Falcon, FIFO, tensor ops) |
-| SMP | `claudio-smp` + `kernel/src/smp_init.rs` | 3,391 + 234 | Complete + Wired | Multi-core x86_64 (APIC, trampoline) |
-| ACPI | `claudio-acpi` + `kernel/src/acpi_init.rs` | 2,433 + 524 | Complete + Wired | RSDP/MADT/FADT/MCFG/HPET parsing |
-| RTC | `kernel/src/rtc.rs` | 300 | Complete | MC146818 CMOS real-time clock |
-| PC Speaker | `kernel/src/boot_sound.rs` | 112 | Complete | PIT channel 2 square wave |
+| SMP | `claudio-smp` + `kernel/src/smp_init.rs` | 3,391 + 233 | Complete + Wired | Multi-core x86_64 (APIC, trampoline) |
+| ACPI | `claudio-acpi` + `kernel/src/acpi_init.rs` | 2,433 + 523 | Complete + Wired | RSDP/MADT/FADT/MCFG/HPET parsing |
+| RTC | `kernel/src/rtc.rs` | 299 | Complete | MC146818 CMOS real-time clock |
+| PC Speaker | `kernel/src/boot_sound.rs` | 111 | Complete | PIT channel 2 square wave |
 | PS/2 Keyboard | kernel | -- | Complete | PS/2 via IRQ1 (8042 controller) |
 | PIT Timer | kernel | -- | Complete | 8253/8254 at 18.2 Hz |
 | Serial UART | kernel | -- | Complete | 16550 at 0x3F8, 115200 baud |
+
+---
+
+## WiFi (`crates/wifi/`)
+
+Native WiFi driver for Intel wireless adapters, enabling untethered networking.
+
+### Module Structure
+
+| Module | Purpose |
+|--------|---------|
+| `driver.rs` | `WifiDriver` with init, scan, connect, disconnect, send/receive |
+| `pci.rs` | PCI detection for Intel WiFi adapters (AX201, AX200) |
+| `firmware.rs` | Firmware image loading and microcode upload |
+| `ieee80211.rs` | IEEE 802.11 frame parsing and construction |
+| `scan.rs` | Network scanning: probe requests, beacon parsing, SSID list |
+| `tx_rx.rs` | Transmit/receive ring management, DMA buffers |
+| `commands.rs` | Firmware command interface, configuration commands |
+| `wpa.rs` | WPA2-Personal and WPA3-SAE key derivation and 4-way handshake |
+
+### Supported Adapters
+
+| PCI Device ID | Controller | Common Hardware |
+|---------------|-----------|-----------------|
+| 0x2723 | Intel Wi-Fi 6 AX200 | Desktop PCIe, laptop M.2 |
+| 0xA0F0 | Intel Wi-Fi 6 AX201 | HP Victus, Dell XPS, ThinkPad |
+
+### Usage
+
+```rust
+use claudio_wifi::WifiDriver;
+
+let mut wifi = WifiDriver::init(bar0_addr).unwrap();
+let networks = wifi.scan().unwrap();
+wifi.connect("MyNetwork", "password123").unwrap();
+```
+
+---
+
+## Bluetooth (`crates/bluetooth/`)
+
+Full Bluetooth stack over USB transport with HID device support.
+
+### Module Structure
+
+| Module | Purpose |
+|--------|---------|
+| `driver.rs` | `BluetoothDriver` with init, scan, pair, connect |
+| `hci.rs` | Host Controller Interface: commands, events, ACL data |
+| `l2cap.rs` | Logical Link Control and Adaptation Protocol: channels, segmentation |
+| `gap.rs` | Generic Access Profile: discovery, advertising, connection |
+| `gatt.rs` | Generic Attribute Profile: services, characteristics, read/write |
+| `hid.rs` | HID over GATT: keyboard, mouse, gamepad input reports |
+| `usb_transport.rs` | USB bulk/interrupt endpoint transport for HCI |
+
+### Usage
+
+```rust
+use claudio_bluetooth::BluetoothDriver;
+
+let mut bt = BluetoothDriver::init(usb_device).unwrap();
+let devices = bt.scan(5_000).unwrap();  // 5 second scan
+bt.pair(&devices[0]).unwrap();
+```
+
+---
+
+## USB Mass Storage (`crates/usb-storage/`)
+
+USB mass storage driver using the Bulk-Only Transport (BOT) protocol with
+SCSI command set for USB thumb drives and external disks.
+
+### Module Structure
+
+| Module | Purpose |
+|--------|---------|
+| `driver.rs` | `UsbStorageDriver` with init, read_sectors, write_sectors |
+| `bot.rs` | Bulk-Only Transport: CBW/CSW packets, bulk endpoint I/O |
+| `scsi.rs` | SCSI commands: INQUIRY, READ CAPACITY, READ(10), WRITE(10) |
+
+### Usage
+
+```rust
+use claudio_usb_storage::UsbStorageDriver;
+
+let mut drive = UsbStorageDriver::init(usb_device).unwrap();
+let mut buf = [0u8; 512];
+drive.read_sectors(0, 1, &mut buf).unwrap();
+```
+
+---
+
+## Touchpad (`kernel/src/touchpad.rs`)
+
+PS/2 and USB touchpad driver with gesture recognition for laptop use.
+
+### Features
+
+- PS/2 Synaptics and ALPS touchpad detection
+- USB HID multi-touch report parsing
+- Gesture recognition: tap-to-click, two-finger scroll, two-finger tap (right-click)
+- Configurable sensitivity and speed
+- Event queue integrated with mouse subsystem
+
+---
+
+## Power Management (`kernel/src/power.rs`)
+
+ACPI-based power management with suspend/resume and battery monitoring.
+
+### Features
+
+- ACPI S3 (suspend to RAM) and S5 (shutdown)
+- Battery status via ACPI _BST and _BIF methods
+- Battery percentage, charging state, time-to-empty estimation
+- Power profiles (performance, balanced, power-saver)
+- Idle detection for automatic suspend
+
+### Shell Commands
+
+```
+battery          # Show battery status
+suspend          # Suspend to RAM (ACPI S3)
+shutdown         # Power off (ACPI S5)
+```
 
 ---
 

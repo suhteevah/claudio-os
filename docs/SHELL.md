@@ -6,6 +6,9 @@ ClaudioOS includes an AI-native shell (`crates/shell/`, 2,884 lines) that combin
 traditional Unix-like commands with natural language processing. Type `ls /mnt/nvme0`
 or `"show me what's on the NVMe drive"` -- both work.
 
+The shell now has 45+ built-in commands spanning filesystem operations, networking,
+security, power management, and system administration.
+
 The shell is `#![no_std]` and runs directly on the bare-metal kernel.
 
 ---
@@ -16,7 +19,7 @@ The shell is `#![no_std]` and runs directly on the bare-metal kernel.
 |--------|---------|
 | `shell.rs` | Main shell loop: line reading, command dispatch, history |
 | `parser.rs` | Command parsing: tokenization, pipes, redirects, quoting |
-| `builtin.rs` | 28 built-in commands + VFS/SystemInfo trait abstractions |
+| `builtin.rs` | 45+ built-in commands + VFS/SystemInfo trait abstractions |
 | `pipe.rs` | Pipeline executor: connect commands with byte-stream pipes |
 | `env.rs` | Environment variables: get, set, expand `$VAR` in arguments |
 | `ai.rs` | AI mode: send natural language to Claude, execute returned commands |
@@ -70,7 +73,13 @@ The shell is `#![no_std]` and runs directly on the bare-metal kernel.
 | Command | Usage | Description |
 |---------|-------|-------------|
 | `ifconfig` | `ifconfig` | Show network interface info (name, IP, MAC, status) |
-| `ping` | `ping <host>` | Ping a host, show round-trip time |
+| `ping` | `ping <host>` | Ping a host with ICMP echo, show round-trip time |
+| `wget` | `wget <url>` | Download a file from a URL via HTTP/HTTPS |
+| `curl` | `curl <url>` | Fetch URL content and display to stdout |
+| `netstat` | `netstat` | Show active network connections and listening ports |
+| `dns` | `dns <hostname>` | Resolve a hostname to IP address |
+| `nslookup` | `nslookup <hostname>` | DNS lookup with detailed resolver info |
+| `traceroute` | `traceroute <host>` | Trace the route packets take to a host |
 | `ssh` | `ssh <host>` | SSH client (placeholder) |
 
 ### Environment Commands
@@ -110,6 +119,30 @@ Available themes: `default`, `solarized-dark`, `solarized-light`, `monokai`,
 Available modes: `starfield`, `matrix`, `bouncing`, `pipes`, `clock`.
 The screensaver activates automatically after 5 minutes of idle time.
 Any keypress deactivates it.
+
+### Security Commands
+
+| Command | Usage | Description |
+|---------|-------|-------------|
+| `fw` | `fw <allow\|deny\|list\|flush>` | Firewall management: add/remove rules, list active rules |
+| `fw allow <port>` | `fw allow 80` | Allow inbound traffic on a port |
+| `fw deny <ip>` | `fw deny 10.0.0.5` | Block traffic from an IP address |
+| `cryptsetup` | `cryptsetup <open\|close\|status>` | Disk encryption management (LUKS-compatible) |
+
+### Power Management Commands
+
+| Command | Usage | Description |
+|---------|-------|-------------|
+| `battery` | `battery` | Show battery status, percentage, charging state |
+| `suspend` | `suspend` | Suspend to RAM (ACPI S3) |
+
+### System Administration Commands
+
+| Command | Usage | Description |
+|---------|-------|-------------|
+| `crontab` | `crontab <list\|add\|remove>` | Manage scheduled periodic tasks |
+| `swapon` | `swapon <device>` | Enable swap on a device or partition |
+| `man` | `man <command>` | Display manual page for a command |
 
 ### Conversation Management Commands
 
