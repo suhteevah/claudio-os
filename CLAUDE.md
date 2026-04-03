@@ -8,8 +8,8 @@ simultaneously. It has NO Linux kernel, NO POSIX layer, NO JavaScript runtime. I
 a single-address-space async Rust application that manages its own hardware.
 
 **Owner**: Matt Gates (suhteevah) — Ridge Cell Repair LLC
-**Target hardware**: x86_64 UEFI machines (dev on QEMU, prod on i9-11900K/RTX 3070 Ti,
-Supermicro SYS-4028GR-TRT, HP Victus laptop, Arch Linux box)
+**Target hardware**: x86_64 UEFI machines (dev on QEMU, prod on production hardware,
+dedicated servers, laptops)
 
 ## Architecture Overview
 
@@ -227,7 +227,7 @@ and outbound internet including HTTPS to api.anthropic.com. No bridging needed f
 - [ ] Boot on physical hardware (test on Arch box first)
 - [ ] Wire VFS to real storage drivers (AHCI/NVMe + ext4/btrfs)
 - [ ] Wire SSH shell to real shell crate
-- [ ] GPU LLM inference (run local models on RTX 3070 Ti)
+- [ ] GPU LLM inference (run local models on GPU)
 - [ ] Graceful shutdown / token revocation
 - [ ] USB boot image generation
 
