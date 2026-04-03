@@ -108,8 +108,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // ── Phase -1: Bare minimum proof-of-life (VGA text mode + raw serial) ──
     // Write directly to serial port 0x3F8 WITHOUT full UART init to prove
     // we actually reached kernel_main. VGA text buffer at 0xB8000 too.
+    // SAFETY: Writing to serial port 0x3F8 is a standard x86 I/O operation.
+    // At this point we are in kernel mode with full I/O permissions.
+    // The UART data register at 0x3F8 is safe to write even without full
+    // UART initialization — QEMU's emulated 16550 accepts bytes immediately.
     unsafe {
-        // Raw serial write — just push bytes, QEMU's serial works even without full init
         let mut port = x86_64::instructions::port::Port::<u8>::new(0x3F8);
         for &b in b"[claudio] kernel_main entered\r\n" {
             port.write(b);
@@ -119,35 +122,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // ── Phase 0: Enable SSE/SSE2/AVX — required for crypto + memchr ──
     // memchr uses runtime CPUID to detect AVX2 and will crash if AVX
     // isn't enabled in the OS. We enable the full SSE+AVX stack.
+    //
+    // SAFETY: We are running in ring 0 with full privilege. Writing CR0, CR4,
+    // and XCR0 is required to enable SIMD instructions. CPUID is always safe
+    // to execute. The bit patterns follow the Intel SDM Vol. 3A requirements
+    // for enabling SSE (OSFXSR) and AVX (OSXSAVE + XCR0.YMM). We perform
+    // CPUID checks before enabling XSAVE/AVX to avoid #UD on older CPUs.
     unsafe {
         // CR0: clear EM (bit 2), set MP (bit 1) — enable FPU/SSE
         let mut cr0: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0);
-        cr0 &= !(1 << 2); // clear EM
-        cr0 |= 1 << 1;    // set MP
+        cr0 &= !(1 << 2); // clear EM (Emulation) — allows native FPU
+        cr0 |= 1 << 1;    // set MP (Monitor Coprocessor) — enables WAIT/FWAIT monitoring
         core::arch::asm!("mov cr0, {}", in(reg) cr0);
 
         // CR4: set OSFXSR (bit 9) + OSXMMEXCPT (bit 10) — enable SSE
         let mut cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4);
-        cr4 |= (1 << 9) | (1 << 10);
+        cr4 |= (1 << 9) | (1 << 10); // OSFXSR: OS supports FXSAVE/FXRSTOR, OSXMMEXCPT: OS handles #XM
 
         // Check if XSAVE is supported (CPUID.01H:ECX bit 26)
         // If so, enable OSXSAVE in CR4 and set XCR0 for AVX
-        // CPUID leaf 1: check XSAVE (ECX bit 26) and AVX (ECX bit 28)
         let cpuid_result = core::arch::x86_64::__cpuid(1).ecx;
         let xsave_supported = (cpuid_result & (1 << 26)) != 0;
         let avx_supported = (cpuid_result & (1 << 28)) != 0;
 
         if xsave_supported && avx_supported {
-            cr4 |= 1 << 18; // OSXSAVE
+            cr4 |= 1 << 18; // OSXSAVE — enables XGETBV/XSETBV instructions
             core::arch::asm!("mov cr4, {}", in(reg) cr4);
 
             // XCR0: enable x87 (bit 0) + SSE (bit 1) + AVX (bit 2)
+            // This tells the CPU which state components to save/restore with XSAVE.
             let xcr0: u64 = (1 << 0) | (1 << 1) | (1 << 2);
             core::arch::asm!(
                 "xsetbv",
-                in("ecx") 0u32,
+                in("ecx") 0u32,       // XCR0 selector
                 in("edx") (xcr0 >> 32) as u32,
                 in("eax") xcr0 as u32,
             );
@@ -265,6 +274,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Switch to the new stack and continue execution there.
     // We pass the entry function pointer and new stack pointer to asm.
+    //
+    // SAFETY: `new_stack_top` is a valid 16-byte aligned pointer to the top of
+    // a freshly allocated 4 MiB heap region. `post_stack_switch` is a valid
+    // function pointer. After `mov rsp`, all subsequent pushes and calls use
+    // the new stack. The old bootloader stack is abandoned (never freed —
+    // it's part of the bootloader's identity mapping and will be reclaimed
+    // if we ever remap that memory). This is marked `noreturn` because
+    // `post_stack_switch` diverges (enters the executor's halt loop).
     unsafe {
         core::arch::asm!(
             "mov rsp, {stack}",
@@ -421,6 +438,10 @@ async fn main_async() {
                         // Entry 0x0000 = signature, 0x0001 = count
                         // File directory at selector 0x0019
                         log::info!("[auth] checking fw_cfg for saved session...");
+                        // SAFETY: QEMU fw_cfg I/O ports (0x510 selector, 0x511 data) are safe
+                        // to read/write in ring 0. On non-QEMU hardware, these ports are either
+                        // unoccupied (reads return 0xFF) or belong to an unrelated device; we
+                        // only act on recognized data ("opt/claudio/session" filename match).
                         unsafe {
                             let mut sel = x86_64::instructions::port::Port::<u16>::new(0x510);
                             let mut data = x86_64::instructions::port::Port::<u8>::new(0x511);

@@ -215,16 +215,22 @@ fn aes256_encrypt_block(key: &[u8; 32], block: &mut [u8; 16]) {
     block.copy_from_slice(&state);
 }
 
-/// GF(2^8) multiply by 2.
+/// GF(2^8) multiply by 2 (xtime operation).
+///
+/// Multiplication in GF(2^8) with the AES irreducible polynomial
+/// x^8 + x^4 + x^3 + x + 1 (0x11B). If the high bit is set before
+/// the shift, we reduce modulo the polynomial.
 fn gf_mul2(x: u8) -> u8 {
     let mut r = (x as u16) << 1;
     if r & 0x100 != 0 {
-        r ^= 0x11b;
+        r ^= 0x11b; // Reduce modulo AES polynomial
     }
     r as u8
 }
 
-/// GF(2^8) multiply by 3 = mul2(x) ^ x.
+/// GF(2^8) multiply by 3 = mul2(x) XOR x.
+///
+/// Used in the MixColumns step of AES encryption.
 fn gf_mul3(x: u8) -> u8 {
     gf_mul2(x) ^ x
 }
@@ -386,7 +392,10 @@ fn aes256_decrypt_block(key: &[u8; 32], block: &mut [u8; 16]) {
     block.copy_from_slice(&state);
 }
 
-/// GF(2^8) multiplication for InvMixColumns.
+/// GF(2^8) general multiplication for InvMixColumns.
+///
+/// Uses the Russian peasant multiplication algorithm (shift-and-add)
+/// with reduction modulo the AES polynomial 0x11B after each step.
 fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     let mut result: u8 = 0;
     for _ in 0..8 {
@@ -489,7 +498,11 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// HMAC-SHA256.
+/// HMAC-SHA256 (RFC 2104).
+///
+/// Computes `H((K XOR opad) || H((K XOR ipad) || message))` where
+/// `ipad` = 0x36 repeated, `opad` = 0x5C repeated, and `H` = SHA-256.
+/// Keys longer than the block size (64 bytes) are first hashed.
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut k = [0u8; 64];
     if key.len() > 64 {
@@ -551,6 +564,12 @@ pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, dk_len: usiz
 // ── XTS mode ─────────────────────────────────────────────────────────
 
 /// GF(2^128) multiply tweak by x (left shift with polynomial reduction).
+///
+/// This implements multiplication by the generator polynomial alpha in
+/// GF(2^128) with the irreducible polynomial x^128 + x^7 + x^2 + x + 1.
+/// The 0x87 constant is the low byte of that polynomial (bits 0-7: 10000111).
+/// Used in XTS mode to derive the tweak for each successive 16-byte block
+/// within a sector.
 fn gf128_mul_x(tweak: &mut [u8; 16]) {
     let mut carry = 0u8;
     for byte in tweak.iter_mut() {
@@ -558,7 +577,8 @@ fn gf128_mul_x(tweak: &mut [u8; 16]) {
         *byte = (*byte << 1) | carry;
         carry = new_carry;
     }
-    // If there was a carry out of the MSB, XOR with the GF(2^128) polynomial
+    // If there was a carry out of the MSB, reduce modulo the GF(2^128) polynomial.
+    // The constant 0x87 = 0b10000111 represents x^7 + x^2 + x + 1.
     if carry != 0 {
         tweak[0] ^= 0x87;
     }
@@ -863,6 +883,10 @@ pub fn generate_salt() -> [u8; 32] {
     for chunk in salt.chunks_mut(8) {
         let mut val: u64 = 0;
         let success: u8;
+        // SAFETY: RDRAND is a non-privileged instruction. On CPUs without
+        // RDRAND support, this will #UD — but our target hardware (Haswell+)
+        // always has it. The fallback path below handles the case where
+        // RDRAND fails (returns CF=0) due to DRNG underflow.
         unsafe {
             core::arch::asm!(
                 "rdrand {val}",

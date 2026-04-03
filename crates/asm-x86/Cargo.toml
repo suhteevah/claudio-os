@@ -1,0 +1,10 @@
+[package]
+name = "claudio-asm-x86"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "x86_64 assembler (NASM-like syntax) for ClaudioOS bare-metal environment"
+
+[dependencies]
+log = { workspace = true }

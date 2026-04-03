@@ -72,6 +72,10 @@ impl<'a> claudio_terminal::DrawTarget for BackBufDrawTarget<'a> {
         let offset = (y * self.stride + x) * self.bpp;
         if offset + 3 < self.buf.len() {
             // BGR32 pixel format (UEFI GOP standard).
+            // SAFETY: The bounds check above guarantees offset+2 < buf.len().
+            // write_volatile is used instead of plain writes to prevent the
+            // compiler from reordering or eliding pixel stores, which matters
+            // when the buffer is later blitted to the framebuffer.
             unsafe {
                 let ptr = self.buf.as_mut_ptr().add(offset);
                 core::ptr::write_volatile(ptr, b);

@@ -25,6 +25,8 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// Called once during kernel init.
 pub fn init() {
     // CPUID leaf 1, ECX bit 30 = RDRAND
+    // SAFETY: CPUID is always safe to execute on x86_64. It has no side effects
+    // beyond reading CPU feature flags.
     let has_rdrand = unsafe {
         let ecx = core::arch::x86_64::__cpuid(1).ecx;
         (ecx & (1 << 30)) != 0
@@ -50,9 +52,17 @@ pub fn init() {
 // ---------------------------------------------------------------------------
 
 /// Try to get a 64-bit random value from RDRAND. Returns None on failure.
+///
+/// The caller must check `RDRAND_AVAILABLE` before calling this in a loop.
+/// A single RDRAND can fail transiently (the DRNG's internal buffer may be
+/// temporarily exhausted under heavy load), hence the `setc` carry-flag check.
 fn rdrand64() -> Option<u64> {
     let mut val: u64;
     let success: u8;
+    // SAFETY: RDRAND is a non-privileged instruction available on Ivy Bridge+.
+    // We only call this after confirming CPUID.01H:ECX[30] (RDRAND support).
+    // The instruction writes a random value to the destination register and
+    // sets CF=1 on success, CF=0 on underflow. No memory is accessed.
     unsafe {
         core::arch::asm!(
             "rdrand {val}",
@@ -178,6 +188,8 @@ fn seed_chacha_state() {
     let mut seed_material = [0u8; 64];
 
     // Source 1: TSC (Time Stamp Counter) — high-resolution, unpredictable
+    // SAFETY: RDTSC is a non-privileged instruction that reads the CPU's
+    // monotonic cycle counter. No side effects.
     let tsc = unsafe { core::arch::x86_64::_rdtsc() };
     seed_material[0..8].copy_from_slice(&tsc.to_le_bytes());
 
@@ -191,6 +203,7 @@ fn seed_chacha_state() {
     seed_material[16..24].copy_from_slice(&unix.to_le_bytes());
 
     // Source 4: Second TSC sample (captures timing jitter between reads)
+    // SAFETY: Same as above — RDTSC is always safe.
     let tsc2 = unsafe { core::arch::x86_64::_rdtsc() };
     seed_material[24..32].copy_from_slice(&tsc2.to_le_bytes());
 
@@ -203,6 +216,7 @@ fn seed_chacha_state() {
     }
 
     // Source 6: More TSC jitter + address space layout
+    // SAFETY: Same as above — RDTSC is always safe.
     let tsc3 = unsafe { core::arch::x86_64::_rdtsc() };
     seed_material[48..56].copy_from_slice(&tsc3.to_le_bytes());
 
@@ -281,8 +295,9 @@ fn chacha_fill(buf: &mut [u8]) {
 pub fn random_bytes(buf: &mut [u8]) {
     if !INITIALIZED.load(Ordering::Relaxed) {
         // Pre-init fallback: use TSC + counter mixing (not ideal, but
-        // better than xorshift)
+        // better than xorshift). Only used before init() is called.
         static FALLBACK_CTR: AtomicU64 = AtomicU64::new(0);
+        // SAFETY: RDTSC is always safe on x86_64.
         let tsc = unsafe { core::arch::x86_64::_rdtsc() };
         let mut state = tsc ^ FALLBACK_CTR.fetch_add(1, Ordering::Relaxed);
         for byte in buf.iter_mut() {

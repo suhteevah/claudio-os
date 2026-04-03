@@ -1,0 +1,13 @@
+[package]
+name = "claudio-cc-lite"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Minimal C11 compiler targeting x86_64 for ClaudioOS bare-metal environment"
+
+[dependencies]
+log = { workspace = true }
+spin = { workspace = true }
+cranelift-codegen = { version = "0.116", default-features = false, features = ["core", "x86"] }
+cranelift-frontend = { version = "0.116", default-features = false, features = ["core"] }
