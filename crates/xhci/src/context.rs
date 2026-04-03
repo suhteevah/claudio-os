@@ -642,7 +642,7 @@ impl Dcbaa {
             _size: total_size,
         });
 
-        phys
+        Some(phys)
     }
 
     /// Get the physical address of a device context for a slot.

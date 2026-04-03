@@ -13,6 +13,9 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::{Aead, AeadInPlace}};
+use chacha20poly1305::aead::generic_array::GenericArray;
+
 use crate::wire::*;
 
 // ---------------------------------------------------------------------------

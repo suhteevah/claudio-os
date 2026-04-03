@@ -39,7 +39,7 @@ pub const SSH_MLDSA65_ED25519: &str = "mlkem768-ed25519@openssh.com";
 
 /// An Ed25519 host keypair.
 pub struct Ed25519HostKey {
-    /// Ed25519 secret key (32 bytes seed, or 64 bytes expanded).
+    /// Ed25519 secret key seed (32 bytes).
     secret: [u8; 32],
     /// Ed25519 public key (32 bytes).
     public: [u8; 32],
@@ -53,18 +53,9 @@ impl Ed25519HostKey {
         let mut secret = [0u8; 32];
         rng(&mut secret);
 
-        // TODO: Wire up ed25519_dalek:
-        //   use ed25519_dalek::SigningKey;
-        //   let signing_key = SigningKey::from_bytes(&secret);
-        //   let public = signing_key.verifying_key().to_bytes();
-        //
-        // Placeholder: derive public key via hash (NOT cryptographically correct,
-        // just to validate the protocol plumbing).
-        let mut hasher = Sha256::new();
-        hasher.update(&secret);
-        let h = hasher.finalize();
-        let mut public = [0u8; 32];
-        public.copy_from_slice(&h);
+        // Real Ed25519 key derivation via ed25519-dalek
+        let signing_key = Ed25519SigningKey::from_bytes(&secret);
+        let public = signing_key.verifying_key().to_bytes();
 
         log::debug!(
             "hostkey: Ed25519 public key = {:02x}{:02x}{:02x}{:02x}...",
@@ -96,26 +87,10 @@ impl Ed25519HostKey {
     pub fn sign(&self, data: &[u8]) -> Vec<u8> {
         log::debug!("hostkey: signing {} bytes with Ed25519", data.len());
 
-        // TODO: Wire up ed25519_dalek:
-        //   use ed25519_dalek::SigningKey;
-        //   let signing_key = SigningKey::from_bytes(&self.secret);
-        //   let sig = signing_key.sign(data);
-        //   let sig_bytes = sig.to_bytes();
-
-        // Placeholder signature (HMAC-SHA256 of data with secret as key)
-        let mut hasher = Sha256::new();
-        hasher.update(&self.secret);
-        hasher.update(data);
-        let h1 = hasher.finalize();
-
-        let mut hasher2 = Sha256::new();
-        hasher2.update(h1);
-        hasher2.update(data);
-        let h2 = hasher2.finalize();
-
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes[..32].copy_from_slice(&h1);
-        sig_bytes[32..].copy_from_slice(&h2);
+        // Real Ed25519 signing via ed25519-dalek
+        let signing_key = Ed25519SigningKey::from_bytes(&self.secret);
+        let sig = signing_key.sign(data);
+        let sig_bytes = sig.to_bytes();
 
         let mut w = SshWriter::new();
         w.write_string_utf8(SSH_ED25519);
@@ -131,14 +106,34 @@ impl Ed25519HostKey {
             signature.len(),
         );
 
-        // TODO: Wire up ed25519_dalek:
-        //   use ed25519_dalek::VerifyingKey;
-        //   let vk = VerifyingKey::from_bytes(public_key)?;
-        //   let sig = ed25519_dalek::Signature::from_bytes(signature)?;
-        //   vk.verify(data, &sig).is_ok()
-        let _ = (public_key, data, signature);
-        log::warn!("hostkey: Ed25519 verify is a placeholder — always returns false");
-        false
+        // Real Ed25519 verification via ed25519-dalek
+        let vk = match Ed25519VerifyingKey::from_bytes(public_key) {
+            Ok(vk) => vk,
+            Err(e) => {
+                log::error!("hostkey: invalid Ed25519 public key: {}", e);
+                return false;
+            }
+        };
+
+        if signature.len() != 64 {
+            log::error!("hostkey: Ed25519 signature wrong length: {} (expected 64)", signature.len());
+            return false;
+        }
+
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(signature);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+        match vk.verify(data, &sig) {
+            Ok(()) => {
+                log::debug!("hostkey: Ed25519 signature verified successfully");
+                true
+            }
+            Err(e) => {
+                log::debug!("hostkey: Ed25519 signature verification failed: {}", e);
+                false
+            }
+        }
     }
 
     /// Get the raw 32-byte public key.
@@ -164,6 +159,15 @@ impl Ed25519HostKey {
         let mut public = [0u8; 32];
         secret.copy_from_slice(&data[..32]);
         public.copy_from_slice(&data[32..64]);
+
+        // Validate that the public key matches the secret
+        let signing_key = Ed25519SigningKey::from_bytes(&secret);
+        let derived_public = signing_key.verifying_key().to_bytes();
+        if derived_public != public {
+            log::error!("hostkey: Ed25519 key mismatch — stored public key doesn't match derived");
+            return None;
+        }
+
         log::debug!("hostkey: Ed25519 keypair loaded from persistence");
         Some(Self { secret, public })
     }
@@ -174,10 +178,13 @@ impl Ed25519HostKey {
 // ---------------------------------------------------------------------------
 
 /// An ML-DSA-65 host keypair (FIPS 204 / CRYSTALS-Dilithium).
+///
+/// Internally stores the 32-byte seed from which the signing key is derived
+/// deterministically, plus the encoded verifying (public) key.
 pub struct MlDsa65HostKey {
-    /// ML-DSA-65 secret/signing key.
-    secret: Vec<u8>,
-    /// ML-DSA-65 public/verifying key.
+    /// ML-DSA-65 seed (32 bytes) — used to derive the full signing key.
+    seed: [u8; 32],
+    /// ML-DSA-65 encoded public/verifying key.
     public: Vec<u8>,
 }
 
@@ -195,23 +202,31 @@ impl MlDsa65HostKey {
     pub fn generate(rng: &mut dyn FnMut(&mut [u8])) -> Self {
         log::info!("hostkey: generating ML-DSA-65 host keypair");
 
-        // TODO: Wire up ml_dsa crate:
-        //   use ml_dsa::MlDsa65;
-        //   let (sk, pk) = MlDsa65::key_gen(&mut rng);
+        // Generate a random 32-byte seed
+        let mut seed = [0u8; 32];
+        rng(&mut seed);
 
-        // Placeholder keys
-        let mut secret = alloc::vec![0u8; MLDSA65_SK_SIZE];
-        rng(&mut secret);
-        let mut public = alloc::vec![0u8; MLDSA65_PK_SIZE];
-        rng(&mut public);
+        // Derive the keypair deterministically from the seed via ml-dsa
+        let seed_array = ml_dsa::B32::from(seed);
+        let kp = MlDsa65::from_seed(&seed_array);
+
+        // Encode the verifying (public) key
+        use ml_dsa::signature::Keypair;
+        let vk = kp.verifying_key();
+        let public = Vec::from(vk.encode().as_slice());
 
         log::debug!(
-            "hostkey: ML-DSA-65 keypair generated — pk={} bytes, sk={} bytes",
+            "hostkey: ML-DSA-65 keypair generated — pk={} bytes, seed=32 bytes",
             public.len(),
-            secret.len(),
         );
 
-        Self { secret, public }
+        Self { seed, public }
+    }
+
+    /// Reconstruct the expanded signing key from the stored seed.
+    fn signing_key(&self) -> ml_dsa::SigningKey<MlDsa65> {
+        let seed_array = ml_dsa::B32::from(self.seed);
+        MlDsa65::from_seed(&seed_array)
     }
 
     /// Serialize the public key in SSH wire format.
@@ -231,21 +246,14 @@ impl MlDsa65HostKey {
     pub fn sign(&self, data: &[u8]) -> Vec<u8> {
         log::debug!("hostkey: signing {} bytes with ML-DSA-65", data.len());
 
-        // TODO: Wire up ml_dsa crate:
-        //   use ml_dsa::MlDsa65;
-        //   let sig = MlDsa65::sign(&self.secret, data);
-
-        // Placeholder: hash-based "signature"
-        let mut sig = alloc::vec![0u8; MLDSA65_SIG_SIZE];
-        let mut hasher = Sha256::new();
-        hasher.update(&self.secret[..32]);
-        hasher.update(data);
-        let h = hasher.finalize();
-        sig[..32].copy_from_slice(&h);
+        // Real ML-DSA-65 signing via ml-dsa crate (deterministic mode)
+        let sk = self.signing_key();
+        let sig: ml_dsa::Signature<MlDsa65> = sk.sign(data);
+        let sig_bytes = sig.encode();
 
         let mut w = SshWriter::new();
         w.write_string_utf8("ml-dsa-65");
-        w.write_string(&sig);
+        w.write_string(sig_bytes.as_slice());
         w.into_bytes()
     }
 
@@ -258,10 +266,51 @@ impl MlDsa65HostKey {
             signature.len(),
         );
 
-        // TODO: Wire up ml_dsa crate
-        let _ = (public_key, data, signature);
-        log::warn!("hostkey: ML-DSA-65 verify is a placeholder — always returns false");
-        false
+        // Decode the verifying key
+        if public_key.len() != MLDSA65_PK_SIZE {
+            log::error!("hostkey: ML-DSA-65 public key wrong size: {} (expected {})", public_key.len(), MLDSA65_PK_SIZE);
+            return false;
+        }
+        let vk_enc = match MlDsaEncodedVerifyingKey::<MlDsa65>::try_from(public_key) {
+            Ok(enc) => enc,
+            Err(_) => {
+                log::error!("hostkey: ML-DSA-65 public key encoding error");
+                return false;
+            }
+        };
+        let vk = MlDsaVerifyingKey::<MlDsa65>::decode(&vk_enc);
+
+        // Decode the signature
+        if signature.len() != MLDSA65_SIG_SIZE {
+            log::error!("hostkey: ML-DSA-65 signature wrong size: {} (expected {})", signature.len(), MLDSA65_SIG_SIZE);
+            return false;
+        }
+        let sig_enc = match MlDsaEncodedSignature::<MlDsa65>::try_from(signature) {
+            Ok(enc) => enc,
+            Err(_) => {
+                log::error!("hostkey: ML-DSA-65 signature encoding error");
+                return false;
+            }
+        };
+        let sig = match ml_dsa::Signature::<MlDsa65>::decode(&sig_enc) {
+            Some(s) => s,
+            None => {
+                log::error!("hostkey: ML-DSA-65 signature decode failed");
+                return false;
+            }
+        };
+
+        // Verify using the real ml-dsa verifier
+        match vk.verify(data, &sig) {
+            Ok(()) => {
+                log::debug!("hostkey: ML-DSA-65 signature verified successfully");
+                true
+            }
+            Err(e) => {
+                log::debug!("hostkey: ML-DSA-65 signature verification failed: {}", e);
+                false
+            }
+        }
     }
 
     /// Get the raw public key bytes.
@@ -269,10 +318,10 @@ impl MlDsa65HostKey {
         &self.public
     }
 
-    /// Serialize for persistence.
+    /// Serialize for persistence (seed + public key).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = SshWriter::new();
-        w.write_string(&self.secret);
+        w.write_string(&self.seed);
         w.write_string(&self.public);
         w.into_bytes()
     }
@@ -280,18 +329,30 @@ impl MlDsa65HostKey {
     /// Deserialize from persistence.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         let mut r = crate::wire::SshReader::new(data);
-        let secret = r.read_string_raw().ok()?.to_vec();
+        let seed_bytes = r.read_string_raw().ok()?;
         let public = r.read_string_raw().ok()?.to_vec();
-        if secret.len() != MLDSA65_SK_SIZE || public.len() != MLDSA65_PK_SIZE {
+
+        if seed_bytes.len() != 32 {
             log::error!(
-                "hostkey: ML-DSA-65 key sizes wrong — sk={}, pk={}",
-                secret.len(),
-                public.len(),
+                "hostkey: ML-DSA-65 seed wrong size — got {}, expected 32",
+                seed_bytes.len(),
             );
             return None;
         }
+        if public.len() != MLDSA65_PK_SIZE {
+            log::error!(
+                "hostkey: ML-DSA-65 public key wrong size — got {}, expected {}",
+                public.len(),
+                MLDSA65_PK_SIZE,
+            );
+            return None;
+        }
+
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(seed_bytes);
+
         log::debug!("hostkey: ML-DSA-65 keypair loaded from persistence");
-        Some(Self { secret, public })
+        Some(Self { seed, public })
     }
 }
 

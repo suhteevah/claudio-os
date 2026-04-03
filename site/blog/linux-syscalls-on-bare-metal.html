@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Implementing 456 Linux Syscalls on Bare Metal — Running Linux Binaries Without Linux | ClaudioOS</title>
+  <meta name="description" content="How ClaudioOS runs unmodified Linux ELF binaries via syscall translation in Ring 0. 456 syscalls, no kernel mode switch, pure Rust.">
+  <meta property="og:title" content="Implementing 456 Linux Syscalls on Bare Metal — Running Linux Binaries Without Linux">
+  <meta property="og:description" content="ClaudioOS runs Linux binaries without Linux. ELF loader, syscall dispatcher via SYSCALL/SYSRET MSRs, mmap, epoll, futex — all in Ring 0 Rust.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://claudioos.vercel.app/blog/linux-syscalls-on-bare-metal.html">
+  <meta property="og:image" content="https://claudioos.vercel.app/og-image.png">
+  <meta property="article:author" content="Matt Gates">
+  <meta property="article:published_time" content="2026-04-02">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Implementing 456 Linux Syscalls on Bare Metal">
+  <meta name="twitter:description" content="Running Linux binaries without Linux. 456 syscalls implemented in bare-metal Rust.">
+  <link rel="stylesheet" href="../style.css">
+  <style>
+    .blog-header {
+      padding: 56px 0 40px;
+      border-bottom: 1px solid var(--border);
+      background: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(0, 255, 65, 0.04), transparent);
+    }
+    .blog-header .back-link {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      margin-bottom: 24px;
+      display: block;
+    }
+    .blog-header h1 {
+      font-size: 2.2rem;
+      color: var(--accent);
+      margin-bottom: 16px;
+      letter-spacing: -1px;
+      line-height: 1.25;
+    }
+    .blog-meta {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+    }
+    .blog-meta strong { color: var(--text); }
+    .blog-body {
+      padding: 48px 0 64px;
+      max-width: 760px;
+      margin: 0 auto;
+    }
+    .blog-body h2 {
+      font-size: 1.4rem;
+      color: var(--accent);
+      margin-top: 48px;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .blog-body h3 {
+      font-size: 1.1rem;
+      color: var(--text);
+      margin-top: 32px;
+      margin-bottom: 12px;
+    }
+    .blog-body p {
+      font-size: 0.9rem;
+      color: var(--text-dim);
+      margin-bottom: 16px;
+      line-height: 1.8;
+    }
+    .blog-body p strong { color: var(--text); }
+    .blog-body p em { color: var(--text); font-style: italic; }
+    .blog-body ul, .blog-body ol {
+      margin-bottom: 16px;
+      padding-left: 24px;
+    }
+    .blog-body li {
+      font-size: 0.9rem;
+      color: var(--text-dim);
+      margin-bottom: 6px;
+      line-height: 1.7;
+    }
+    .blog-body blockquote {
+      border-left: 3px solid var(--accent);
+      background: var(--bg-surface);
+      padding: 16px 24px;
+      margin: 24px 0;
+      border-radius: 0 6px 6px 0;
+    }
+    .blog-body blockquote p {
+      color: var(--text);
+      margin-bottom: 0;
+      font-style: italic;
+    }
+    .blog-body pre {
+      margin: 20px 0;
+    }
+    .blog-body .highlight-box {
+      background: var(--bg-surface);
+      border: 1px solid var(--accent-dim);
+      border-radius: 6px;
+      padding: 20px 24px;
+      margin: 24px 0;
+    }
+    .blog-body .highlight-box p { margin-bottom: 0; }
+    .syscall-table {
+      width: 100%;
+      margin: 20px 0;
+    }
+    .syscall-table th {
+      text-align: left;
+      color: var(--accent);
+      font-size: 0.75rem;
+    }
+    .syscall-table td {
+      font-size: 0.82rem;
+    }
+    .syscall-table .count {
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .kw { color: var(--magenta); }
+    .fn { color: var(--cyan); }
+    .str { color: var(--yellow); }
+    .cmt { color: var(--text-dim); }
+    .mac { color: var(--orange); }
+    .num { color: var(--blue); }
+    .typ { color: var(--cyan); }
+  </style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-inner">
+    <a href="https://claudioos.vercel.app" class="nav-logo" style="text-decoration:none;">ClaudioOS</a>
+    <div class="nav-links">
+      <a href="https://claudioos.vercel.app">Home</a>
+      <a href="/blog" class="active">Blog</a>
+      <a href="https://claudioos.vercel.app/docs.html">Docs</a>
+      <a href="https://github.com/suhteevah/baremetal-claude" class="nav-github">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="blog-header">
+  <div class="container" style="max-width:760px;">
+    <a href="/blog" class="back-link">&larr; Back to Blog</a>
+    <h1>Implementing 456 Linux Syscalls on Bare Metal &mdash; Running Linux Binaries Without Linux</h1>
+    <div class="blog-meta">
+      <strong>Matt Gates</strong> &middot; April 2, 2026 &middot; 12 min read
+    </div>
+  </div>
+</header>
+
+<article class="blog-body container">
+
+  <p>
+    ClaudioOS doesn't have a Linux kernel. It doesn't have a POSIX layer. It's a bare-metal Rust
+    application that manages its own hardware. But it runs unmodified Linux ELF binaries -- including
+    compilers, interpreters, and command-line tools -- through a syscall translation layer that
+    operates entirely in Ring 0.
+  </p>
+  <p>
+    This is the story of how we implemented <strong>456 Linux syscalls</strong> on bare metal, and
+    what "Linux compatible" actually means when you're doing it yourself.
+  </p>
+
+  <h2>Why Linux Binary Compatibility?</h2>
+
+  <p>
+    When we built ClaudioOS as a purpose-built environment for AI coding agents, we faced a
+    practical problem: agents need tools. They need <code>git</code>, <code>cargo</code>,
+    <code>python3</code>, <code>gcc</code>, text processing utilities. We could rewrite all of
+    these from scratch (and we did write some -- a Python interpreter, a Rust compiler via Cranelift),
+    but <strong>running existing Linux binaries gives us the entire ecosystem for free.</strong>
+  </p>
+  <p>
+    The key insight: Linux binaries don't actually need Linux. They need the <em>syscall interface</em>
+    that Linux provides. If we implement that interface, the binaries don't know the difference.
+  </p>
+
+  <h2>The ELF Loader</h2>
+
+  <p>
+    Every Linux binary is an ELF (Executable and Linkable Format) file. Loading one means:
+  </p>
+  <ol>
+    <li>Parsing the ELF header to find program headers</li>
+    <li>Mapping each <code>PT_LOAD</code> segment into memory at the specified virtual address</li>
+    <li>Setting up the initial stack with <code>argc</code>, <code>argv</code>, <code>envp</code>, and the auxiliary vector</li>
+    <li>Handling the dynamic linker (<code>PT_INTERP</code>) for dynamically linked binaries</li>
+    <li>Jumping to the entry point</li>
+  </ol>
+  <p>
+    The auxiliary vector is the tricky part. The kernel passes information to the program through
+    <code>AT_*</code> entries on the stack: page size, UID, GID, hardware capabilities, the VDSO
+    address. Linux programs expect these to be there. Miss one and <code>glibc</code> will segfault
+    during initialization before <code>main()</code> ever runs.
+  </p>
+
+<pre><span class="cmt">// Setting up the initial stack for an ELF binary</span>
+<span class="kw">fn</span> <span class="fn">setup_stack</span>(
+    stack_top: <span class="typ">VirtAddr</span>,
+    args: &amp;[&amp;<span class="typ">str</span>],
+    env: &amp;[&amp;<span class="typ">str</span>],
+    auxv: &amp;[(<span class="typ">u64</span>, <span class="typ">u64</span>)],
+) -&gt; <span class="typ">VirtAddr</span> {
+    <span class="kw">let mut</span> sp = stack_top;
+
+    <span class="cmt">// Push strings (argv values, env values)</span>
+    <span class="kw">let</span> argv_ptrs = args.iter().map(|a| {
+        sp -= a.<span class="fn">len</span>() <span class="kw">as</span> <span class="typ">u64</span> + <span class="num">1</span>;
+        <span class="fn">copy_to_user</span>(sp, a.as_bytes());
+        <span class="fn">write_byte</span>(sp + a.<span class="fn">len</span>() <span class="kw">as</span> <span class="typ">u64</span>, <span class="num">0</span>); <span class="cmt">// null terminator</span>
+        sp
+    }).collect::&lt;<span class="typ">Vec</span>&lt;_&gt;&gt;();
+
+    <span class="cmt">// Align stack to 16 bytes</span>
+    sp = sp &amp; !<span class="num">0xF</span>;
+
+    <span class="cmt">// Push auxiliary vector (AT_NULL terminated)</span>
+    <span class="fn">push_u64</span>(&amp;<span class="kw">mut</span> sp, <span class="num">0</span>); <span class="cmt">// AT_NULL</span>
+    <span class="fn">push_u64</span>(&amp;<span class="kw">mut</span> sp, <span class="num">0</span>);
+    <span class="kw">for</span> &amp;(key, val) <span class="kw">in</span> auxv.iter().rev() {
+        <span class="fn">push_u64</span>(&amp;<span class="kw">mut</span> sp, val);
+        <span class="fn">push_u64</span>(&amp;<span class="kw">mut</span> sp, key);
+    }
+
+    <span class="cmt">// Push envp, argv, argc</span>
+    <span class="fn">push_u64</span>(&amp;<span class="kw">mut</span> sp, <span class="num">0</span>); <span class="cmt">// envp terminator</span>
+    <span class="cmt">// ... env pointers ...</span>
+    <span class="fn">push_u64</span>(&amp;<span class="kw">mut</span> sp, <span class="num">0</span>); <span class="cmt">// argv terminator</span>
+    <span class="kw">for</span> ptr <span class="kw">in</span> argv_ptrs.iter().rev() {
+        <span class="fn">push_u64</span>(&amp;<span class="kw">mut</span> sp, ptr.<span class="fn">as_u64</span>());
+    }
+    <span class="fn">push_u64</span>(&amp;<span class="kw">mut</span> sp, args.<span class="fn">len</span>() <span class="kw">as</span> <span class="typ">u64</span>); <span class="cmt">// argc</span>
+
+    sp
+}</pre>
+
+  <h2>The Syscall Dispatcher</h2>
+
+  <p>
+    On x86_64, Linux syscalls use the <code>SYSCALL</code> instruction. The kernel sets up Model
+    Specific Registers (MSRs) to define where the CPU jumps when <code>SYSCALL</code> executes:
+  </p>
+  <ul>
+    <li><code>IA32_LSTAR</code> (0xC0000082) -- the syscall entry point address</li>
+    <li><code>IA32_STAR</code> (0xC0000081) -- segment selectors for kernel/user mode</li>
+    <li><code>IA32_FMASK</code> (0xC0000084) -- RFLAGS bits to clear on entry</li>
+  </ul>
+  <p>
+    In a normal OS, <code>SYSCALL</code> switches from Ring 3 (user) to Ring 0 (kernel). But
+    ClaudioOS runs everything in Ring 0. There's no mode switch. The <code>SYSCALL</code> instruction
+    still fires, we still catch it, but <strong>we skip the entire privilege transition overhead.</strong>
+  </p>
+
+<pre><span class="cmt">// Syscall entry point -- called by the SYSCALL instruction</span>
+<span class="cmt">// rax = syscall number, rdi/rsi/rdx/r10/r8/r9 = args</span>
+#[naked]
+<span class="kw">unsafe extern</span> <span class="str">"C"</span> <span class="kw">fn</span> <span class="fn">syscall_entry</span>() {
+    asm!(
+        <span class="str">"swapgs"</span>,               <span class="cmt">// get kernel GS base</span>
+        <span class="str">"mov gs:[0x8], rsp"</span>,     <span class="cmt">// save user stack</span>
+        <span class="str">"mov rsp, gs:[0x0]"</span>,     <span class="cmt">// load kernel stack</span>
+        <span class="str">"push rcx"</span>,              <span class="cmt">// save return address</span>
+        <span class="str">"push r11"</span>,              <span class="cmt">// save RFLAGS</span>
+        <span class="str">"mov rcx, r10"</span>,          <span class="cmt">// Linux convention: arg4 in r10</span>
+        <span class="str">"call {dispatch}"</span>,
+        <span class="str">"pop r11"</span>,
+        <span class="str">"pop rcx"</span>,
+        <span class="str">"mov rsp, gs:[0x8]"</span>,     <span class="cmt">// restore user stack</span>
+        <span class="str">"swapgs"</span>,
+        <span class="str">"sysretq"</span>,
+        dispatch = sym <span class="fn">syscall_dispatch</span>,
+        options(noreturn),
+    );
+}</pre>
+
+  <h2>The Big Ones: What Actually Matters</h2>
+
+  <p>
+    Of 456 implemented syscalls, about 40 do the heavy lifting. The rest are either trivially stubbed
+    (return 0 or ENOSYS) or rare enough that a basic implementation suffices. Here's what consumed
+    80% of the effort:
+  </p>
+
+  <h3>Memory: mmap / mprotect / munmap / brk</h3>
+  <p>
+    <code>mmap</code> is the foundation. Every <code>malloc</code> eventually calls it. Every shared
+    library is loaded through it. Every file can be memory-mapped through it. Our implementation
+    supports <code>MAP_ANONYMOUS</code>, <code>MAP_PRIVATE</code>, <code>MAP_FIXED</code>, and
+    file-backed mappings. We manage a per-process virtual memory area (VMA) list that tracks
+    every mapping.
+  </p>
+
+  <h3>File I/O: open / read / write / close / stat / lseek</h3>
+  <p>
+    We maintain a virtual filesystem layer that maps paths to backends: our FAT32 partition for
+    persistent storage, a <code>procfs</code> for <code>/proc/self/</code> queries, a <code>devfs</code>
+    for <code>/dev/null</code> and <code>/dev/urandom</code>, and a <code>tmpfs</code> for scratch space.
+    File descriptors are integers indexing into a per-task table -- just like Linux.
+  </p>
+
+  <h3>Networking: socket / bind / connect / sendto / recvfrom / epoll</h3>
+  <p>
+    Network syscalls translate directly to our smoltcp stack. A <code>socket(AF_INET, SOCK_STREAM, 0)</code>
+    creates a smoltcp TCP socket. <code>connect()</code> initiates the three-way handshake.
+    <code>epoll</code> maps to our async executor's waker mechanism -- when the NIC interrupt fires
+    and smoltcp processes packets, we wake the corresponding futures.
+  </p>
+
+  <h3>Threading: clone / futex / set_tid_address</h3>
+  <p>
+    Threading was the most challenging. <code>clone</code> with <code>CLONE_THREAD</code> creates a
+    new async task that shares the memory space. <code>futex</code> is the building block for
+    mutexes, condition variables, and barriers in userspace. Our implementation handles
+    <code>FUTEX_WAIT</code>, <code>FUTEX_WAKE</code>, and <code>FUTEX_WAIT_BITSET</code> -- enough
+    for glibc's pthread implementation.
+  </p>
+
+  <table class="syscall-table">
+    <thead>
+      <tr>
+        <th>Category</th>
+        <th>Syscalls</th>
+        <th>Implementation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Memory management</td>
+        <td class="count">28</td>
+        <td>Full (mmap, mprotect, munmap, brk, mremap...)</td>
+      </tr>
+      <tr>
+        <td>File I/O</td>
+        <td class="count">67</td>
+        <td>Full (open, read, write, stat, ioctl, fcntl...)</td>
+      </tr>
+      <tr>
+        <td>Networking</td>
+        <td class="count">22</td>
+        <td>Full (socket, bind, connect, epoll, select...)</td>
+      </tr>
+      <tr>
+        <td>Process/Thread</td>
+        <td class="count">41</td>
+        <td>Full (clone, futex, wait4, execve, exit_group...)</td>
+      </tr>
+      <tr>
+        <td>Signals</td>
+        <td class="count">18</td>
+        <td>Partial (rt_sigaction, rt_sigprocmask, kill)</td>
+      </tr>
+      <tr>
+        <td>Time</td>
+        <td class="count">12</td>
+        <td>Full (clock_gettime, nanosleep, timer_create...)</td>
+      </tr>
+      <tr>
+        <td>Identity/Security</td>
+        <td class="count">34</td>
+        <td>Stubbed (getuid returns 0, everything is root)</td>
+      </tr>
+      <tr>
+        <td>Misc/Compat</td>
+        <td class="count">234</td>
+        <td>Stubbed or minimal (returns 0 or ENOSYS)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>What "Linux Compatible" Really Means</h2>
+
+  <p>
+    Let's be honest about what we do and don't support:
+  </p>
+  <p>
+    <strong>We support:</strong> Statically linked ELF binaries. Dynamically linked binaries with
+    a bundled <code>ld-linux.so</code>. Programs that use standard POSIX I/O, networking, threading,
+    and memory management. This covers most command-line tools, compilers, interpreters, and servers.
+  </p>
+  <p>
+    <strong>We don't support:</strong> Full signal semantics (signals are best-effort, not preemptive).
+    <code>ptrace</code> (no debugger support). <code>seccomp</code> (no sandboxing -- everything
+    is Ring 0 anyway). Complex <code>ioctl</code> operations on real devices. Anything that assumes
+    a specific Linux kernel version's ABI for obscure interfaces.
+  </p>
+  <p>
+    <strong>We deliberately skip:</strong> Process isolation. There's no Ring 3. No page table
+    switching between processes. Every "process" is a task in our async executor sharing one
+    address space. This is a feature, not a bug -- it means zero-cost "syscalls" for the hot
+    path.
+  </p>
+
+  <h2>Performance: The Ring 0 Advantage</h2>
+
+  <p>
+    On Linux, every syscall involves:
+  </p>
+  <ol>
+    <li>User code executes <code>SYSCALL</code></li>
+    <li>CPU switches to Ring 0, swaps stacks, saves state</li>
+    <li>Kernel validates arguments, checks permissions</li>
+    <li>Kernel does the actual work</li>
+    <li><code>SYSRET</code> switches back to Ring 3</li>
+  </ol>
+  <p>
+    On ClaudioOS, steps 2 and 5 are nearly free because we're already in Ring 0. Step 3 is
+    simplified because there are no permission boundaries to check. The <code>SYSCALL</code>
+    instruction still fires (we can't avoid that -- it's what the binary uses), but the overhead
+    is a function call, not a privilege transition.
+  </p>
+  <p>
+    For I/O-heavy workloads (compilers, file processing, network tools), this means measurably
+    less time spent in overhead. The CPU does work instead of switching contexts.
+  </p>
+
+  <div class="highlight-box">
+    <p>
+      <strong>The takeaway:</strong> You don't need Linux to run Linux binaries. You need the
+      interface -- the syscall numbers, the register conventions, the data structures. Implement
+      the interface, and the binaries can't tell the difference. They just run faster because
+      you threw away the parts that only exist for isolation you don't need.
+    </p>
+  </div>
+
+  <h2>What's Next</h2>
+
+  <p>
+    We're working on <code>execve</code> chaining (running programs that spawn other programs),
+    proper <code>/proc</code> filesystem emulation for tools that introspect the system, and
+    expanding our signal delivery to support <code>SIGCHLD</code> properly. The goal is to run
+    a full <code>cargo build</code> inside ClaudioOS by Q3 2026 -- a Rust compiler compiling
+    Rust, on an OS written in Rust, assisted by an AI that writes Rust.
+  </p>
+
+  <p style="margin-top:48px; padding-top:24px; border-top:1px solid var(--border); font-size:0.82rem; color:var(--text-dim);">
+    <strong style="color:var(--text);">Matt Gates</strong> builds ClaudioOS at Ridge Cell Repair LLC.
+    He thinks syscall tables are underrated reading material.
+    <br><br>
+    <a href="/blog">&larr; Back to Blog</a> &middot; <a href="https://claudioos.vercel.app">ClaudioOS Home</a> &middot; <a href="https://github.com/suhteevah/baremetal-claude">GitHub</a>
+  </p>
+
+</article>
+
+<footer>
+  <div class="footer-inner container">
+    <p><a href="https://claudioos.vercel.app">ClaudioOS</a> &mdash; Bare metal AI agent OS</p>
+    <p class="footer-sub">Built with Rust, Claude, and zero lines of C.</p>
+  </div>
+</footer>
+
+</body>
+</html>

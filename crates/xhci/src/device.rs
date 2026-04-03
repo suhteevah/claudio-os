@@ -532,15 +532,23 @@ impl ParsedConfiguration {
 ///
 /// # Safety
 /// Caller must ensure the buffer is not freed while DMA is in progress.
-pub unsafe fn alloc_dma_buffer(size: usize) -> (*mut u8, u64) {
+pub unsafe fn alloc_dma_buffer(size: usize) -> Option<(*mut u8, u64)> {
     let align = if size >= 4096 { 4096 } else { 64 };
-    let layout = Layout::from_size_align(size, align)
-        .expect("xhci: DMA buffer layout");
+    let layout = match Layout::from_size_align(size, align) {
+        Ok(l) => l,
+        Err(_) => {
+            log::error!("xhci: invalid DMA buffer layout ({} bytes, align {})", size, align);
+            return None;
+        }
+    };
     let ptr = alloc_zeroed(layout);
-    assert!(!ptr.is_null(), "xhci: DMA buffer allocation failed ({} bytes)", size);
+    if ptr.is_null() {
+        log::error!("xhci: DMA buffer allocation failed ({} bytes)", size);
+        return None;
+    }
     let phys = ptr as u64;
     log::trace!("xhci: DMA buffer allocated: {} bytes at {:#x}", size, phys);
-    (ptr, phys)
+    Some((ptr, phys))
 }
 
 /// Read bytes from a DMA buffer.

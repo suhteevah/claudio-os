@@ -48,6 +48,7 @@ mod usb;
 mod users;
 mod vconsole;
 mod clipboard;
+mod csprng;
 mod firewall;
 mod manpages;
 mod cron;
@@ -190,6 +191,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // ── Phase 3c: Real-Time Clock ────────────────────────────────────
     rtc::init();
+
+    // ── Phase 3c2: CSPRNG ────────────────────────────────────────────
+    // Initialize the cryptographically secure RNG (needs PIT + RTC for entropy).
+    csprng::init();
 
     // ── Phase 3d: ACPI table discovery ───────────────────────────────
     // Parse ACPI tables for hardware discovery: CPU cores (MADT), power

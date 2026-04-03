@@ -144,6 +144,66 @@ mod sha256 {
 }
 
 // ---------------------------------------------------------------------------
+// Hex encoding/decoding utilities
+// ---------------------------------------------------------------------------
+
+/// Convert a byte slice to a hex string.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    const HEX: [char; 16] = ['0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'];
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize]);
+        s.push(HEX[(b & 0xf) as usize]);
+    }
+    s
+}
+
+/// Decode a hex string to bytes. Returns None if the string is not valid hex.
+fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let chars: Vec<u8> = hex.bytes().collect();
+    for pair in chars.chunks_exact(2) {
+        let hi = hex_digit(pair[0])?;
+        let lo = hex_digit(pair[1])?;
+        bytes.push((hi << 4) | lo);
+    }
+    Some(bytes)
+}
+
+/// Parse a single hex digit.
+fn hex_digit(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Constant-time comparison (CRIT-04: timing-safe password verification)
+// ---------------------------------------------------------------------------
+
+/// Compare two byte slices in constant time to prevent timing attacks.
+///
+/// Returns `true` if and only if both slices have the same length and
+/// identical contents. The comparison always examines every byte in both
+/// slices, regardless of where (or whether) they differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ---------------------------------------------------------------------------
 // User struct
 // ---------------------------------------------------------------------------
 
@@ -152,8 +212,9 @@ mod sha256 {
 pub struct User {
     /// Login name.
     pub username: String,
-    /// SHA-256 hex digest of the password. Empty string means no password
-    /// (auto-login / password-less SSH).
+    /// Password hash. Stored as "salt_hex:hash_hex" where hash = SHA-256(salt || password).
+    /// Empty string means no password (auto-login / password-less SSH).
+    /// Legacy format (bare hex hash without ':') is accepted for backwards compatibility.
     pub password_hash: String,
     /// SSH authorized public keys (one per entry, OpenSSH format).
     pub authorized_keys: Vec<String>,
@@ -182,34 +243,69 @@ impl User {
         user
     }
 
-    /// Set the user's password (stores SHA-256 hash, never plaintext).
+    /// Set the user's password (stores salted SHA-256 hash, never plaintext).
+    ///
+    /// Format: "salt_hex:hash_hex" where hash = SHA-256(salt || password).
+    /// Salt is 16 bytes (32 hex chars) generated from the CSPRNG.
     pub fn set_password(&mut self, password: &str) {
-        let digest = sha256::hash(password.as_bytes());
-        self.password_hash = sha256::to_hex(&digest);
+        let mut salt = [0u8; 16];
+        crate::csprng::random_bytes(&mut salt);
+        let salt_hex = bytes_to_hex(&salt);
+
+        // hash = SHA-256(salt || password)
+        let mut salted = Vec::with_capacity(salt.len() + password.len());
+        salted.extend_from_slice(&salt);
+        salted.extend_from_slice(password.as_bytes());
+        let digest = sha256::hash(&salted);
+        let hash_hex = sha256::to_hex(&digest);
+
+        self.password_hash = alloc::format!("{}:{}", salt_hex, hash_hex);
     }
 
     /// Check if a password matches. Returns `true` if the user has no
     /// password (empty hash) or if the hash matches.
+    ///
+    /// Uses constant-time comparison to prevent timing attacks.
+    /// Supports both new salted format ("salt:hash") and legacy bare hash.
     pub fn check_password(&self, password: &str) -> bool {
         if self.password_hash.is_empty() {
             // No password set — always matches (auto-login).
             return true;
         }
+
+        if let Some((salt_hex, stored_hash)) = self.password_hash.split_once(':') {
+            // New salted format: salt_hex:hash_hex
+            // Reconstruct: SHA-256(salt_bytes || password)
+            if let Some(salt_bytes) = hex_to_bytes(salt_hex) {
+                let mut salted = Vec::with_capacity(salt_bytes.len() + password.len());
+                salted.extend_from_slice(&salt_bytes);
+                salted.extend_from_slice(password.as_bytes());
+                let digest = sha256::hash(&salted);
+                let computed = sha256::to_hex(&digest);
+                return constant_time_eq(computed.as_bytes(), stored_hash.as_bytes());
+            }
+        }
+
+        // Legacy format: bare SHA-256 hex (no salt) — constant-time compare
         let digest = sha256::hash(password.as_bytes());
         let hex = sha256::to_hex(&digest);
-        hex == self.password_hash
+        constant_time_eq(hex.as_bytes(), self.password_hash.as_bytes())
     }
 
     /// Check if a public key is in this user's authorized_keys.
+    ///
+    /// Uses constant-time comparison to prevent timing attacks on key matching.
     pub fn check_public_key(&self, key: &str) -> bool {
-        // Compare the key data portion (skip key type prefix for flexibility).
-        // In practice, compare the full "ssh-rsa AAAA..." or "ssh-ed25519 AAAA..." string.
+        let key_trimmed = key.trim();
+        let key_bytes = key_trimmed.as_bytes();
+        // Iterate all keys to avoid leaking which position matched
+        let mut found = false;
         for ak in &self.authorized_keys {
-            if ak.trim() == key.trim() {
-                return true;
+            if constant_time_eq(ak.trim().as_bytes(), key_bytes) {
+                found = true;
             }
         }
-        false
+        found
     }
 }
 
@@ -315,7 +411,7 @@ impl UserDatabase {
     pub fn authenticate(&self, username: &str, password: &str) -> bool {
         match self.lookup(username) {
             Some(user) => {
-                if user.password_hash == "!" {
+                if constant_time_eq(user.password_hash.as_bytes(), b"!") {
                     log::warn!("[users] login denied: account '{}' is locked", username);
                     return false;
                 }
@@ -338,7 +434,7 @@ impl UserDatabase {
     pub fn authenticate_pubkey(&self, username: &str, key: &str) -> bool {
         match self.lookup(username) {
             Some(user) => {
-                if user.password_hash == "!" {
+                if constant_time_eq(user.password_hash.as_bytes(), b"!") {
                     log::warn!("[users] pubkey denied: account '{}' is locked", username);
                     return false;
                 }
