@@ -62,7 +62,7 @@ impl SizeKind {
 /// Tokenize assembly source into a list of tokens.
 pub fn tokenize(source: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
-    let mut chars: &[u8] = source.as_bytes();
+    let chars: &[u8] = source.as_bytes();
     let mut i = 0;
 
     while i < chars.len() {

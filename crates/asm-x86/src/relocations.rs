@@ -5,7 +5,6 @@
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::vec::Vec;
 
 /// A fixup to be applied after all labels are known.
 #[derive(Debug, Clone)]

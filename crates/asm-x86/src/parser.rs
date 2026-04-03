@@ -1,5 +1,6 @@
 //! Parse assembly tokens into structured instructions.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use crate::lexer::{Token, SizeKind};
@@ -408,7 +409,7 @@ pub fn parse(tokens: &[Token]) -> Result<AsmProgram, String> {
                 }
                 "global" => {
                     i += 1;
-                    if let Some(Token::Ident(ref name)) = tokens.get(i) {
+                    if let Some(Token::Ident(name)) = tokens.get(i) {
                         stmts.push(Statement::Directive(Directive::Global(name.clone())));
                         i += 1;
                     }
@@ -416,7 +417,7 @@ pub fn parse(tokens: &[Token]) -> Result<AsmProgram, String> {
                 }
                 "extern" => {
                     i += 1;
-                    if let Some(Token::Ident(ref name)) = tokens.get(i) {
+                    if let Some(Token::Ident(name)) = tokens.get(i) {
                         stmts.push(Statement::Directive(Directive::Extern(name.clone())));
                         i += 1;
                     }
@@ -435,7 +436,7 @@ pub fn parse(tokens: &[Token]) -> Result<AsmProgram, String> {
                     if i < tokens.len() && tokens[i] == Token::Dot {
                         i += 1;
                     }
-                    if let Some(Token::Ident(ref name)) = tokens.get(i) {
+                    if let Some(Token::Ident(name)) = tokens.get(i) {
                         let lower_name: String = name.chars().map(|c| c.to_ascii_lowercase()).collect();
                         stmts.push(Statement::Directive(Directive::Section(lower_name)));
                         i += 1;
@@ -589,7 +590,7 @@ fn parse_operand(tokens: &[Token]) -> Result<(Operand, usize), String> {
     }
 
     // Register
-    if let Some(Token::Ident(ref name)) = tokens.get(i) {
+    if let Some(Token::Ident(name)) = tokens.get(i) {
         if let Some(reg) = parse_register(name) {
             return Ok((Operand::Register(reg), i + 1));
         }

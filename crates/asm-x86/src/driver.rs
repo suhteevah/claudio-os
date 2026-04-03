@@ -185,20 +185,22 @@ pub unsafe fn execute(program: &AssembledProgram) -> i64 {
 
     // Allocate executable memory (on bare metal, heap is executable)
     let mut code_mem = vec![0u8; program.code.len()];
-    core::ptr::copy_nonoverlapping(
-        program.code.as_ptr(),
-        code_mem.as_mut_ptr(),
-        program.code.len(),
-    );
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            program.code.as_ptr(),
+            code_mem.as_mut_ptr(),
+            program.code.len(),
+        );
+    }
 
     let base = code_mem.as_ptr();
-    let entry = base.add(program.entry_offset);
+    let entry = unsafe { base.add(program.entry_offset) };
 
     // Leak so it doesn't get freed while executing
     core::mem::forget(code_mem);
 
     // Call as fn() -> i64 (System V: return value in RAX)
-    let func: fn() -> i64 = core::mem::transmute(entry);
+    let func: fn() -> i64 = unsafe { core::mem::transmute(entry) };
     func()
 }
 

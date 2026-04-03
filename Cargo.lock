@@ -237,6 +237,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "claudio-asm-x86"
+version = "0.1.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "claudio-auth"
 version = "0.1.0"
 dependencies = [
@@ -258,6 +265,16 @@ name = "claudio-btrfs"
 version = "0.1.0"
 dependencies = [
  "log",
+]
+
+[[package]]
+name = "claudio-cc-lite"
+version = "0.1.0"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "log",
+ "spin",
 ]
 
 [[package]]
@@ -376,9 +393,11 @@ dependencies = [
  "claudio-agent",
  "claudio-ahci",
  "claudio-api",
+ "claudio-asm-x86",
  "claudio-auth",
  "claudio-bluetooth",
  "claudio-btrfs",
+ "claudio-cc-lite",
  "claudio-dotnet-clr",
  "claudio-dxvk-bridge",
  "claudio-elf-loader",

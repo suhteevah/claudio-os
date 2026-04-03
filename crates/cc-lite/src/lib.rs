@@ -6,6 +6,7 @@
 //! This is ClaudioOS's answer to HolyC.
 
 #![no_std]
+#![allow(unused_variables, unused_assignments)]
 extern crate alloc;
 
 pub mod lexer;

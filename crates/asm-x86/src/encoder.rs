@@ -1,6 +1,7 @@
 //! x86_64 instruction encoding: REX prefix, ModR/M, SIB, displacement, immediate.
 
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::parser::{Instruction, MemOperand, Operand, RegKind, RegSize, Register};

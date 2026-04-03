@@ -51,3 +51,5 @@ claudio-win32 = { path = "../crates/win32" }
 claudio-dxvk-bridge = { path = "../crates/dxvk-bridge" }
 claudio-dotnet-clr = { path = "../crates/dotnet-clr" }
 claudio-winrt = { path = "../crates/winrt" }
+claudio-cc-lite = { path = "../crates/cc-lite" }
+claudio-asm-x86 = { path = "../crates/asm-x86" }
