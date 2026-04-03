@@ -6,7 +6,7 @@
 
 ## Summary
 
-We successfully ported Cranelift to run on a bare-metal `#![no_std]` OS ([ClaudioOS](https://github.com/suhteevah/baremetal-claude)) and achieved JIT compilation on bare metal — `add(3, 4) = 7` from Cranelift-generated x86_64 machine code with no OS, no POSIX, no libc.
+We successfully ported Cranelift to run on a bare-metal `#![no_std]` OS ([ClaudioOS](https://github.com/suhteevah/claudio-os)) and achieved JIT compilation on bare metal — `add(3, 4) = 7` from Cranelift-generated x86_64 machine code with no OS, no POSIX, no libc.
 
 This required forking **6 crates** and patching **200+ files** to remove `std` dependencies. We believe Cranelift is an ideal JIT backend for embedded/bare-metal/unikernel targets and would benefit from official `no_std` support.
 
@@ -40,7 +40,7 @@ The entire crate graph needs `no_std` propagation.
 
 ## Proof of concept
 
-Our implementation: https://github.com/suhteevah/baremetal-claude
+Our implementation: https://github.com/suhteevah/claudio-os
 
 Key crates:
 - `crates/cranelift-codegen-nostd/` — forked cranelift-codegen with no_std patches

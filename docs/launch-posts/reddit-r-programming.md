@@ -64,8 +64,8 @@ A significant portion of this OS was built with the help of Claude itself. An AI
 
 ## Links
 
-- **GitHub**: https://github.com/suhteevah/baremetal-claude
+- **GitHub**: https://github.com/suhteevah/claudio-os
 - **Website**: https://claudioos.vercel.app
-- **29 standalone no_std crates**: https://github.com/suhteevah/baremetal-claude/blob/main/docs/OPEN-SOURCE-CRATES.md
+- **29 standalone no_std crates**: https://github.com/suhteevah/claudio-os/blob/main/docs/OPEN-SOURCE-CRATES.md
 
 Happy to answer questions about any layer of the stack.

@@ -90,8 +90,8 @@ The ELF loader (1,213 lines) handles ELF64 parsing, section/segment mapping, rel
 
 ## Links
 
-- **GitHub**: https://github.com/suhteevah/baremetal-claude
+- **GitHub**: https://github.com/suhteevah/claudio-os
 - **Website**: https://claudioos.vercel.app
-- **Architecture diagram**: https://github.com/suhteevah/baremetal-claude/blob/main/docs/ARCHITECTURE.md
+- **Architecture diagram**: https://github.com/suhteevah/claudio-os/blob/main/docs/ARCHITECTURE.md
 
 Would love to hear from other osdev folks about the approach. Especially interested in feedback on the Linux compat strategy and whether the ELF loader + syscall shim approach is viable for real-world binaries.

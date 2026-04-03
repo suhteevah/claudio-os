@@ -199,6 +199,6 @@ The `no_std` crates are NEW, extracted from wraith's existing code but stripped 
 
 ## Contact
 
-- **ClaudioOS repo**: https://github.com/suhteevah/baremetal-claude
+- **ClaudioOS repo**: https://github.com/suhteevah/claudio-os
 - **Owner**: Matt Gates (suhteevah) — Ridge Cell Repair LLC
 - **Wraith repo**: https://github.com/suhteevah/wraith-browser

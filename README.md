@@ -11,7 +11,7 @@ independent Claude agent session with tool use (text editor, Python interpreter,
 compiler, JavaScript evaluator). The entire stack -- from hardware interrupts to TLS 1.3
 handshakes to SSE streaming -- is a single-address-space async Rust application.
 
-**GitHub**: [suhteevah/baremetal-claude](https://github.com/suhteevah/baremetal-claude)
+**GitHub**: [suhteevah/claudio-os](https://github.com/suhteevah/claudio-os)
 **Site**: [claudioos.vercel.app](https://claudioos.vercel.app)
 **License**: AGPL-3.0-or-later ([Ridge Cell Repair LLC](https://github.com/suhteevah))
 

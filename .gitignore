@@ -36,3 +36,12 @@ lpt7
 lpt8
 lpt9
 tools/__pycache__/
+
+# Session/credentials (NEVER commit)
+target/session.txt
+target/credentials.img
+*.key
+*.pem
+
+# Build artifacts that shouldn't be tracked
+target/

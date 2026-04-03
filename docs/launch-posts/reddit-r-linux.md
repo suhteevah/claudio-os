@@ -57,9 +57,9 @@ Plus ~80 additional stubs that return success or ENOSYS for things like mlock, p
 
 ## Links
 
-- **GitHub**: https://github.com/suhteevah/baremetal-claude
+- **GitHub**: https://github.com/suhteevah/claudio-os
 - **Website**: https://claudioos.vercel.app
-- **Linux compat source**: https://github.com/suhteevah/baremetal-claude/tree/main/crates/linux-compat
-- **ELF loader source**: https://github.com/suhteevah/baremetal-claude/tree/main/crates/elf-loader
+- **Linux compat source**: https://github.com/suhteevah/claudio-os/tree/main/crates/linux-compat
+- **ELF loader source**: https://github.com/suhteevah/claudio-os/tree/main/crates/elf-loader
 
 I would be curious to hear from Linux kernel developers about how accurate or misguided my syscall implementations are. Also happy to discuss the design tradeoffs of the compatibility approach vs. just porting software natively.

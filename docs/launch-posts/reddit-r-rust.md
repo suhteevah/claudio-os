@@ -54,9 +54,9 @@ Getting Cranelift to compile under `no_std` required forking 6 crates (cranelift
 
 ## Links
 
-- **GitHub**: https://github.com/suhteevah/baremetal-claude
+- **GitHub**: https://github.com/suhteevah/claudio-os
 - **Website**: https://claudioos.vercel.app
-- **Crate catalog**: https://github.com/suhteevah/baremetal-claude/blob/main/docs/OPEN-SOURCE-CRATES.md
-- **Architecture**: https://github.com/suhteevah/baremetal-claude/blob/main/docs/ARCHITECTURE.md
+- **Crate catalog**: https://github.com/suhteevah/claudio-os/blob/main/docs/OPEN-SOURCE-CRATES.md
+- **Architecture**: https://github.com/suhteevah/claudio-os/blob/main/docs/ARCHITECTURE.md
 
 Happy to answer any questions about the architecture, specific crate implementations, or `no_std` war stories. This has been the most rewarding Rust project I have ever worked on.

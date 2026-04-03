@@ -90,8 +90,8 @@ Agents run a tool loop: send a message, Claude responds with tool calls, the OS 
 
 ## Links
 
-- **GitHub**: https://github.com/suhteevah/baremetal-claude
+- **GitHub**: https://github.com/suhteevah/claudio-os
 - **Website**: https://claudioos.vercel.app
-- **Getting started**: https://github.com/suhteevah/baremetal-claude/blob/main/docs/building.md
+- **Getting started**: https://github.com/suhteevah/claudio-os/blob/main/docs/building.md
 
 Happy to answer questions about the setup, hardware compatibility, or anything else. If you have a spare machine gathering dust and an Anthropic API key, this might be a fun weekend project.

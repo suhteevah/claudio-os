@@ -2,7 +2,7 @@
 
 **Project**: ClaudioOS — Bare-metal Rust OS for AI agent workloads
 **Owner**: Matt Gates (suhteevah), Ridge Cell Repair LLC
-**Repository**: github.com/suhteevah/baremetal-claude
+**Repository**: github.com/suhteevah/claudio-os
 **Website**: claudioos.vercel.app
 **Date**: April 2026
 

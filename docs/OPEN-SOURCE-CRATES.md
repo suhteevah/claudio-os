@@ -4,7 +4,7 @@ ClaudioOS has 52 workspace crates across 35 published GitHub repos. Each crate i
 `#![no_std]` and can be used independently of ClaudioOS in any bare-metal or
 embedded Rust project.
 
-**Repository**: [github.com/suhteevah/baremetal-claude](https://github.com/suhteevah/baremetal-claude)
+**Repository**: [github.com/suhteevah/claudio-os](https://github.com/suhteevah/claudio-os)
 
 ---
 
@@ -97,7 +97,7 @@ All crates are designed for `#![no_std]` environments. Add them to your `Cargo.t
 ```toml
 [dependencies]
 # Example: using the ext4 filesystem crate
-ext4-rw = { git = "https://github.com/suhteevah/baremetal-claude", path = "crates/ext4" }
+ext4-rw = { git = "https://github.com/suhteevah/claudio-os", path = "crates/ext4" }
 ```
 
 Or if published to crates.io:

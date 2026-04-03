@@ -89,9 +89,9 @@ Beyond the GPU/inference angle, ClaudioOS is a complete bare-metal OS:
 
 ## Links
 
-- **GitHub**: https://github.com/suhteevah/baremetal-claude
+- **GitHub**: https://github.com/suhteevah/claudio-os
 - **Website**: https://claudioos.vercel.app
-- **GPU crate source**: https://github.com/suhteevah/baremetal-claude/tree/main/crates/gpu
-- **All 29 standalone crates**: https://github.com/suhteevah/baremetal-claude/blob/main/docs/OPEN-SOURCE-CRATES.md
+- **GPU crate source**: https://github.com/suhteevah/claudio-os/tree/main/crates/gpu
+- **All 29 standalone crates**: https://github.com/suhteevah/claudio-os/blob/main/docs/OPEN-SOURCE-CRATES.md
 
 I am not going to pretend local inference is right around the corner. The GPU driver is the hardest unsolved problem in this project. But the architecture is designed for it, and I think a bare-metal inference engine is an interesting enough goal to be worth pursuing. Would love to hear from anyone who has worked with nouveau or bare-metal GPU programming.

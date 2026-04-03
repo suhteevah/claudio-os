@@ -37,10 +37,10 @@
 
 **Links:**
 
-- GitHub: https://github.com/suhteevah/baremetal-claude
+- GitHub: https://github.com/suhteevah/claudio-os
 - Website: https://claudioos.vercel.app
-- Architecture doc: https://github.com/suhteevah/baremetal-claude/blob/main/docs/ARCHITECTURE.md
-- Open-source crates list: https://github.com/suhteevah/baremetal-claude/blob/main/docs/OPEN-SOURCE-CRATES.md
+- Architecture doc: https://github.com/suhteevah/claudio-os/blob/main/docs/ARCHITECTURE.md
+- Open-source crates list: https://github.com/suhteevah/claudio-os/blob/main/docs/OPEN-SOURCE-CRATES.md
 
 **The "built with Claude" angle:**
 
