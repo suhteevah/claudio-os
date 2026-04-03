@@ -14,8 +14,10 @@ extern crate alloc;
 
 mod acpi_init;
 mod agent_loop;
+mod conversations;
 mod dashboard;
 mod executor;
+mod filemanager;
 mod framebuffer;
 mod gdt;
 mod init;
@@ -33,8 +35,12 @@ mod ssh_server;
 mod sysmon;
 mod terminal;
 mod boot_sound;
+mod browser;
 mod mouse;
+mod screensaver;
 mod splash;
+mod themes;
+mod session_manager;
 mod usb;
 mod users;
 
@@ -1021,6 +1027,13 @@ async fn main_async() {
                                 });
                             }
                             log::info!("[claude.ai] auth mode set — launching dashboard");
+
+                            // Initialize session manager for automatic token refresh.
+                            session_manager::init(
+                                alloc::string::String::from(session_cookie),
+                                alloc::string::String::from(org_id),
+                                conv_id.clone(),
+                            );
 
                             // Register compile handler
                             unsafe {

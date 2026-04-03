@@ -33,7 +33,7 @@ use claudio_net::NetworkStack;
 use crate::keyboard;
 
 /// RNG seed counter — each TLS connection needs a unique seed.
-static RNG_SEED: AtomicU64 = AtomicU64::new(1);
+pub(crate) static RNG_SEED: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum number of consecutive tool-use rounds before we force-stop.
 /// Prevents runaway loops if the model keeps requesting tools.
@@ -511,7 +511,7 @@ pub enum AuthMode {
 }
 
 /// Global auth mode — set during init, read during agent loops.
-static mut AUTH_MODE: Option<AuthMode> = None;
+pub(crate) static mut AUTH_MODE: Option<AuthMode> = None;
 
 /// Set the authentication mode. Call once during boot.
 ///

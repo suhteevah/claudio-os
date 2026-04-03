@@ -362,6 +362,7 @@ dependencies = [
  "spin",
  "vte",
  "wraith-dom",
+ "wraith-render",
  "x86_64",
 ]
 

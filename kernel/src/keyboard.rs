@@ -72,6 +72,37 @@ impl ScancodeStream {
     pub async fn next_key(&self) -> DecodedKey {
         NextKey.await
     }
+
+    /// Non-blocking check for the next decoded keypress.
+    ///
+    /// Drains available scancodes through the decoder. Returns `Some(key)` if
+    /// a full key event is available, `None` if the queue is empty or only
+    /// contains partial/modifier scancodes.
+    pub fn try_next_key(&self) -> Option<DecodedKey> {
+        loop {
+            let scancode = x86_64::instructions::interrupts::without_interrupts(|| {
+                SCANCODE_QUEUE.lock().pop_front()
+            });
+            match scancode {
+                Some(code) => {
+                    let decoded = x86_64::instructions::interrupts::without_interrupts(|| {
+                        let mut decoder = KEYBOARD_DECODER.lock();
+                        let decoder = decoder.as_mut()?;
+                        if let Ok(Some(key_event)) = decoder.add_byte(code) {
+                            decoder.process_keyevent(key_event)
+                        } else {
+                            None
+                        }
+                    });
+                    if decoded.is_some() {
+                        return decoded;
+                    }
+                    // Keep draining — might be a modifier scancode
+                }
+                None => return None,
+            }
+        }
+    }
 }
 
 /// Future that resolves to the next [`DecodedKey`] from the scancode queue.

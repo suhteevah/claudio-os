@@ -35,13 +35,14 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use pc_keyboard::DecodedKey;
+use pc_keyboard::{DecodedKey, KeyCode};
 
 use claudio_agent::{AgentState, Dashboard};
 use claudio_net::{Instant, NetworkStack};
 use claudio_shell::{Shell, Vfs, SystemInfo};
 use claudio_terminal::{Layout, SplitDirection, FONT_HEIGHT};
 
+use crate::filemanager::{self, FileManagerState, FileManagerAction};
 use crate::ipc;
 use crate::keyboard::ScancodeStream;
 
@@ -144,6 +145,10 @@ enum PaneType {
     Shell(ShellPaneState),
     /// System monitor pane. The usize is the layout pane id.
     SysMonitor(usize),
+    /// Text-mode web browser pane.
+    Browser(crate::browser::BrowserState),
+    /// Visual file manager pane.
+    FileManager(FileManagerState),
 }
 
 /// State for a shell pane. Wraps `claudio_shell::Shell` and adapts it to the
@@ -418,6 +423,7 @@ pub async fn run_dashboard(
     let mut input_buffers: Vec<InputBuffer> = Vec::new();
     let mut next_shell_id: usize = 0;
     let mut vfs = StubVfs;
+    let mut screensaver = crate::screensaver::ScreensaverState::new();
 
     // Create the first pane as a shell session.
     let first_pane_id = layout.focused_pane_id();
@@ -437,7 +443,7 @@ pub async fn run_dashboard(
         pane.write_str("  \x1b[32mPhase 3\x1b[0m: TLS + API .................... \x1b[92mOK\x1b[0m\r\n");
         pane.write_str("  \x1b[32mPhase 4\x1b[0m: Multi-agent dashboard ........ \x1b[92mOK\x1b[0m\r\n");
         pane.write_str("\r\n");
-        pane.write_str("\x1b[90mCtrl+B then \" = split | n/p = focus | c = new agent | s = new shell | x = close | , = rename\x1b[0m\r\n");
+        pane.write_str("\x1b[90mCtrl+B then \" = split | n/p = focus | c = new agent | s = new shell | f = files | w = browser | x = close\x1b[0m\r\n");
         pane.write_str("\x1b[90mIPC: /msg <agent> <text> | /broadcast <text> | /inbox | /agents | /channel create|read|write\x1b[0m\r\n");
         pane.write_str("\x1b[90mType commands or natural language. Type 'help' for builtins.\x1b[0m\r\n");
         pane.write_str("\r\n");
@@ -454,7 +460,23 @@ pub async fn run_dashboard(
     let mut last_sysmon_tick: u64 = crate::interrupts::tick_count();
 
     loop {
+        // -- Screensaver: idle check + animation loop --
+        if screensaver.active {
+            if let Some(_key) = stream.try_next_key() {
+                screensaver.record_input();
+                render_full(&mut layout);
+                continue;
+            }
+            screensaver.render_frame();
+            crate::executor::yield_now().await;
+            continue;
+        }
+        if screensaver.check_idle() {
+            continue;
+        }
+
         let key = stream.next_key().await;
+        screensaver.record_input();
 
         match key {
             DecodedKey::Unicode(c) => {
@@ -486,6 +508,39 @@ pub async fn run_dashboard(
 
                         let focused_pane_id = layout.focused_pane_id();
 
+                        // Browser pane — route all keys to the browser.
+                        let is_browser = pane_types.iter().any(|pt| {
+                            matches!(pt, PaneType::Browser(bs) if bs.pane_id == focused_pane_id)
+                        });
+                        if is_browser {
+                            handle_browser_char(
+                                c,
+                                &mut layout,
+                                &mut pane_types,
+                                stack,
+                                now,
+                                focused_pane_id,
+                            );
+                            render_dirty(&mut layout);
+                            continue;
+                        }
+
+                        // File manager pane -- route all keys to the file manager.
+                        let is_fm = pane_types.iter().any(|pt| {
+                            matches!(pt, PaneType::FileManager(fm) if fm.pane_id == focused_pane_id)
+                        });
+                        if is_fm {
+                            handle_filemanager_char(
+                                c,
+                                &mut layout,
+                                &mut pane_types,
+                                &mut vfs,
+                                focused_pane_id,
+                            );
+                            render_dirty(&mut layout);
+                            continue;
+                        }
+
                         // Enter key — submit input.
                         if c == '\n' || c == '\r' {
                             submit_input_for_focused(
@@ -497,6 +552,7 @@ pub async fn run_dashboard(
                                 stack,
                                 api_key,
                                 now,
+                                &mut screensaver,
                             ).await;
                         } else if c == '\x08' || c == '\x7f' {
                             // Backspace / DEL — remove last character from input buffer.
@@ -518,8 +574,35 @@ pub async fn run_dashboard(
                     prefix_state = PrefixState::Normal;
                     log::debug!("[dashboard] prefix cancelled by raw key: {:?}", k);
                 }
-                // Raw keys (arrows, function keys, etc.) are logged but not routed yet.
-                log::trace!("[dashboard] raw key: {:?}", k);
+                // Route raw keys to browser if focused.
+                let focused_pane_id = layout.focused_pane_id();
+                let is_browser = pane_types.iter().any(|pt| {
+                    matches!(pt, PaneType::Browser(bs) if bs.pane_id == focused_pane_id)
+                });
+                if is_browser {
+                    handle_browser_rawkey(
+                        k,
+                        &mut layout,
+                        &mut pane_types,
+                        focused_pane_id,
+                    );
+                } else {
+                    // File manager pane -- route raw keys.
+                    let is_fm = pane_types.iter().any(|pt| {
+                        matches!(pt, PaneType::FileManager(fm) if fm.pane_id == focused_pane_id)
+                    });
+                    if is_fm {
+                        handle_filemanager_rawkey(
+                            k,
+                            &mut layout,
+                            &mut pane_types,
+                            &mut vfs,
+                            focused_pane_id,
+                        );
+                    } else {
+                        log::trace!("[dashboard] raw key: {:?}", k);
+                    }
+                }
             }
         }
 
@@ -671,6 +754,8 @@ fn handle_prefix_command(
                 }
                 PaneType::Shell(ss) => ss.pane_id == focused_pane_id,
                 PaneType::SysMonitor(pid) => *pid == focused_pane_id,
+                PaneType::Browser(bs) => bs.pane_id == focused_pane_id,
+                PaneType::FileManager(fm) => fm.pane_id == focused_pane_id,
             }) {
                 if let PaneType::Agent(aid) = &pane_types[idx] {
                     let aid = *aid;
@@ -702,6 +787,23 @@ fn handle_prefix_command(
             if let Some(pane) = layout.pane_by_id_mut(new_pane_id) {
                 pane.write_str(&rendered);
             }
+        }
+
+        // File manager: Ctrl+B then f
+        'f' => {
+            log::info!("[dashboard] new file manager pane (split horizontal)");
+            layout.split(SplitDirection::Horizontal);
+            let new_pane_id = layout.focused_pane_id();
+            let fm_state = FileManagerState::new(new_pane_id);
+            // Render initial content into the pane.
+            if let Some(pane) = layout.pane_by_id_mut(new_pane_id) {
+                let cols = pane.cols();
+                let rows = pane.rows();
+                let rendered = filemanager::render_to_pane(&fm_state, cols, rows);
+                pane.write_str(&rendered);
+            }
+            pane_types.push(PaneType::FileManager(fm_state));
+            input_buffers.push(InputBuffer::new(new_pane_id));
         }
 
         // Rename focused agent: Ctrl+B then ,
@@ -767,6 +869,7 @@ async fn submit_input_for_focused(
     stack: &mut NetworkStack,
     api_key: &str,
     now: fn() -> Instant,
+    screensaver: &mut crate::screensaver::ScreensaverState,
 ) {
     let focused_pane_id = layout.focused_pane_id();
 
@@ -787,6 +890,8 @@ async fn submit_input_for_focused(
         }
         PaneType::Shell(ss) => ss.pane_id == focused_pane_id,
         PaneType::SysMonitor(pid) => *pid == focused_pane_id,
+        PaneType::Browser(bs) => bs.pane_id == focused_pane_id,
+        PaneType::FileManager(fm) => fm.pane_id == focused_pane_id,
     });
 
     let pane_type_idx = match pane_type_idx {
@@ -797,8 +902,8 @@ async fn submit_input_for_focused(
         }
     };
 
-    // SysMonitor panes don't accept text input — ignore Enter.
-    if matches!(&pane_types[pane_type_idx], PaneType::SysMonitor(_)) {
+    // SysMonitor, Browser, and FileManager panes don't accept text input — ignore Enter.
+    if matches!(&pane_types[pane_type_idx], PaneType::SysMonitor(_) | PaneType::Browser(_) | PaneType::FileManager(_)) {
         return;
     }
 
@@ -820,6 +925,22 @@ async fn submit_input_for_focused(
             layout, dashboard, agent_id, focused_pane_id, input_text, stack, api_key, now,
         ).await;
     } else {
+        // Intercept `screensaver` shell command.
+        let trimmed_ss = input_text.trim();
+        if trimmed_ss == "screensaver" || trimmed_ss.starts_with("screensaver ") {
+            let ss_args = trimmed_ss.strip_prefix("screensaver").unwrap_or("").trim();
+            if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                pane.write_str(&format!("\r\n\x1b[32m$ {}\x1b[0m\r\n", trimmed_ss));
+            }
+            let ss_output = crate::screensaver::handle_command(screensaver, ss_args);
+            if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                let terminal_output = ss_output.replace('\n', "\r\n");
+                pane.write_str(&terminal_output);
+                pane.write_str("\r\n");
+            }
+            return;
+        }
+
         submit_shell_input(
             layout, dashboard, pane_types, pane_type_idx, focused_pane_id, input_text, vfs,
         );
@@ -1245,10 +1366,12 @@ fn render_prompt_for_pane(
         }
         PaneType::Shell(ss) => ss.pane_id == pane_id,
         PaneType::SysMonitor(pid) => *pid == pane_id,
+        PaneType::Browser(bs) => bs.pane_id == pane_id,
+        PaneType::FileManager(fm) => fm.pane_id == pane_id,
     });
 
-    // SysMonitor panes don't show a prompt -- skip.
-    if matches!(pane_type, Some(PaneType::SysMonitor(_))) {
+    // SysMonitor, Browser, and FileManager panes don't show a standard prompt -- skip.
+    if matches!(pane_type, Some(PaneType::SysMonitor(_) | PaneType::Browser(_) | PaneType::FileManager(_))) {
         return;
     }
 
@@ -1271,7 +1394,7 @@ fn render_prompt_for_pane(
         Some(PaneType::Shell(_ss)) => {
             ("shell", "", "$")
         }
-        Some(PaneType::SysMonitor(_)) => unreachable!(),
+        Some(PaneType::SysMonitor(_)) | Some(PaneType::Browser(_)) | Some(PaneType::FileManager(_)) => unreachable!(),
         None => ("???", "", ">"),
     };
 
@@ -1366,4 +1489,176 @@ fn render_full(layout: &mut Layout) {
     });
     crate::framebuffer::blit_full();
     log::debug!("[dashboard] full render completed");
+}
+
+// ---------------------------------------------------------------------------
+// Browser pane keyboard handlers
+// ---------------------------------------------------------------------------
+
+/// Handle a character key in the focused browser pane.
+fn handle_browser_char(
+    c: char,
+    layout: &mut Layout,
+    pane_types: &mut Vec<PaneType>,
+    stack: &mut NetworkStack,
+    now: fn() -> Instant,
+    focused_pane_id: usize,
+) {
+    let browser_idx = match pane_types.iter().position(|pt| {
+        matches!(pt, PaneType::Browser(bs) if bs.pane_id == focused_pane_id)
+    }) {
+        Some(idx) => idx,
+        None => return,
+    };
+
+    let result = if let PaneType::Browser(bs) = &mut pane_types[browser_idx] {
+        bs.handle_key(c, stack, now)
+    } else {
+        return;
+    };
+
+    match result {
+        crate::browser::BrowserKeyResult::Consumed => {
+            // Re-render the browser pane content.
+            if let PaneType::Browser(bs) = &pane_types[browser_idx] {
+                let rows = layout.pane_by_id_mut(focused_pane_id)
+                    .map(|p| p.rows())
+                    .unwrap_or(24);
+                let rendered = bs.render_to_pane(rows);
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    pane.write_str(&rendered);
+                }
+            }
+        }
+        crate::browser::BrowserKeyResult::CloseBrowser => {
+            if layout.pane_count() > 1 {
+                pane_types.remove(browser_idx);
+                layout.close_focused();
+                render_full(layout);
+            }
+        }
+    }
+}
+
+/// Handle a raw key (arrows, etc.) in the focused browser pane.
+fn handle_browser_rawkey(
+    key: KeyCode,
+    layout: &mut Layout,
+    pane_types: &mut Vec<PaneType>,
+    focused_pane_id: usize,
+) {
+    let browser_idx = match pane_types.iter().position(|pt| {
+        matches!(pt, PaneType::Browser(bs) if bs.pane_id == focused_pane_id)
+    }) {
+        Some(idx) => idx,
+        None => return,
+    };
+
+    if let PaneType::Browser(bs) = &mut pane_types[browser_idx] {
+        bs.handle_raw_key(key);
+
+        // Re-render the browser pane content.
+        let rows = layout.pane_by_id_mut(focused_pane_id)
+            .map(|p| p.rows())
+            .unwrap_or(24);
+        let rendered = bs.render_to_pane(rows);
+        if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+            pane.write_str(&rendered);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File manager input handlers
+// ---------------------------------------------------------------------------
+
+/// Handle a Unicode character input for the focused file manager pane.
+fn handle_filemanager_char(
+    c: char,
+    layout: &mut Layout,
+    pane_types: &mut Vec<PaneType>,
+    vfs: &mut StubVfs,
+    focused_pane_id: usize,
+) {
+    // Find the file manager pane type mutably.
+    let fm = match pane_types.iter_mut().find_map(|pt| match pt {
+        PaneType::FileManager(fm) if fm.pane_id == focused_pane_id => Some(fm),
+        _ => None,
+    }) {
+        Some(fm) => fm,
+        None => return,
+    };
+
+    let visible_rows = layout
+        .pane_by_id_mut(focused_pane_id)
+        .map(|p| p.rows())
+        .unwrap_or(24);
+
+    let action = fm.handle_char(c, vfs);
+
+    match action {
+        Some(FileManagerAction::Enter) => {
+            let result = fm.enter_selected(vfs);
+            if let Some(file_path) = result {
+                // File was selected -- log it (editor integration is future work).
+                fm.status_message = format!("Open: {} (editor not yet wired)", file_path);
+            }
+        }
+        Some(FileManagerAction::GoParent) => {
+            fm.go_parent(vfs);
+        }
+        Some(FileManagerAction::Redraw) | Some(FileManagerAction::OpenFile(_)) => {
+            // Just redraw below.
+        }
+        None => return,
+    }
+
+    // Re-render the file manager pane.
+    let cols = layout
+        .pane_by_id_mut(focused_pane_id)
+        .map(|p| p.cols())
+        .unwrap_or(80);
+    let rendered = filemanager::render_to_pane(fm, cols, visible_rows);
+    if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+        pane.write_str(&rendered);
+    }
+}
+
+/// Handle a raw key (arrows, etc.) for the focused file manager pane.
+fn handle_filemanager_rawkey(
+    k: KeyCode,
+    layout: &mut Layout,
+    pane_types: &mut Vec<PaneType>,
+    vfs: &mut StubVfs,
+    focused_pane_id: usize,
+) {
+    let visible_rows = layout
+        .pane_by_id_mut(focused_pane_id)
+        .map(|p| p.rows())
+        .unwrap_or(24);
+
+    let fm = match pane_types.iter_mut().find_map(|pt| match pt {
+        PaneType::FileManager(fm) if fm.pane_id == focused_pane_id => Some(fm),
+        _ => None,
+    }) {
+        Some(fm) => fm,
+        None => return,
+    };
+
+    let action = fm.handle_raw_key(k, visible_rows);
+
+    match action {
+        Some(FileManagerAction::Redraw) => {
+            // Re-render the file manager pane.
+            let cols = layout
+                .pane_by_id_mut(focused_pane_id)
+                .map(|p| p.cols())
+                .unwrap_or(80);
+            let rendered = filemanager::render_to_pane(fm, cols, visible_rows);
+            if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                pane.write_str(&rendered);
+            }
+        }
+        _ => {}
+    }
 }
