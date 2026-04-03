@@ -463,6 +463,8 @@ pub enum VirtioInitError {
     FeatureNegotiationFailed,
     /// Generic device error during init.
     DeviceError,
+    /// Memory allocation failed during init.
+    AllocFailed,
 }
 
 impl VirtioNet {
@@ -553,7 +555,10 @@ impl VirtioNet {
         }
         let rx_size = rx_size.min(QUEUE_SIZE as u16);
 
-        let mut rx_queue = alloc_legacy_virtqueue(rx_size, phys_mem_offset);
+        let mut rx_queue = match alloc_legacy_virtqueue(rx_size, phys_mem_offset) {
+            Some(q) => q,
+            None => return Err(VirtioInitError::AllocFailed),
+        };
 
         // Write the physical page frame number of the descriptor table.
         let rx_pfn = rx_queue.pfn();
@@ -573,7 +578,10 @@ impl VirtioNet {
         }
         let tx_size = tx_size.min(QUEUE_SIZE as u16);
 
-        let tx_queue = alloc_legacy_virtqueue(tx_size, phys_mem_offset);
+        let tx_queue = match alloc_legacy_virtqueue(tx_size, phys_mem_offset) {
+            Some(q) => q,
+            None => return Err(VirtioInitError::AllocFailed),
+        };
 
         let tx_pfn = tx_queue.pfn();
         unsafe { port_write_u32(io_base, VIRTIO_QUEUE_ADDR, tx_pfn) };

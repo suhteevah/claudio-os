@@ -217,9 +217,18 @@ impl AhciController {
         log::debug!("[ahci] port {}: issuing IDENTIFY DEVICE", port_num);
 
         // Allocate a 512-byte buffer for IDENTIFY data (word-aligned).
-        let id_layout = Layout::from_size_align(512, 16).expect("identify layout");
+        let id_layout = match Layout::from_size_align(512, 16) {
+            Ok(l) => l,
+            Err(_) => {
+                log::error!("[ahci] port {}: invalid IDENTIFY layout", port_num);
+                return Err(AhciError::InitFailed);
+            }
+        };
         let id_buf = unsafe { alloc_zeroed(id_layout) };
-        assert!(!id_buf.is_null(), "[ahci] failed to allocate IDENTIFY buffer");
+        if id_buf.is_null() {
+            log::error!("[ahci] port {}: failed to allocate IDENTIFY buffer", port_num);
+            return Err(AhciError::InitFailed);
+        }
         let id_buf_addr = id_buf as u64;
 
         // Build the IDENTIFY command.
@@ -472,10 +481,18 @@ impl AhciDisk {
 
         // Allocate a sector-aligned temporary buffer.
         let tmp_len = total_sectors as usize * self.sector_size as usize;
-        let tmp_layout =
-            Layout::from_size_align(tmp_len, 16).expect("read_bytes tmp layout");
+        let tmp_layout = match Layout::from_size_align(tmp_len, 16) {
+            Ok(l) => l,
+            Err(_) => {
+                log::error!("[ahci] port {}: invalid read_bytes tmp layout", self.port);
+                return Err(AhciError::IoError);
+            }
+        };
         let tmp_ptr = unsafe { alloc_zeroed(tmp_layout) };
-        assert!(!tmp_ptr.is_null(), "[ahci] read_bytes: alloc failed");
+        if tmp_ptr.is_null() {
+            log::error!("[ahci] port {}: read_bytes alloc failed", self.port);
+            return Err(AhciError::IoError);
+        }
 
         let tmp_buf = unsafe { core::slice::from_raw_parts_mut(tmp_ptr, tmp_len) };
 
@@ -527,10 +544,18 @@ impl AhciDisk {
 
         // Allocate a sector-aligned temporary buffer.
         let tmp_len = total_sectors as usize * self.sector_size as usize;
-        let tmp_layout =
-            Layout::from_size_align(tmp_len, 16).expect("write_bytes tmp layout");
+        let tmp_layout = match Layout::from_size_align(tmp_len, 16) {
+            Ok(l) => l,
+            Err(_) => {
+                log::error!("[ahci] port {}: invalid write_bytes tmp layout", self.port);
+                return Err(AhciError::IoError);
+            }
+        };
         let tmp_ptr = unsafe { alloc_zeroed(tmp_layout) };
-        assert!(!tmp_ptr.is_null(), "[ahci] write_bytes: alloc failed");
+        if tmp_ptr.is_null() {
+            log::error!("[ahci] port {}: write_bytes alloc failed", self.port);
+            return Err(AhciError::IoError);
+        }
 
         let tmp_buf = unsafe { core::slice::from_raw_parts_mut(tmp_ptr, tmp_len) };
 

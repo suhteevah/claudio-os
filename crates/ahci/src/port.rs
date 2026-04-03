@@ -165,31 +165,40 @@ pub fn wait_port_idle(hba: &HbaRegs, port: u32) {
 /// The FIS Receive area must be 256-byte aligned and is 256 bytes.
 ///
 /// Returns `(cmd_list_addr, fis_addr)` as physical addresses.
-pub fn allocate_port_memory(hba: &HbaRegs, port: u32) -> (u64, u64) {
+pub fn allocate_port_memory(hba: &HbaRegs, port: u32) -> Option<(u64, u64)> {
     log::debug!(
         "[ahci] port {}: allocating command list and FIS receive area",
         port
     );
 
     // Command list: 32 headers * 32 bytes = 1024 bytes, 1024-byte aligned.
-    let cmd_list_layout = Layout::from_size_align(1024, 1024)
-        .expect("[ahci] command list layout");
+    let cmd_list_layout = match Layout::from_size_align(1024, 1024) {
+        Ok(l) => l,
+        Err(_) => {
+            log::error!("[ahci] port {}: invalid command list layout", port);
+            return None;
+        }
+    };
     let cmd_list_ptr = unsafe { alloc_zeroed(cmd_list_layout) };
-    assert!(
-        !cmd_list_ptr.is_null(),
-        "[ahci] port {}: failed to allocate command list",
-        port
-    );
+    if cmd_list_ptr.is_null() {
+        log::error!("[ahci] port {}: failed to allocate command list", port);
+        return None;
+    }
     let cmd_list_addr = cmd_list_ptr as u64;
 
     // FIS receive area: 256 bytes, 256-byte aligned.
-    let fis_layout = Layout::from_size_align(256, 256).expect("[ahci] FIS layout");
+    let fis_layout = match Layout::from_size_align(256, 256) {
+        Ok(l) => l,
+        Err(_) => {
+            log::error!("[ahci] port {}: invalid FIS layout", port);
+            return None;
+        }
+    };
     let fis_ptr = unsafe { alloc_zeroed(fis_layout) };
-    assert!(
-        !fis_ptr.is_null(),
-        "[ahci] port {}: failed to allocate FIS receive area",
-        port
-    );
+    if fis_ptr.is_null() {
+        log::error!("[ahci] port {}: failed to allocate FIS receive area", port);
+        return None;
+    }
     let fis_addr = fis_ptr as u64;
 
     // Program the port registers with these addresses.
@@ -203,7 +212,7 @@ pub fn allocate_port_memory(hba: &HbaRegs, port: u32) -> (u64, u64) {
         port, cmd_list_addr, fis_addr
     );
 
-    (cmd_list_addr, fis_addr)
+    Some((cmd_list_addr, fis_addr))
 }
 
 /// Perform a COMRESET on a port via the SControl register.
@@ -293,7 +302,7 @@ pub fn init_port(hba: &HbaRegs, port: u32) -> Option<(u64, u64)> {
     stop_cmd_engine(hba, port);
 
     // Allocate DMA buffers.
-    let (clb, fb) = allocate_port_memory(hba, port);
+    let (clb, fb) = allocate_port_memory(hba, port)?;
 
     // Clear pending interrupts and errors.
     hba.port_write_serr(port, 0xFFFF_FFFF);

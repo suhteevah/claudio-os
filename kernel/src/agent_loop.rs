@@ -733,21 +733,30 @@ pub enum AuthMode {
 }
 
 /// Global auth mode — set during init, read during agent loops.
-/// Protected by spin::Once for safe one-time initialization.
-static AUTH_MODE: spin::Once<AuthMode> = spin::Once::new();
+/// Protected by spin::Mutex for thread-safe access and mutation
+/// (conversations module needs to update conv_id).
+pub(crate) static AUTH_MODE: spin::Mutex<Option<AuthMode>> = spin::Mutex::new(None);
 
 /// Set the authentication mode. Call once during boot.
 ///
 /// # Safety
-/// Safe to call — uses spin::Once which handles synchronization.
+/// Safe to call — uses spin::Mutex which handles synchronization.
 /// Kept as `unsafe fn` to preserve API compatibility with callers.
 pub unsafe fn set_auth_mode(mode: AuthMode) {
-    AUTH_MODE.call_once(|| mode);
+    let mut guard = AUTH_MODE.lock();
+    *guard = Some(mode);
 }
 
-/// Get current auth mode reference.
-pub fn auth_mode() -> Option<&'static AuthMode> {
-    AUTH_MODE.get()
+/// Get a clone of the current auth mode.
+pub fn auth_mode() -> Option<AuthMode> {
+    AUTH_MODE.lock().clone()
+}
+
+/// Get a reference to the auth mode via the lock. For callers that need
+/// to read fields without cloning.
+pub fn with_auth_mode<R>(f: impl FnOnce(Option<&AuthMode>) -> R) -> R {
+    let guard = AUTH_MODE.lock();
+    f(guard.as_ref())
 }
 
 /// Send an API request — routes to either api.anthropic.com or claude.ai
@@ -759,7 +768,7 @@ pub fn send_via_https(
     now: fn() -> claudio_net::Instant,
 ) -> Result<Vec<u8>, String> {
     // Check if we have claude.ai auth mode
-    if let Some(AuthMode::ClaudeAi { session_cookie, org_id, conv_id }) = auth_mode() {
+    if let Some(AuthMode::ClaudeAi { ref session_cookie, ref org_id, ref conv_id }) = auth_mode() {
         return send_via_claude_ai(stack, session_cookie, org_id, conv_id, body, now);
     }
 
@@ -905,7 +914,7 @@ pub fn send_streaming(
     now: fn() -> claudio_net::Instant,
     on_token: impl FnMut(&str),
 ) -> Result<crate::streaming::StreamResult, String> {
-    if let Some(AuthMode::ClaudeAi { session_cookie, org_id, conv_id }) = auth_mode() {
+    if let Some(AuthMode::ClaudeAi { ref session_cookie, ref org_id, ref conv_id }) = auth_mode() {
         return send_streaming_claude_ai(stack, session_cookie, org_id, conv_id, body, now, on_token);
     }
     send_streaming_api_key(stack, api_key, body, now, on_token)
