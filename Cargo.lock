@@ -246,6 +246,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "claudio-bluetooth"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "spin",
+]
+
+[[package]]
 name = "claudio-btrfs"
 version = "0.1.0"
 dependencies = [
@@ -337,6 +345,7 @@ dependencies = [
  "claudio-ahci",
  "claudio-api",
  "claudio-auth",
+ "claudio-bluetooth",
  "claudio-btrfs",
  "claudio-ext4",
  "claudio-fs",
@@ -351,6 +360,7 @@ dependencies = [
  "claudio-smp",
  "claudio-sshd",
  "claudio-terminal",
+ "claudio-usb-storage",
  "claudio-vfs",
  "claudio-xhci",
  "conquer-once",
@@ -414,6 +424,15 @@ dependencies = [
  "log",
  "spin",
  "vte",
+]
+
+[[package]]
+name = "claudio-usb-storage"
+version = "0.1.0"
+dependencies = [
+ "claudio-vfs",
+ "log",
+ "spin",
 ]
 
 [[package]]

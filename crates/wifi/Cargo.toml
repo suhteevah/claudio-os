@@ -1,0 +1,11 @@
+[package]
+name = "claudio-wifi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "no_std Intel WiFi driver (AX201/AX200/AX210/AC9260) for ClaudioOS — iwlwifi equivalent"
+
+[dependencies]
+log = { workspace = true }
+spin = { workspace = true }

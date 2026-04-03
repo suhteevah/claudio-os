@@ -1,0 +1,12 @@
+[package]
+name = "claudio-usb-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "no_std USB Mass Storage driver (Bulk-Only Transport) for ClaudioOS"
+
+[dependencies]
+log = { workspace = true }
+spin = { workspace = true }
+claudio-vfs = { path = "../vfs" }

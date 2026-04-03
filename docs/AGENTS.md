@@ -65,26 +65,63 @@ This enables conversation reuse across reboots without re-authentication.
 
 ---
 
+## Session Auto-Refresh (`kernel/src/session_manager.rs`)
+
+The session manager monitors cookie expiry and automatically refreshes tokens
+before they expire, preventing stale sessions during long uptime.
+
+### Refresh Flow
+
+1. On auth completion, the session manager parses the JWT expiry from the
+   sessionKey cookie (base64url-decoded `exp` claim)
+2. The dashboard event loop calls `periodic_check()` roughly every 60 minutes
+3. When less than 24 hours remain before expiry, a refresh is attempted
+4. Refresh calls `GET /api/auth/session` with the existing cookie
+5. If the session is still valid, new Set-Cookie headers extend the expiry
+6. Updated cookies are emitted via the `SAVE_SESSION:` serial marker for
+   host-side persistence
+
+### Warning Thresholds
+
+| Threshold | Action |
+|-----------|--------|
+| 24 hours | Log warning about approaching expiry |
+| 2 hours | Elevated warning |
+| 30 minutes | Critical warning |
+| 0 (expired) | Flag `needs_reauth` for full re-authentication |
+
+---
+
 ## Dashboard (tmux-style Panes)
 
 The dashboard provides a split-pane terminal interface, similar to tmux.
+It supports 6 pane types:
+
+| Pane Type | Description |
+|-----------|-------------|
+| **Agent** | Claude AI coding agent with tool loop |
+| **Shell** | AI-native shell with 28 builtins |
+| **Browser** | Text-mode web browser (wraith-based) |
+| **FileManager** | Visual directory browser with file operations |
+| **SysMonitor** | Real-time CPU/memory/network/agent stats |
+| **Screensaver** | 5 modes: starfield, matrix, bouncing, pipes, clock |
 
 ### Layout
 
 ```
 +---------------------------+---------------------------+
 |                           |                           |
-|   Agent 1 (focused)       |   Agent 2                 |
-|   claude session          |   claude session          |
+|   Agent 1 (focused)       |   Shell                   |
+|   claude session          |   28 builtins + AI        |
 |   [typing/streaming]      |   [idle]                  |
 |                           |                           |
 +---------------------------+---------------------------+
-|                                                       |
-|   Agent 3                                             |
-|   claude session                                      |
-|   [tool execution]                                    |
-|                                                       |
-+-------------------------------------------------------+
+|                           |                           |
+|   Browser                 |   System Monitor          |
+|   https://example.com     |   CPU [###------] 35%     |
+|   [browsing]              |   MEM [######---] 64%     |
+|                           |                           |
++---------------------------+---------------------------+
 ```
 
 ### Keyboard Shortcuts
@@ -97,8 +134,12 @@ action key), matching tmux conventions.
 | `Ctrl+B "` | Split pane horizontally |
 | `Ctrl+B %` | Split pane vertically |
 | `Ctrl+B o` | Switch focus to next pane |
+| `Ctrl+B n` | Switch focus to next pane |
+| `Ctrl+B p` | Switch focus to previous pane |
 | `Ctrl+B c` | Create new agent session in current pane |
+| `Ctrl+B s` | Create new shell pane |
 | `Ctrl+B x` | Close current pane / kill agent |
+| `Ctrl+B ,` | Rename current agent |
 | `Ctrl+B Up/Down/Left/Right` | Move focus directionally |
 
 ### Layout Engine
@@ -121,7 +162,7 @@ Each `Pane` contains:
 - A `Terminal` instance (VTE parser + character grid)
 - Viewport coordinates (x, y, width, height) in pixels
 - Scroll position and history buffer
-- Reference to the agent session (if any)
+- Reference to the agent session, shell, browser, file manager, or sysmon (depending on type)
 
 ---
 
@@ -132,19 +173,21 @@ Each agent session is an async task with its own:
 - Authentication credentials (shared via reference)
 - Terminal pane (for rendering output)
 - Tool execution context
+- IPC registration (message inbox, agent name)
 
 ### Session Lifecycle
 
 ```
 1. User creates agent (Ctrl+B c)
 2. Agent session spawns as async task
-3. Welcome banner displayed
-4. User types a prompt
-5. Prompt sent to Claude (API key or claude.ai)
-6. SSE stream received, tokens rendered to pane
-7. If tool_use: execute tool, send result, repeat (up to 20 rounds)
-8. Final response displayed
-9. Wait for next user input
+3. Agent registered with IPC message bus
+4. Welcome banner displayed (themed)
+5. User types a prompt
+6. Prompt sent to Claude (API key or claude.ai)
+7. SSE stream received, tokens rendered to pane
+8. If tool_use: execute tool, send result, repeat (up to 20 rounds)
+9. Final response displayed
+10. Wait for next user input
 ```
 
 ### Tool Loop
@@ -191,35 +234,89 @@ Tools are declared in the API request and executed locally when Claude requests 
 | `compile_rust` | Compile Rust code | `rustc-lite` + Cranelift, or host build server |
 | `list_files` | List directory contents | VFS `list_dir()` |
 | `search_files` | Search for files by pattern | VFS traversal |
+| `send_to_agent` | Send a message to another agent | IPC message bus |
+| `read_agent_messages` | Read messages from inbox | IPC message bus |
+| `list_agents_ipc` | List all agents available for messaging | IPC registry |
+| `create_channel` | Create a named data channel | IPC channel registry |
+| `channel_write` | Write data to a named channel | IPC channel |
+| `channel_read` | Read data from a named channel | IPC channel |
+| `shared_memory_write` | Write to shared memory region | IPC shared memory |
+| `shared_memory_read` | Read from shared memory region | IPC shared memory |
 
-### Tool Declaration (JSON)
+---
 
-```json
-{
-  "name": "execute_python",
-  "description": "Execute Python code and return stdout/stderr",
-  "input_schema": {
-    "type": "object",
-    "properties": {
-      "code": {
-        "type": "string",
-        "description": "Python source code to execute"
-      }
-    },
-    "required": ["code"]
-  }
-}
+## Inter-Agent Communication (IPC) (`kernel/src/ipc.rs`)
+
+The IPC system enables Claude agents to collaborate by sending messages,
+streaming data through channels, and sharing memory regions.
+
+### Components
+
+| Component | Description |
+|-----------|-------------|
+| **MessageBus** | Global per-agent inboxes. Messages accumulate until drained. |
+| **Channel** | Named SPSC ring buffer (4 KiB default) for streaming data between agents. |
+| **SharedMemory** | Named byte buffers that grow on demand, readable/writable by any agent. |
+
+### Agent Registration
+
+When an agent session starts, it is registered with the IPC system:
+
+```rust
+ipc.bus.register_agent(agent_id, agent_name);
 ```
 
-### Tool Result Format
+This creates an inbox and a name -> ID mapping. Agents can send messages
+by name or numeric ID, or broadcast to all agents.
 
-```json
-{
-  "type": "tool_result",
-  "tool_use_id": "toolu_abc123",
-  "content": "Output of the tool execution..."
-}
+### IPC Tools for Claude
+
+8 IPC tools are exposed to Claude agents via the tool-use protocol:
+
+- `send_to_agent` -- send a message to a specific agent or broadcast
+- `read_agent_messages` -- drain pending messages from inbox
+- `list_agents_ipc` -- list all registered agents
+- `create_channel` -- create a named data channel
+- `channel_write` -- write data to a channel
+- `channel_read` -- read data from a channel
+- `shared_memory_write` -- write to a shared memory region
+- `shared_memory_read` -- read from a shared memory region
+
+### Example: Agent Collaboration
+
 ```
+Agent 1: "Research the x86 APIC and send me a summary"
+  -> Claude calls send_to_agent(to="agent-2", message="Research x86 APIC...")
+  -> Agent 2 receives the message via read_agent_messages
+  -> Agent 2 researches and sends results back via send_to_agent(to="agent-1", ...)
+  -> Agent 1 reads the results and continues its work
+```
+
+---
+
+## Conversation Management (`kernel/src/conversations.rs`)
+
+Manages claude.ai conversations: listing, selecting, renaming, and deleting.
+
+### Shell Commands
+
+| Command | Description |
+|---------|-------------|
+| `conversations` / `convos` | List the 20 most recent conversations |
+| `conv use <uuid>` | Switch the active conversation for this agent |
+| `conv rename <uuid> <name>` | Rename a conversation |
+| `conv delete <uuid>` | Delete a conversation |
+| `conv new [name]` | Start a new conversation (clears active conv_id) |
+
+### API Integration
+
+Uses the claude.ai REST API:
+- `GET /api/organizations/{org}/chat_conversations` -- list
+- `PATCH /api/organizations/{org}/chat_conversations/{id}` -- rename
+- `DELETE /api/organizations/{org}/chat_conversations/{id}` -- delete
+
+Per-agent active conversation tracking allows different agents to use
+different conversations simultaneously.
 
 ---
 
@@ -231,7 +328,7 @@ Each agent maintains a message list:
 pub struct Conversation {
     pub id: String,              // conversation UUID
     pub messages: Vec<Message>,  // alternating user/assistant messages
-    pub model: String,           // e.g., "claude-sonnet-4-20250514"
+    pub model: String,           // e.g., "claude-sonnet-4-6"
     pub system_prompt: Option<String>,
 }
 

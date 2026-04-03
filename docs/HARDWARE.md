@@ -2,24 +2,207 @@
 
 ## Supported Hardware Overview
 
-| Driver | Crate | Lines | Status | Hardware |
-|--------|-------|-------|--------|----------|
+| Driver | Crate / Module | Lines | Status | Hardware |
+|--------|----------------|-------|--------|----------|
 | AHCI/SATA | `claudio-ahci` | 2,139 | Complete | Any AHCI controller (Intel PCH, AMD) |
 | NVMe | `claudio-nvme` | 2,563 | Complete | NVMe 1.4+ SSDs (Samsung, WD, Intel) |
-| Intel NIC | `claudio-intel-nic` | 1,986 | Complete | e1000, e1000e (I219-V), igc (I225-V) |
+| Intel NIC | `claudio-intel-nic` + `kernel/src/intel_nic.rs` | 1,986 + 455 | Complete + Wired | e1000, e1000e (I219-V), igc (I225-V) |
 | VirtIO-net | `claudio-net` | 3,172 | Complete | QEMU virtio-net-pci (legacy 0.9.5) |
-| xHCI USB | `claudio-xhci` | 4,204 | Complete | USB 3.0 host controllers + HID keyboard |
+| xHCI USB | `claudio-xhci` + `kernel/src/usb.rs` | 4,204 + 187 | Complete + Wired | USB 3.0 host controllers + HID keyboard |
+| USB Mouse | `kernel/src/mouse.rs` | 400 | Complete (awaiting xHCI mouse polling) | USB HID boot protocol mouse |
 | HDA Audio | `claudio-hda` | 2,631 | Complete | Intel HD Audio (Realtek, etc.) |
 | NVIDIA GPU | `claudio-gpu` | 3,392 | Complete | NVIDIA GPUs (Falcon, FIFO, tensor ops) |
-| SMP | `claudio-smp` | 3,391 | Complete | Multi-core x86_64 (APIC, trampoline) |
-| ACPI | `claudio-acpi` | 2,433 | Complete | RSDP/MADT/FADT/MCFG/HPET parsing |
+| SMP | `claudio-smp` + `kernel/src/smp_init.rs` | 3,391 + 234 | Complete + Wired | Multi-core x86_64 (APIC, trampoline) |
+| ACPI | `claudio-acpi` + `kernel/src/acpi_init.rs` | 2,433 + 524 | Complete + Wired | RSDP/MADT/FADT/MCFG/HPET parsing |
+| RTC | `kernel/src/rtc.rs` | 300 | Complete | MC146818 CMOS real-time clock |
+| PC Speaker | `kernel/src/boot_sound.rs` | 112 | Complete | PIT channel 2 square wave |
 | PS/2 Keyboard | kernel | -- | Complete | PS/2 via IRQ1 (8042 controller) |
 | PIT Timer | kernel | -- | Complete | 8253/8254 at 18.2 Hz |
 | Serial UART | kernel | -- | Complete | 16550 at 0x3F8, 115200 baud |
 
-**Wiring status**: The drivers are implemented as standalone crates with clean APIs.
-Wiring them into the kernel boot sequence is tracked in `docs/ROADMAP.md` under
-"TODO -- Critical".
+---
+
+## ACPI Hardware Discovery (`kernel/src/acpi_init.rs`)
+
+The ACPI init module runs early in boot (after heap, before networking) and
+populates a global `AcpiInfo` struct used by SMP, power management, and timers.
+
+### Discovery Sequence
+
+1. Find RSDP from UEFI bootloader address (or BIOS memory scan fallback)
+2. Parse RSDT/XSDT to enumerate all ACPI tables
+3. Parse MADT: extract CPU cores (Local APICs), I/O APICs, interrupt overrides
+4. Parse FADT: extract power management registers, parse DSDT for S5 shutdown
+5. Parse HPET: enable precision timer, read frequency
+6. Parse MCFG: extract PCIe ECAM base addresses
+
+### ACPI Info Provided to Kernel
+
+| Field | Source | Used By |
+|-------|--------|---------|
+| `cpu_count` | MADT Local APICs | SMP init |
+| `local_apic_address` | MADT | SMP init (APIC MMIO base) |
+| `io_apics` | MADT | SMP init (interrupt routing) |
+| `interrupt_overrides` | MADT | IRQ remapping |
+| `fadt_info` | FADT | Shutdown/reboot via PM1a control |
+| `hpet_info` | HPET | Precision timing |
+| `mcfg_entries` | MCFG | PCIe ECAM config space |
+
+### Power Management
+
+```rust
+// ACPI S5 shutdown via PM1a control register:
+acpi_init::shutdown();  // Tries ACPI S5, falls back to QEMU port 0x604
+
+// ACPI reboot via reset register:
+acpi_init::reboot();    // Tries ACPI reset, falls back to keyboard controller 0xFE
+```
+
+---
+
+## SMP Multi-Core Boot (`kernel/src/smp_init.rs`)
+
+The SMP init module boots all application processors discovered via ACPI MADT.
+
+### Init Sequence
+
+1. Read MADT data from `acpi_init` (Local APICs, I/O APICs, APIC base)
+2. Verify trampoline page at physical 0x8000 is writable
+3. Disable legacy 8259 PIC (mask all IRQs on ports 0x21 and 0xA1)
+4. Create `SmpController` with APIC base address
+5. Run full SMP init: BSP APIC setup, I/O APIC config, AP boot via SIPI
+6. Store controller globally for `spawn_agent_on_core()` / `spawn_agent()`
+
+### Public API
+
+```rust
+smp_init::num_cores()                          // Total active cores
+smp_init::spawn_agent_on_core(core, name, entry, arg)  // Dispatch to specific core
+smp_init::spawn_agent(name, entry, arg)        // Dispatch to least-loaded core
+smp_init::apic_eoi()                           // Send EOI from interrupt handlers
+```
+
+---
+
+## USB Keyboard + Mouse (`kernel/src/usb.rs`, `kernel/src/mouse.rs`)
+
+### USB Keyboard
+
+The USB subsystem detects xHCI controllers via PCI (class 0x0C/0x03/0x30),
+initializes the controller, and bridges USB keyboard events to the existing
+PS/2 scancode queue so the dashboard works identically for both.
+
+**Polling Model:** Since MSI-X interrupt routing isn't wired yet, the USB
+keyboard is polled periodically from the async executor:
+
+```rust
+usb::poll_usb_keyboard();  // Non-blocking, converts HID events to PS/2 scancodes
+```
+
+Key press -> `keyboard::push_scancode(scancode)`
+Key release -> `keyboard::push_scancode(scancode | 0x80)` (PS/2 Set 1 break code)
+
+### USB Mouse
+
+The mouse module (`kernel/src/mouse.rs`) provides:
+- USB HID boot protocol report parsing (3-4 bytes: buttons, dx, dy, scroll)
+- Mouse state tracking: position, button state, event queue
+- XOR crosshair cursor rendering on the GOP framebuffer
+- Global state accessible via `mouse::position()`, `mouse::buttons()`, `mouse::drain_events()`
+
+The cursor uses XOR rendering for visibility on any background color. The
+crosshair is 6 pixels in each direction from center.
+
+**Integration status:** The mouse state machine is fully functional. Full
+integration awaits xHCI crate support for mouse device enumeration
+(HID class=3, subclass=1, protocol=2).
+
+---
+
+## Intel NIC Integration (`kernel/src/intel_nic.rs`)
+
+The Intel NIC module provides a complete smoltcp `Device` adapter for Intel
+e1000/e1000e/igc NICs, enabling the same TCP/IP stack used by VirtIO-net.
+
+### Architecture
+
+```
+smoltcp Interface
+    | Device trait
+IntelSmoltcpDevice (intel_nic module)
+    | E1000::transmit / E1000::receive
+claudio-intel-nic crate
+    | MMIO registers + DMA descriptor rings
+Intel NIC hardware
+```
+
+### Key Features
+
+- PCI detection: scans for Intel vendor 0x8086 against all known device IDs
+- BAR0 MMIO mapping: handles both 32-bit and 64-bit BARs
+- Page-table walk for virt-to-phys DMA address translation (L4->L3->L2->L1)
+- `IntelNetworkStack`: complete smoltcp interface with DHCP
+- Automatic NIC selection: kernel tries VirtIO-net first, falls back to Intel NIC
+
+### DHCP Flow
+
+```rust
+let stack = intel_nic::init_intel_network(now)?;
+// Polls up to 200,000 iterations waiting for DHCP lease
+// Returns IntelNetworkStack with IP, gateway, DNS servers
+```
+
+---
+
+## SSH Server Wiring (`kernel/src/ssh_server.rs`)
+
+The SSH server module wires the `claudio-sshd` crate to smoltcp TCP and the
+dashboard event loop.
+
+### Architecture
+
+- TCP listener on port 22 with 16 KiB RX/TX buffers per connection
+- Up to 4 simultaneous SSH sessions
+- SSH protocol state machine driven by `poll_ssh_server()` each dashboard loop iteration
+- Version exchange, binary packet processing, channel actions
+- Echo shell with welcome banner (full pane integration planned)
+
+### Integration
+
+```rust
+// During boot:
+ssh_server::start_ssh_server(&mut stack, now);
+
+// Each dashboard loop iteration:
+ssh_server::poll_ssh_server(&mut stack);
+```
+
+---
+
+## Real-Time Clock (`kernel/src/rtc.rs`)
+
+The RTC module reads the MC146818 CMOS real-time clock at boot and combines
+it with PIT elapsed ticks to provide a wall clock.
+
+### Features
+
+- Reads CMOS registers via I/O ports 0x70/0x71
+- Handles BCD vs binary mode (status register B)
+- Handles 12-hour vs 24-hour mode
+- Century register support (register 0x32)
+- Double-read guard against mid-update races
+- Unix timestamp conversion (accurate 1970-2099)
+- PIT-corrected wall clock: `rtc::wall_clock()` returns current DateTime
+
+### Public API
+
+```rust
+rtc::init();                     // Read RTC at boot, store timestamp
+rtc::wall_clock() -> DateTime    // Current time (boot RTC + PIT elapsed)
+rtc::wall_clock_formatted()      // "YYYY-MM-DD HH:MM:SS"
+rtc::uptime_seconds()            // Seconds since boot
+rtc::boot_timestamp()            // Unix timestamp of boot time
+```
 
 ---
 
@@ -38,16 +221,6 @@ interface to SATA drives. ClaudioOS detects AHCI controllers via PCI class
 | `command.rs` | Command table construction: CFIS (H2D Register FIS), PRDT entries |
 | `identify.rs` | ATA IDENTIFY DEVICE parsing: model, serial, capacity, features |
 | `driver.rs` | High-level `AhciController` + `AhciDisk` with sector read/write |
-
-### Register Layout
-
-```
-ABAR (BAR5 from PCI config)
-  +0x00  GHC: Global Host Control (CAP, GHC, IS, PI, VS)
-  +0x100 Port 0 registers (CLB, FB, IS, IE, CMD, TFD, SIG, SSTS, SCTL, SERR, CI)
-  +0x180 Port 1 registers
-  ...up to 32 ports
-```
 
 ### Usage
 
@@ -79,23 +252,6 @@ sector I/O.
 | `admin.rs` | Admin commands: Identify Controller, Identify Namespace, Create I/O Queue |
 | `io.rs` | I/O commands: Read, Write, Flush with scatter-gather PRP lists |
 | `driver.rs` | `NvmeController` + `NvmeDisk` with sector-level API |
-
-### Queue Architecture
-
-```
-Host Memory:
-  Admin Submission Queue (ASQ) --doorbell--> Controller
-  Admin Completion Queue (ACQ) <--interrupt-- Controller
-
-  I/O Submission Queue 1 (IOSQ) --doorbell--> Controller
-  I/O Completion Queue 1 (IOCQ) <--interrupt-- Controller
-
-Each queue pair:
-  - Submission: array of 64-byte command entries
-  - Completion: array of 16-byte completion entries
-  - Phase bit flips each wrap to distinguish new from old
-  - Doorbell registers: BAR0 + 0x1000 + (queue_id * doorbell_stride)
-```
 
 ### Usage
 
@@ -133,26 +289,13 @@ Supports the Intel e1000 family of Ethernet controllers for real hardware
 | `phy.rs` | PHY configuration: MDIO register access, link speed/duplex |
 | `driver.rs` | `IntelNic` with init, send_packet, recv_packet, link_status |
 
-### DMA Ring Architecture
-
-```
-Host Memory:                        NIC Hardware:
-  RX Descriptor Ring (256 entries)    RDH (head) -- NIC writes here
-    [addr | length | status | ...]    RDT (tail) -- driver advances here
-  RX Packet Buffers (2 KiB each)
-
-  TX Descriptor Ring (256 entries)    TDH (head) -- NIC reads here
-    [addr | length | cmd | status]    TDT (tail) -- driver writes here
-  TX Packet Buffers (2 KiB each)
-```
-
 ---
 
 ## xHCI USB 3.0 (`crates/xhci/`)
 
 xHCI (eXtensible Host Controller Interface) provides USB 1.1/2.0/3.0 support
 through a unified register interface. ClaudioOS uses it primarily for USB
-keyboard input on real hardware (replacing PS/2).
+keyboard and mouse input on real hardware (replacing PS/2).
 
 ### Module Structure
 
@@ -165,22 +308,6 @@ keyboard input on real hardware (replacing PS/2).
 | `device.rs` | USB device enumeration: address, configure, interface/endpoint discovery |
 | `hid.rs` | HID keyboard driver: report descriptor parsing, scancode translation |
 | `driver.rs` | `XhciController` with init, poll, and keyboard event retrieval |
-
-### TRB Ring Architecture
-
-```
-Command Ring (host -> controller):
-  [TRB 0] [TRB 1] ... [Link TRB] -> wraps to start
-  Doorbell write triggers controller to process
-
-Event Ring (controller -> host):
-  [Event TRB 0] [Event TRB 1] ...
-  Interrupt or poll to check new events
-
-Transfer Rings (per-endpoint):
-  [Setup TRB] [Data TRB] [Status TRB]  -- control transfers
-  [Normal TRB] [Normal TRB]            -- bulk/interrupt transfers
-```
 
 ---
 
@@ -199,23 +326,6 @@ discovery + command/response protocol.
 | `codec.rs` | Codec discovery: widget tree walk, pin config, DAC/ADC routing |
 | `stream.rs` | Stream descriptor setup: BDL (Buffer Descriptor List), format, DMA |
 | `driver.rs` | `HdaController` with init, discover_codecs, play_pcm |
-
-### CORB/RIRB Protocol
-
-```
-Host sends verb to codec:
-  CORB[write_ptr] = (codec_id << 28) | (nid << 20) | verb
-  Write CORBWP to advance
-
-Codec responds:
-  RIRB[read_ptr] = response (32 bits) + solicited flag
-  Read RIRBWP to check for new responses
-
-Stream playback:
-  BDL: array of (buffer_addr, buffer_length) entries
-  Stream registers: CTL, STS, LPIB, CBL, FMT
-  DMA reads PCM samples from BDL buffers
-```
 
 ---
 
@@ -236,20 +346,6 @@ reverse-engineering from the nouveau project and envytools.
 | `compute.rs` | Compute class setup: shader program load, grid/block dispatch |
 | `tensor.rs` | Tensor operations: matmul, softmax, layernorm, GELU activation |
 | `driver.rs` | `GpuDevice` high-level API: init, query capabilities, dispatch compute |
-
-### Compute Dispatch Flow
-
-```
-1. Detect GPU via PCI (vendor 0x10DE)
-2. Map BAR0 (MMIO registers) + BAR1 (VRAM aperture)
-3. Boot Falcon microcontrollers (PMU, SEC2)
-4. Create GPFIFO channel + push buffer
-5. Load compute shader to GPU memory
-6. Set up grid dimensions (blocks x threads)
-7. Write method calls to push buffer
-8. Ring doorbell to submit work
-9. Poll for completion or wait for interrupt
-```
 
 ---
 
@@ -315,15 +411,3 @@ ACPI table parsing provides hardware discovery and power management.
 | `mcfg.rs` | MCFG parsing: ECAM base, bus range for PCIe config space |
 | `hpet.rs` | HPET parsing: base address, comparator count, min tick |
 | `driver.rs` | `AcpiTables` with init, shutdown, reboot |
-
-### Power Management
-
-```rust
-// Shutdown via ACPI PM1a control register:
-// Write SLP_TYP | SLP_EN to PM1a_CNT
-let pm1a_cnt = fadt.pm1a_control_block;
-outw(pm1a_cnt, (slp_typ << 10) | (1 << 13));
-
-// Reboot via keyboard controller (fallback):
-outb(0x64, 0xFE);
-```

@@ -29,6 +29,8 @@ members = [
     "crates/sshd",
     "crates/vfs",
     "crates/shell",
+    "crates/usb-storage",
+    "crates/bluetooth",
 ]
 exclude = [
     "tools/image-builder",  # Host-side tool, must NOT inherit x86_64-unknown-none target

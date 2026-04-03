@@ -61,7 +61,7 @@ The shell is `#![no_std]` and runs directly on the bare-metal kernel.
 | `clear` | `clear` | Clear the terminal screen |
 | `reboot` | `reboot` | Reboot the system (via ACPI or keyboard controller) |
 | `shutdown` | `shutdown` | Shutdown the system (via ACPI) |
-| `date` | `date` | Show current date and time |
+| `date` | `date` | Show current date and time (from RTC wall clock) |
 | `uptime` | `uptime` | Show system uptime |
 | `free` | `free` | Show memory usage (total, used, free) |
 
@@ -89,6 +89,52 @@ The shell is `#![no_std]` and runs directly on the bare-metal kernel.
 | `help` | `help` | Show list of available commands |
 | `history` | `history` | Show command history |
 | `exit` | `exit` | Exit the shell |
+
+### Theme Commands
+
+| Command | Usage | Description |
+|---------|-------|-------------|
+| `theme` | `theme <name>` | Switch color theme at runtime |
+| `theme list` | `theme list` | List all 9 available themes |
+
+Available themes: `default`, `solarized-dark`, `solarized-light`, `monokai`,
+`dracula`, `nord`, `gruvbox`, `claudioos`, `templeos`.
+
+### Screensaver Commands
+
+| Command | Usage | Description |
+|---------|-------|-------------|
+| `screensaver` | `screensaver <mode>` | Activate a screensaver mode |
+| `screensaver list` | `screensaver list` | List all 5 available modes |
+
+Available modes: `starfield`, `matrix`, `bouncing`, `pipes`, `clock`.
+The screensaver activates automatically after 5 minutes of idle time.
+Any keypress deactivates it.
+
+### Conversation Management Commands
+
+| Command | Usage | Description |
+|---------|-------|-------------|
+| `conversations` / `convos` | `conversations` | List recent claude.ai conversations |
+| `conv use <uuid>` | `conv use abc123...` | Switch agent to use this conversation |
+| `conv rename <uuid> <name>` | `conv rename abc123 "My Project"` | Rename a conversation |
+| `conv delete <uuid>` | `conv delete abc123...` | Delete a conversation |
+| `conv new [name]` | `conv new "New Chat"` | Start a new conversation |
+
+These commands require claude.ai auth mode. They interact with the claude.ai REST API
+to manage conversations.
+
+### IPC Commands
+
+| Command | Usage | Description |
+|---------|-------|-------------|
+| `/msg <agent> <text>` | `/msg agent-1 hello` | Send a message to another agent |
+| `/broadcast <text>` | `/broadcast attention` | Send a message to all agents |
+| `/inbox` | `/inbox` | Read pending messages from other agents |
+| `/agents` | `/agents` | List all registered agents with IPC |
+| `/channel create <name>` | `/channel create shared-data` | Create a named data channel |
+| `/channel read <name>` | `/channel read shared-data` | Read from a named channel |
+| `/channel write <name> <data>` | `/channel write shared-data hello` | Write to a named channel |
 
 ---
 
@@ -222,9 +268,8 @@ to the VFS for live path completion.
 
 ## Integration
 
-The shell is designed to run as a pane type in the agent dashboard. The wiring
-between the shell crate and the kernel dashboard is tracked in `docs/ROADMAP.md`
-under "TODO -- Critical: Wire shell to dashboard."
+The shell runs as a pane type in the agent dashboard. It is fully integrated
+and accessible via `Ctrl+B s` (create new shell pane).
 
 ```rust
 use claudio_shell::{Shell, LineReader, Environment};

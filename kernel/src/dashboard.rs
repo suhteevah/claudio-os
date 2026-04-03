@@ -444,6 +444,7 @@ pub async fn run_dashboard(
         pane.write_str("  \x1b[32mPhase 4\x1b[0m: Multi-agent dashboard ........ \x1b[92mOK\x1b[0m\r\n");
         pane.write_str("\r\n");
         pane.write_str("\x1b[90mCtrl+B then \" = split | n/p = focus | c = new agent | s = new shell | f = files | w = browser | x = close\x1b[0m\r\n");
+        pane.write_str("\x1b[90mCtrl+Alt+F1-F6 = virtual consoles | Ctrl+Shift+C/V = copy/paste | Ctrl+Shift+H = clipboard history\x1b[0m\r\n");
         pane.write_str("\x1b[90mIPC: /msg <agent> <text> | /broadcast <text> | /inbox | /agents | /channel create|read|write\x1b[0m\r\n");
         pane.write_str("\x1b[90mType commands or natural language. Type 'help' for builtins.\x1b[0m\r\n");
         pane.write_str("\r\n");
@@ -478,6 +479,17 @@ pub async fn run_dashboard(
         let key = stream.next_key().await;
         screensaver.record_input();
 
+        // Virtual console check: if we're not on console 0 (dashboard),
+        // the dashboard doesn't process input. The Ctrl+Alt+F1-F6 switching
+        // is handled at the ISR level (interrupts.rs). We just skip here.
+        if crate::vconsole::active_console() != 0 {
+            // If on kernel log console (6), refresh the log display.
+            if crate::vconsole::is_kernel_log_active() {
+                render_kernel_log_fullscreen();
+            }
+            continue;
+        }
+
         match key {
             DecodedKey::Unicode(c) => {
                 match prefix_state {
@@ -504,6 +516,69 @@ pub async fn run_dashboard(
                             prefix_state = PrefixState::AwaitingCommand;
                             log::debug!("[dashboard] prefix key (Ctrl+B) pressed");
                             continue;
+                        }
+
+                        // Clipboard shortcuts (Ctrl+Shift detected via scancode modifier tracking):
+                        // Ctrl+C (0x03) with Shift held = copy, Ctrl+V (0x16) with Shift held = paste,
+                        // Ctrl+H (0x08) with Shift held = cycle clipboard history.
+                        if crate::vconsole::shift_held() {
+                            match c {
+                                '\x03' => {
+                                    // Ctrl+Shift+C — copy current input buffer to clipboard.
+                                    let focused_pane_id = layout.focused_pane_id();
+                                    if let Some(buf) = input_buffers.iter().find(|b| b.pane_id == focused_pane_id) {
+                                        let text = buf.as_str();
+                                        if !text.is_empty() {
+                                            crate::clipboard::copy(text);
+                                            if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                                                pane.write_str("\x1b[90m[copied]\x1b[0m");
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                '\x16' => {
+                                    // Ctrl+Shift+V — paste clipboard into current input buffer.
+                                    let focused_pane_id = layout.focused_pane_id();
+                                    let text = crate::clipboard::paste();
+                                    if !text.is_empty() {
+                                        if let Some(buf) = input_buffers.iter_mut().find(|b| b.pane_id == focused_pane_id) {
+                                            for ch in text.chars() {
+                                                if !ch.is_control() || ch == '\t' {
+                                                    buf.push(ch);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                '\x08' => {
+                                    // Ctrl+Shift+H — cycle clipboard history, paste selection.
+                                    let focused_pane_id = layout.focused_pane_id();
+                                    let text = crate::clipboard::cycle_history();
+                                    if !text.is_empty() {
+                                        if let Some(buf) = input_buffers.iter_mut().find(|b| b.pane_id == focused_pane_id) {
+                                            // Replace current input with the history entry.
+                                            buf.drain();
+                                            for ch in text.chars() {
+                                                if !ch.is_control() || ch == '\t' {
+                                                    buf.push(ch);
+                                                }
+                                            }
+                                        }
+                                        if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                                            let preview = if text.len() > 40 {
+                                                &text[..40]
+                                            } else {
+                                                &text
+                                            };
+                                            pane.write_str(&format!("\x1b[90m[clipboard: {}...]\x1b[0m", preview));
+                                        }
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
                         }
 
                         let focused_pane_id = layout.focused_pane_id();
@@ -939,6 +1014,91 @@ async fn submit_input_for_focused(
                 pane.write_str("\r\n");
             }
             return;
+        }
+
+        // Intercept network utility commands (ping, wget, curl, netstat, etc.).
+        {
+            let trimmed_net = input_text.trim();
+            if let Some(net_output) = crate::nettools::try_handle_netcmd(trimmed_net, stack, now) {
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    pane.write_str(&format!("\r\n\x1b[32m$ {}\x1b[0m\r\n", trimmed_net));
+                }
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    let terminal_output = net_output.replace('\n', "\r\n");
+                    pane.write_str(&terminal_output);
+                    if !net_output.ends_with('\n') {
+                        pane.write_str("\r\n");
+                    }
+                }
+                // Add to shell history.
+                if let PaneType::Shell(ss) = &mut pane_types[pane_type_idx] {
+                    ss.shell.history.push(trimmed_net);
+                }
+                return;
+            }
+        }
+
+        // Intercept `fw` firewall commands.
+        {
+            let trimmed_fw = input_text.trim();
+            if trimmed_fw == "fw" || trimmed_fw.starts_with("fw ") {
+                let fw_args = trimmed_fw.strip_prefix("fw").unwrap_or("").trim();
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    pane.write_str(&format!("\r\n\x1b[32m$ {}\x1b[0m\r\n", trimmed_fw));
+                }
+                let fw_output = crate::firewall::handle_command(fw_args);
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    let terminal_output = fw_output.replace('\n', "\r\n");
+                    pane.write_str(&terminal_output);
+                    if !fw_output.ends_with('\n') {
+                        pane.write_str("\r\n");
+                    }
+                }
+                if let PaneType::Shell(ss) = &mut pane_types[pane_type_idx] {
+                    ss.shell.history.push(trimmed_fw);
+                }
+                return;
+            }
+        }
+
+        // Intercept `man` and enhanced `help` commands.
+        {
+            let trimmed_man = input_text.trim();
+            if trimmed_man == "man" || trimmed_man.starts_with("man ") {
+                let man_args = trimmed_man.strip_prefix("man").unwrap_or("").trim();
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    pane.write_str(&format!("\r\n\x1b[32m$ {}\x1b[0m\r\n", trimmed_man));
+                }
+                let man_output = crate::manpages::handle_command(man_args);
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    let terminal_output = man_output.replace('\n', "\r\n");
+                    pane.write_str(&terminal_output);
+                    if !man_output.ends_with('\n') {
+                        pane.write_str("\r\n");
+                    }
+                }
+                if let PaneType::Shell(ss) = &mut pane_types[pane_type_idx] {
+                    ss.shell.history.push(trimmed_man);
+                }
+                return;
+            }
+            if trimmed_man == "help" {
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    pane.write_str(&format!("\r\n\x1b[32m$ {}\x1b[0m\r\n", trimmed_man));
+                }
+                let help_output = crate::manpages::help_with_manpages();
+                if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+                    let terminal_output = help_output.replace('\n', "\r\n");
+                    pane.write_str(&terminal_output);
+                    if !help_output.ends_with('\n') {
+                        pane.write_str("\r\n");
+                    }
+                }
+                if let PaneType::Shell(ss) = &mut pane_types[pane_type_idx] {
+                    ss.shell.history.push(trimmed_man);
+                }
+                return;
+            }
         }
 
         submit_shell_input(
@@ -1489,6 +1649,44 @@ fn render_full(layout: &mut Layout) {
     });
     crate::framebuffer::blit_full();
     log::debug!("[dashboard] full render completed");
+}
+
+/// Render the kernel log (vconsole 6) as a full-screen text display.
+/// Uses a simple line-by-line rendering approach into the back buffer.
+fn render_kernel_log_fullscreen() {
+    let fb_width = crate::framebuffer::width();
+    let fb_height = crate::framebuffer::height();
+    let font_height = FONT_HEIGHT;
+    let max_rows = if font_height > 0 { fb_height / font_height } else { 40 };
+
+    let header = format!(
+        "\x1b[96m[ Kernel Log — Console 6 (read-only) — {} lines total ]\x1b[0m",
+        crate::vconsole::kernel_log_line_count()
+    );
+    let log_text = crate::vconsole::kernel_log_text(max_rows.saturating_sub(3));
+
+    // Use a temporary single-pane layout to render the log text with ANSI support.
+    let mut tmp_layout = Layout::new(fb_width, fb_height);
+    let pane_id = tmp_layout.focused_pane_id();
+    if let Some(pane) = tmp_layout.pane_by_id_mut(pane_id) {
+        pane.write_str(&header);
+        pane.write_str("\r\n\x1b[90m");
+        for _ in 0..60 { pane.write_str("\u{2500}"); }
+        pane.write_str("\x1b[0m\r\n");
+        pane.write_str(&log_text);
+    }
+
+    crate::framebuffer::with_back_buffer(|buf, w, h, stride, bpp| {
+        let mut target = BackBufDrawTarget {
+            buf,
+            width: w,
+            height: h,
+            stride,
+            bpp,
+        };
+        tmp_layout.render_all_and_clear(&mut target);
+    });
+    crate::framebuffer::blit_full();
 }
 
 // ---------------------------------------------------------------------------

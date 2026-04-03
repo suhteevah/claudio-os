@@ -17,6 +17,10 @@ single-address-space async Rust application manages all hardware.
 |  | Agent 1 (pane)    | | Agent 2 (pane)    | | Agent 3 (pane)    |  |
 |  | claude session    | | claude session    | | claude session    |  |
 |  +-------------------+ +-------------------+ +-------------------+  |
+|  +---------+ +---------+ +----------+ +----------+ +-----------+   |
+|  | Shell   | | Browser | | FileMgr  | | SysMon   | | Screen-   |   |
+|  | (pane)  | | (pane)  | | (pane)   | | (pane)   | | saver     |   |
+|  +---------+ +---------+ +----------+ +----------+ +-----------+   |
 |  +-----------------------------------------------------------+     |
 |  | AI-Native Shell  (28 builtins + natural language -> Claude)|     |
 |  +-----------------------------------------------------------+     |
@@ -25,6 +29,10 @@ single-address-space async Rust application manages all hardware.
 |  +-------------------+ +-------------------+ +-------------------+  |
 |  | Agent Manager     | | Dashboard/Layout  | | SSH Daemon (PQ)   |  |
 |  | tool loop, state  | | tmux-style panes  | | ML-KEM + X25519   |  |
+|  +-------------------+ +-------------------+ +-------------------+  |
+|  +-------------------+ +-------------------+ +-------------------+  |
+|  | Session Refresh   | | Conversations     | | IPC (msg bus +    |  |
+|  | JWT expiry, auto  | | list/select/del   | | channels + shmem) |  |
 |  +-------------------+ +-------------------+ +-------------------+  |
 +=====================================================================+
 |                       APPLICATION SERVICES                          |
@@ -63,20 +71,27 @@ single-address-space async Rust application manages all hardware.
 |  | PS/2 Kbd | | HDA     | | GPU       | | ACPI   | | SMP/APIC   | |
 |  | IRQ1     | | Audio   | | NVIDIA    | | tables | | multi-core | |
 |  +----------+ +---------+ +-----------+ +--------+ +------------+ |
+|  +----------+ +---------+ +-----------+                            |
+|  | USB Mouse| | RTC     | | PC Speaker|                            |
+|  | HID boot | | CMOS    | | PIT ch2   |                            |
+|  +----------+ +---------+ +-----------+                            |
 +=====================================================================+
-|                       KERNEL CORE                                   |
+|                       KERNEL SERVICES                               |
+|  +---------------------------------------------------------------+ |
+|  | Init System | Users | Themes | Splash | Screensaver | Chime   | |
 |  +---------------------------------------------------------------+ |
 |  | Async Executor (interrupt-driven, hlt when idle)              | |
 |  +---------------------------------------------------------------+ |
 |  | Memory: 48 MiB heap (linked_list_allocator), page tables      | |
-|  | CPU: GDT + TSS, IDT, 8259 PIC, PIT timer (18.2 Hz)           | |
+|  | CPU: GDT + TSS, IDT, 8259 PIC / APIC, PIT timer (18.2 Hz)   | |
 |  | PCI: bus enumeration, BAR mapping, bus mastering               | |
 |  +---------------------------------------------------------------+ |
 +=====================================================================+
 |                       BOOT                                          |
 |  +---------------------------------------------------------------+ |
 |  | UEFI -> bootloader v0.11 -> kernel_main -> post_stack_switch  | |
-|  |   -> main_async -> network init -> auth -> dashboard          | |
+|  |   -> splash -> ACPI -> SMP -> USB -> RTC -> network -> auth   | |
+|  |   -> init system -> SSH -> dashboard                          | |
 |  +---------------------------------------------------------------+ |
 +=====================================================================+
 ```
@@ -103,8 +118,13 @@ kernel_main(boot_info)
   |-- Phase 2: Heap allocator (48 MiB via linked_list_allocator)
   |-- Phase 3: IDT + 8259 PIC (APIC disabled for UEFI compat)
   |-- Phase 3b: PS/2 keyboard decoder
-  |-- Phase 4: Framebuffer init + early banner render
+  |-- Phase 4: Framebuffer init + boot splash (Hardware stage)
+  |-- Phase 4b: Boot chime (PC speaker C5-E5-G5)
   |-- Phase 5: PCI bus enumeration + device discovery
+  |-- Phase 5b: ACPI table discovery (MADT, FADT, HPET, MCFG)
+  |-- Phase 5c: SMP init (boot AP cores, switch to APIC mode)
+  |-- Phase 5d: USB init (xHCI controller, keyboard, mouse)
+  |-- Phase 5e: RTC init (read CMOS wall clock)
   |-- Phase 6: Allocate 4 MiB heap stack, switch RSP
   |
   v
@@ -114,19 +134,31 @@ post_stack_switch()
   |
   v
 main_async()
-  |-- Find NIC (VirtIO-net or e1000)
-  |-- Init VirtIO driver + smoltcp + DHCP
+  |-- Boot splash (Network stage)
+  |-- Find NIC (VirtIO-net or Intel e1000)
+  |-- Init network driver + smoltcp + DHCP
   |-- Resolve DNS
+  |-- Boot splash (Authenticating stage)
+  |-- Init system (load config from fw_cfg)
+  |-- Init user database
   |-- Authenticate (API key or claude.ai OAuth)
-  |-- Load session (fw_cfg for persistence across reboots)
-  |-- Launch agent dashboard
+  |-- Init session manager (JWT expiry tracking, auto-refresh)
+  |-- Start SSH server on port 22
+  |-- Boot splash (Ready stage)
+  |-- Hide splash, launch agent dashboard
   |
   v
 Dashboard loop (forever)
-  |-- Render split-pane terminal
-  |-- Handle keyboard input
-  |-- Dispatch to agent sessions
+  |-- Render split-pane terminal (6 pane types)
+  |-- Handle keyboard + USB mouse input
+  |-- Dispatch to agent sessions / shell / browser / file manager
   |-- Agent tool loop (send -> tool_use -> execute -> resend)
+  |-- IPC message delivery
+  |-- Poll SSH server
+  |-- Poll USB keyboard/mouse
+  |-- Session refresh periodic check
+  |-- Screensaver idle timeout check
+  |-- System monitor auto-refresh
 ```
 
 ## Memory Layout
@@ -197,19 +229,24 @@ kernel
   +-- wraith-render
   +-- wraith-transport
   +-- rustc-lite
-        +-- cranelift-codegen-nostd
-        +-- cranelift-frontend-nostd
-        +-- cranelift-codegen-shared-nostd
-        +-- cranelift-control-nostd
-        +-- rustc-hash-nostd
-        +-- arbitrary-stub
+  |     +-- cranelift-codegen-nostd
+  |     +-- cranelift-frontend-nostd
+  |     +-- cranelift-codegen-shared-nostd
+  |     +-- cranelift-control-nostd
+  |     +-- rustc-hash-nostd
+  |     +-- arbitrary-stub
+  +-- kernel modules (17):
+        acpi_init, smp_init, usb, intel_nic, ssh_server,
+        rtc, mouse, ipc, init, users, sysmon, splash,
+        boot_sound, themes, screensaver, browser, filemanager,
+        conversations, session_manager
 ```
 
-## All 33 Crates
+## All 33 Crates + 17 Kernel Modules
 
 | # | Crate | Path | Lines | Description |
 |---|-------|------|-------|-------------|
-| 1 | `claudio-os` | `kernel/` | 4,537 | Kernel binary: boot, hardware init, async executor, dashboard |
+| 1 | `claudio-os` | `kernel/` | 4,537+ | Kernel binary: boot, hardware init, async executor, dashboard |
 | 2 | `claudio-terminal` | `crates/terminal/` | 1,794 | Framebuffer terminal, split panes, ANSI/VTE, font rendering |
 | 3 | `claudio-net` | `crates/net/` | 3,172 | VirtIO-net driver, smoltcp TCP/IP, TLS 1.3, HTTP/SSE |
 | 4 | `claudio-api` | `crates/api-client/` | 1,849 | Anthropic Messages API client, SSE streaming, tool use protocol |
@@ -244,6 +281,30 @@ kernel
 | 33 | `rustc-hash-nostd` | `crates/rustc-hash-nostd/` | -- | Forked rustc-hash for no_std |
 | -- | `arbitrary-stub` | `crates/arbitrary-stub/` | -- | no_std stub for arbitrary crate (Cranelift dep) |
 
+### Kernel Modules (17)
+
+| Module | Path | Description |
+|--------|------|-------------|
+| `acpi_init` | `kernel/src/acpi_init.rs` | ACPI hardware discovery: MADT (CPUs, I/O APICs), FADT (power mgmt, S5 shutdown), HPET (precision timer), MCFG (PCIe ECAM) |
+| `smp_init` | `kernel/src/smp_init.rs` | Multi-core boot: reads MADT, disables legacy PIC, boots AP cores via SIPI, enables APIC mode |
+| `usb` | `kernel/src/usb.rs` | xHCI controller PCI detection, USB keyboard -> PS/2 scancode bridge, USB mouse polling stub |
+| `intel_nic` | `kernel/src/intel_nic.rs` | Intel NIC -> smoltcp Device adapter, page-table virt-to-phys, IntelNetworkStack with DHCP |
+| `ssh_server` | `kernel/src/ssh_server.rs` | SSH listener on port 22, TCP session management, version exchange, echo shell, up to 4 sessions |
+| `rtc` | `kernel/src/rtc.rs` | CMOS RTC (MC146818), BCD/binary decode, 12h/24h, boot timestamp, PIT-corrected wall clock |
+| `mouse` | `kernel/src/mouse.rs` | USB HID boot protocol mouse, XOR crosshair cursor on framebuffer, event queue |
+| `ipc` | `kernel/src/ipc.rs` | Message bus (per-agent inboxes), named channels (4K ring buffers), shared memory, 8 tools |
+| `init` | `kernel/src/init.rs` | fw_cfg config loading (key=value), hostname, log level, auto-mount, SSH, startup scripts |
+| `users` | `kernel/src/users.rs` | User database, SHA-256 password auth (in-kernel impl), SSH public key auth, default "matt" user |
+| `sysmon` | `kernel/src/sysmon.rs` | System monitor pane: CPU/memory/network/agent stats, ANSI progress bars, auto-refresh |
+| `splash` | `kernel/src/splash.rs` | Boot splash: ASCII art "CLAUDIOOS" logo, 4-stage progress bar (Hardware/Network/Auth/Ready) |
+| `boot_sound` | `kernel/src/boot_sound.rs` | PC speaker boot chime: PIT channel 2, C5-E5-G5 ascending triad (523/659/784 Hz) |
+| `themes` | `kernel/src/themes.rs` | 9 color themes: default, solarized-dark/light, monokai, dracula, nord, gruvbox, claudioos, templeos |
+| `screensaver` | `kernel/src/screensaver.rs` | 5 modes: 3D starfield, matrix rain, bouncing logo, pipes, digital clock. Idle timeout activation |
+| `browser` | `kernel/src/browser.rs` | Text-mode web browser pane: wraith HTML/CSS rendering, URL bar, link following, history, scroll |
+| `filemanager` | `kernel/src/filemanager.rs` | Visual file manager pane: directory listing, copy/move/rename/delete, search filter, VFS integration |
+| `conversations` | `kernel/src/conversations.rs` | Conversation management: list/select/rename/delete via claude.ai REST API, per-agent active conv |
+| `session_manager` | `kernel/src/session_manager.rs` | Session auto-refresh: JWT expiry parsing, periodic /api/auth/session refresh, warning thresholds |
+
 ## Network Stack
 
 ```
@@ -264,7 +325,7 @@ claude.ai API / api.anthropic.com
         v
   NIC Driver
         |-- VirtIO-net (legacy 0.9.5) for QEMU
-        |-- Intel e1000/e1000e/igc for real hardware
+        |-- Intel e1000/e1000e/igc for real hardware (via intel_nic module)
         v
   PCI Bus (BAR mapping, bus mastering, IRQ routing)
 ```
@@ -276,3 +337,5 @@ claude.ai API / api.anthropic.com
 3. **Everything is no_std** -- All crates use `#![no_std]` with `extern crate alloc`. No libc, no POSIX.
 4. **Direct hardware access** -- Volatile MMIO for all device drivers. No HAL abstraction layers.
 5. **Minimal dependencies** -- Only well-audited no_std crates from crates.io. Forked when necessary.
+6. **Multiple pane types** -- Dashboard supports 6 pane types: Agent, Shell, Browser, FileManager, SysMonitor, Screensaver.
+7. **Agent collaboration** -- IPC message bus, named channels, and shared memory let agents communicate and collaborate.

@@ -40,51 +40,52 @@ type: project
 - [x] SMP multi-core (APIC, trampoline, work-stealing scheduler)
 - [x] GPU compute (NVIDIA, Falcon, FIFO, tensor ops)
 - [x] VFS layer (mount table, GPT/MBR, POSIX file API)
-- [x] AI-native shell (28 builtins + natural language → Claude)
+- [x] AI-native shell (28 builtins + natural language -> Claude)
 - [x] Post-quantum SSH daemon (ML-KEM-768 + X25519, ML-DSA-65)
+- [x] ACPI wired into boot sequence (hardware discovery, MADT->SMP, FADT->power, HPET->timer, MCFG->PCIe)
+- [x] SMP wired to boot sequence (MADT-driven AP boot, APIC mode, work-stealing scheduler)
+- [x] USB keyboard wired to dashboard (xHCI -> PS/2 scancode queue bridge)
+- [x] Intel NIC wired to smoltcp (E1000 Device adapter, DHCP, full TCP/IP stack)
+- [x] SSH server wired to smoltcp TCP (port 22 listener, session state machines, echo shell)
+- [x] RTC wall clock (CMOS MC146818, BCD/binary, 12h/24h, PIT-corrected uptime)
+- [x] USB mouse support (HID boot protocol, XOR crosshair cursor, event queue)
+- [x] Inter-agent IPC (message bus, named channels, shared memory, 8 agent tools)
+- [x] Init system (fw_cfg config loading, hostname, log level, auto-mount, startup scripts)
+- [x] User accounts (SHA-256 password auth, SSH public key auth, user database)
+- [x] System monitor pane (CPU/memory/network/agent stats, auto-refresh)
+- [x] Boot splash screen (ASCII art logo, 4-stage progress bar)
+- [x] Boot chime (PC speaker, C5-E5-G5 ascending triad)
+- [x] Color themes (9 built-in: default, solarized-dark/light, monokai, dracula, nord, gruvbox, claudioos, templeos)
+- [x] Screensaver (5 modes: starfield, matrix rain, bouncing logo, pipes, clock)
+- [x] Web browser pane (wraith-based, URL bar, link following, history, scroll)
+- [x] File manager pane (directory listing, navigation, copy/move/rename/delete/search)
+- [x] Conversation management (list, select, rename, delete conversations via claude.ai API)
+- [x] Session auto-refresh (JWT expiry parsing, automatic /api/auth/session refresh, warning thresholds)
 
-## TODO — Critical (can't ship without)
+## TODO -- Critical (can't ship without)
 - [ ] Wire VFS to real storage drivers (AHCI/NVMe + ext4/btrfs)
-- [ ] Wire shell to dashboard (shell as a pane type)
-- [ ] Wire SSH daemon to smoltcp TCP + terminal panes
-- [ ] Wire xHCI USB keyboard to dashboard (replace PS/2 for real hardware)
-- [ ] Wire Intel NIC to smoltcp (replace VirtIO-net for real hardware)
-- [ ] Wire ACPI to boot sequence (hardware discovery, APIC setup)
-- [ ] Wire SMP to agent sessions (one agent per core)
 - [ ] Boot on real hardware (i9-11900K test first)
-- [ ] RTC — real-time clock (CMOS or HPET) for wall clock time
 - [ ] Fix keyboard input in QEMU graphical mode
 
-## TODO — Important (makes it usable daily)
-- [ ] Mouse support (USB HID mouse via xHCI)
-- [ ] Pipes/IPC between agents
+## TODO -- Important (makes it usable daily)
 - [ ] Agent naming (Ctrl+B , to rename)
-- [ ] init system (boot sequence configuration)
-- [ ] User accounts + login (for SSH)
-- [ ] Authorized keys management
-- [ ] Config file persistence (FAT32 or ext4 on disk)
+- [ ] Config file persistence to disk (FAT32 or ext4 on disk)
 - [ ] Log file output (serial to file, or disk-backed)
-- [ ] Session token auto-refresh before expiry
-- [ ] Conversation management (list, select, delete old ones)
+- [ ] Wire SSH shell to real shell crate (currently echo shell)
+- [ ] Authorized keys management CLI
+- [ ] Full pane integration for SSH (route SSH channel I/O to dashboard terminal panes)
 
-## TODO — Killer features (differentiators)
-- [ ] Claude as shell (natural language → executed commands)
+## TODO -- Killer features (differentiators)
+- [ ] Claude as shell (natural language -> executed commands)
 - [ ] GPU LLM inference (run local models on RTX 3070 Ti)
 - [ ] Live code reload (Cranelift JIT hot-swap)
-- [ ] Agent collaboration (agents talking to each other)
-- [ ] Web browser in a pane (wraith text-mode rendering)
-- [ ] File manager (visual directory browser)
-- [ ] System monitor (CPU/memory/network dashboard)
 - [ ] Boot from USB stick
 - [ ] PXE network boot
 - [ ] Wi-Fi driver (Intel AX201)
 
-## TODO — Polish
+## TODO -- Polish
 - [ ] Better font rendering (anti-aliased if GPU available)
-- [ ] Color themes
-- [ ] Startup animation / splash screen
-- [ ] Sound effects (boot chime via HDA)
-- [ ] Screensaver (like TempleOS flight sim)
+- [ ] Tab completion for file paths and command names
 
 ## Published Open-Source Crates (19)
 1. ext4-rw

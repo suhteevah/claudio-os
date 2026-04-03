@@ -23,14 +23,29 @@ handshakes to SSE streaming -- is a single-address-space async Rust application.
 ## Feature Highlights
 
 - **Multi-agent dashboard** -- tmux-style split panes, each running an independent Claude session
+- **6 pane types** -- Agent, Shell, Web Browser, File Manager, System Monitor, Screensaver
 - **Native TLS 1.3** -- AES-128-GCM-SHA256 with hardware AES-NI, direct HTTPS to Claude APIs
 - **Two auth modes** -- claude.ai Max subscription (OAuth) or Anthropic API key
+- **Session auto-refresh** -- JWT expiry detection, automatic token refresh before expiry
 - **AI-native shell** -- 28 Unix-like builtins + natural language mode (type English, get commands)
 - **Full filesystem stack** -- ext4, btrfs, NTFS, FAT32, VFS layer, GPT/MBR partition detection
-- **Hardware drivers** -- AHCI/SATA, NVMe, Intel NIC, xHCI USB, HDA audio, NVIDIA GPU, SMP
-- **Post-quantum SSH** -- ML-KEM-768 + X25519 hybrid KEX, ML-DSA-65 host keys
+- **Hardware drivers** -- AHCI/SATA, NVMe, Intel NIC, xHCI USB (keyboard + mouse), HDA audio, NVIDIA GPU, SMP
+- **ACPI hardware discovery** -- MADT (CPU cores, I/O APICs), FADT (power management), HPET (precision timer), MCFG (PCIe ECAM)
+- **SMP multi-core** -- APIC-mode interrupt routing, AP core startup via SIPI, work-stealing scheduler
+- **Post-quantum SSH** -- ML-KEM-768 + X25519 hybrid KEX, ML-DSA-65 host keys, port 22
+- **Inter-agent IPC** -- message bus, named channels, shared memory, 8 IPC tools for Claude agents
 - **Dev tools** -- Python interpreter, JavaScript evaluator, Rust compiler (Cranelift JIT), nano-like editor
-- **Text-mode browser** -- HTML parser, CSS selectors, HTTP/HTTPS transport (wraith)
+- **Text-mode browser** -- HTML parser, CSS selectors, HTTP/HTTPS transport (wraith), link following
+- **File manager** -- visual directory browser with copy, move, rename, delete, search
+- **System monitor** -- real-time CPU, memory, network, and agent stats dashboard
+- **Conversation management** -- list, select, rename, delete claude.ai conversations
+- **Init system** -- fw_cfg config, hostname, log level, auto-mount, startup scripts
+- **User accounts** -- SHA-256 password auth, SSH public key auth, user database
+- **RTC wall clock** -- CMOS real-time clock for timestamps, uptime tracking
+- **Color themes** -- 9 built-in themes (solarized, monokai, dracula, nord, gruvbox, and more)
+- **Boot splash** -- ASCII art logo with 4-stage progress bar
+- **Boot chime** -- PC speaker C5-E5-G5 ascending triad
+- **Screensaver** -- 5 modes: starfield, matrix rain, bouncing logo, pipes, digital clock
 - **Session persistence** -- Conversations survive reboots via QEMU fw_cfg
 
 ---
@@ -40,21 +55,27 @@ handshakes to SSE streaming -- is a single-address-space async Rust application.
 ```
 +=====================================================================+
 |  Agent Dashboard (tmux-style split panes)                           |
-|  +-------------------+ +-------------------+ +-------------------+  |
-|  | Agent 1 (Claude)  | | Agent 2 (Claude)  | | Agent 3 (Claude)  |  |
-|  +-------------------+ +-------------------+ +-------------------+  |
+|  +--------+ +--------+ +--------+ +--------+ +--------+ +--------+ |
+|  | Agent  | | Shell  | |Browser | |FileMgr | |SysMon  | |Screen- | |
+|  | (Claude| | (28    | |(wraith | |(visual | |(CPU/   | | saver  | |
+|  |  tools)| |  cmds) | | + TLS) | | dirs)  | | mem)   | | (5x)   | |
+|  +--------+ +--------+ +--------+ +--------+ +--------+ +--------+ |
 +=====================================================================+
-|  Shell (28 builtins + AI)  |  SSH Daemon (post-quantum)             |
+|  Shell (28 builtins + AI)  |  SSH Daemon (post-quantum, port 22)    |
 +============================+========================================+
 |  API Client (SSE) | Auth (OAuth/key) | Editor | Python | JS | Rust |
+|  IPC (msg bus + channels)  | Conversations | Session Refresh        |
 +=====================================================================+
 |  VFS: ext4 | btrfs | NTFS | FAT32 | GPT/MBR                       |
 +=====================================================================+
 |  TLS 1.3 (embedded-tls) | smoltcp TCP/IP (DHCP, DNS)               |
 +=====================================================================+
 |  VirtIO-net | Intel NIC | AHCI | NVMe | xHCI | HDA | GPU | SMP    |
+|  USB kbd+mouse | ACPI (MADT/FADT/HPET/MCFG) | RTC | PC Speaker    |
 +=====================================================================+
-|  Kernel: async executor, 48 MiB heap, GDT/IDT, PIC, PCI, PIT      |
+|  Init System | Users | Themes | Splash | Screensaver | Boot Chime   |
++=====================================================================+
+|  Kernel: async executor, 48 MiB heap, GDT/IDT, APIC, PCI, PIT     |
 +=====================================================================+
 |  UEFI Boot (bootloader crate v0.11)                                 |
 +=====================================================================+
@@ -109,11 +130,11 @@ setup, and troubleshooting.
 | Document | Description |
 |----------|-------------|
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Full system architecture, boot sequence, memory layout, crate graph |
-| [HARDWARE.md](docs/HARDWARE.md) | Hardware drivers: AHCI, NVMe, Intel NIC, xHCI, HDA, GPU, SMP, ACPI |
+| [HARDWARE.md](docs/HARDWARE.md) | Hardware drivers: AHCI, NVMe, Intel NIC, xHCI, HDA, GPU, SMP, ACPI, RTC, USB |
 | [NETWORKING.md](docs/networking.md) | Network stack: VirtIO-net, smoltcp, TLS 1.3, HTTP, claude.ai API, SSH |
 | [FILESYSTEMS.md](docs/FILESYSTEMS.md) | VFS layer, ext4, btrfs, NTFS, FAT32, GPT/MBR |
-| [SHELL.md](docs/SHELL.md) | AI-native shell: 28 builtins, pipes, env vars, scripting |
-| [AGENTS.md](docs/AGENTS.md) | Multi-agent system: auth modes, dashboard, tool loop, session persistence |
+| [SHELL.md](docs/SHELL.md) | AI-native shell: 28+ builtins, pipes, env vars, scripting, themes, screensaver |
+| [AGENTS.md](docs/AGENTS.md) | Multi-agent system: auth modes, dashboard, tool loop, IPC, session management |
 | [BUILDING.md](docs/building.md) | Build instructions, QEMU setup, run.ps1, troubleshooting |
 | [OPEN-SOURCE-CRATES.md](docs/OPEN-SOURCE-CRATES.md) | 19 published crates with usage examples |
 | [ROADMAP.md](docs/ROADMAP.md) | Feature roadmap and TODO list |
@@ -147,7 +168,7 @@ API documentation.
 
 | Crate | Lines | Description |
 |-------|-------|-------------|
-| kernel | 4,537 | Boot, hardware init, async executor, dashboard |
+| kernel | 4,537+ | Boot, hardware init, async executor, dashboard, 17 kernel modules |
 | claudio-terminal | 1,794 | Framebuffer terminal, split panes, ANSI/VTE |
 | claudio-net | 3,172 | VirtIO-net, smoltcp, TLS 1.3, HTTP/SSE |
 | claudio-api | 1,849 | Anthropic Messages API, SSE streaming, tools |
@@ -178,6 +199,33 @@ API documentation.
 | cranelift-*-nostd | -- | 4 forked Cranelift crates for no_std |
 | rustc-hash-nostd | -- | Forked rustc-hash for no_std |
 | arbitrary-stub | -- | no_std stub for arbitrary crate |
+
+### Kernel Modules (17)
+
+These are in-kernel modules under `kernel/src/` that wire the standalone crates
+to the hardware and dashboard:
+
+| Module | Description |
+|--------|-------------|
+| `acpi_init.rs` | ACPI table discovery: MADT, FADT, HPET, MCFG parsing and power management |
+| `smp_init.rs` | Multi-core boot: MADT-driven AP startup, APIC mode, legacy PIC disable |
+| `usb.rs` | xHCI controller init, USB keyboard -> PS/2 scancode bridge, mouse polling stub |
+| `intel_nic.rs` | Intel NIC -> smoltcp Device adapter, full network stack with DHCP |
+| `ssh_server.rs` | SSH listener on port 22, TCP session management, echo shell |
+| `rtc.rs` | CMOS RTC wall clock, BCD/binary decode, PIT-corrected uptime |
+| `mouse.rs` | USB HID mouse state, XOR crosshair cursor, event queue |
+| `ipc.rs` | Message bus, named channels, shared memory, 8 IPC tools for agents |
+| `init.rs` | fw_cfg config loading, hostname, log level, auto-mount, startup scripts |
+| `users.rs` | User database, SHA-256 password auth, SSH public key auth |
+| `sysmon.rs` | System monitor: CPU, memory, network, agent stats with ANSI rendering |
+| `splash.rs` | Boot splash: ASCII art logo, 4-stage progress bar |
+| `boot_sound.rs` | PC speaker boot chime: C5-E5-G5 ascending triad via PIT channel 2 |
+| `themes.rs` | 9 color themes with ANSI 24-bit escape generation |
+| `screensaver.rs` | 5 modes: starfield, matrix rain, bouncing logo, pipes, digital clock |
+| `browser.rs` | Text-mode web browser pane: wraith + smoltcp, URL bar, link following |
+| `filemanager.rs` | Visual file manager pane: directory listing, copy/move/rename/delete/search |
+| `conversations.rs` | Conversation management: list, select, rename, delete via claude.ai API |
+| `session_manager.rs` | Session auto-refresh: JWT expiry parsing, automatic token refresh |
 
 ---
 

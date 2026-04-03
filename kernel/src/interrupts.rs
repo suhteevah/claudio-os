@@ -369,6 +369,14 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     // otherwise the PIC may deliver the next IRQ before we read this one)
     let scancode: u8 = unsafe { Port::new(0x60).read() };
 
+    // Track modifier state and intercept Ctrl+Alt+F1-F6 for virtual console switching.
+    if let Some(console_idx) = crate::vconsole::process_scancode(scancode) {
+        crate::vconsole::switch_console(console_idx);
+        // Consume the scancode — don't pass F-key to the keyboard decoder.
+        unsafe { notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8()); }
+        return;
+    }
+
     // Push scancode to the async keyboard queue and wake the reader
     crate::keyboard::push_scancode(scancode);
 

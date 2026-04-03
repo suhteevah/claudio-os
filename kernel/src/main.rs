@@ -41,8 +41,18 @@ mod screensaver;
 mod splash;
 mod themes;
 mod session_manager;
+mod nettools;
+mod power;
+mod touchpad;
 mod usb;
 mod users;
+mod vconsole;
+mod clipboard;
+mod firewall;
+mod manpages;
+mod cron;
+mod encryption;
+mod swap;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
@@ -201,6 +211,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // This runs BEFORE networking, so it's visible even if DHCP/TLS stalls.
     splash::show_splash(splash::BootStage::Hardware);
     boot_sound::boot_chime();
+
+    // ── Phase 4c: Virtual consoles ──────────────────────────────────
+    vconsole::init();
 
     // ── Phase 5: PCI enumeration + device discovery ──────────────────
     log::info!("[boot] starting PCI enumeration...");
