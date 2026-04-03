@@ -520,13 +520,21 @@ impl Dcbaa {
     ///
     /// # Safety
     /// Memory must be identity-mapped for DMA.
-    pub unsafe fn new(max_slots: u8, ctx_size: usize, scratchpad_count: u32) -> Self {
+    pub unsafe fn new(max_slots: u8, ctx_size: usize, scratchpad_count: u32) -> Option<Self> {
         let entry_count = max_slots as usize + 1; // slot 0 = scratchpad
         let array_size = entry_count * 8; // 8 bytes per entry (u64 pointer)
-        let layout = Layout::from_size_align(array_size, 64)
-            .expect("xhci: DCBAA layout");
+        let layout = match Layout::from_size_align(array_size, 64) {
+            Ok(l) => l,
+            Err(_) => {
+                log::error!("xhci: invalid DCBAA layout");
+                return None;
+            }
+        };
         let buffer = alloc_zeroed(layout) as *mut u64;
-        assert!(!buffer.is_null(), "xhci: DCBAA allocation failed");
+        if buffer.is_null() {
+            log::error!("xhci: DCBAA allocation failed");
+            return None;
+        }
 
         let phys = buffer as u64;
 
@@ -541,17 +549,33 @@ impl Dcbaa {
 
             // Scratchpad Buffer Array: array of 64-bit physical addresses
             let sp_array_size = scratchpad_count as usize * 8;
-            let sp_array_layout = Layout::from_size_align(sp_array_size, 64)
-                .expect("xhci: scratchpad array layout");
+            let sp_array_layout = match Layout::from_size_align(sp_array_size, 64) {
+                Ok(l) => l,
+                Err(_) => {
+                    log::error!("xhci: invalid scratchpad array layout");
+                    return None;
+                }
+            };
             let sp_array = alloc_zeroed(sp_array_layout) as *mut u64;
-            assert!(!sp_array.is_null(), "xhci: scratchpad array alloc failed");
+            if sp_array.is_null() {
+                log::error!("xhci: scratchpad array alloc failed");
+                return None;
+            }
 
             // Allocate each scratchpad buffer page (4K aligned)
             for i in 0..scratchpad_count as usize {
-                let page_layout = Layout::from_size_align(4096, 4096)
-                    .expect("xhci: scratchpad page layout");
+                let page_layout = match Layout::from_size_align(4096, 4096) {
+                    Ok(l) => l,
+                    Err(_) => {
+                        log::error!("xhci: invalid scratchpad page layout");
+                        return None;
+                    }
+                };
                 let page = alloc_zeroed(page_layout);
-                assert!(!page.is_null(), "xhci: scratchpad page {} alloc failed", i);
+                if page.is_null() {
+                    log::error!("xhci: scratchpad page {} alloc failed", i);
+                    return None;
+                }
                 ptr::write_volatile(sp_array.add(i), page as u64);
             }
 
@@ -565,12 +589,12 @@ impl Dcbaa {
             device_contexts.push(None);
         }
 
-        Self {
+        Some(Self {
             buffer,
             phys,
             max_slots,
             device_contexts,
-        }
+        })
     }
 
     /// Physical address of the DCBAA (for programming DCBAAP).
@@ -582,14 +606,25 @@ impl Dcbaa {
     ///
     /// # Safety
     /// Memory must be identity-mapped.
-    pub unsafe fn alloc_device_context(&mut self, slot_id: u8, ctx_size: usize) -> u64 {
-        assert!(slot_id >= 1 && slot_id <= self.max_slots, "xhci: invalid slot_id {}", slot_id);
+    pub unsafe fn alloc_device_context(&mut self, slot_id: u8, ctx_size: usize) -> Option<u64> {
+        if slot_id < 1 || slot_id > self.max_slots {
+            log::error!("xhci: invalid slot_id {}", slot_id);
+            return None;
+        }
 
         let total_size = 32 * ctx_size; // Slot + 31 EP contexts
-        let layout = Layout::from_size_align(total_size, 64)
-            .expect("xhci: device context layout");
+        let layout = match Layout::from_size_align(total_size, 64) {
+            Ok(l) => l,
+            Err(_) => {
+                log::error!("xhci: invalid device context layout for slot {}", slot_id);
+                return None;
+            }
+        };
         let va = alloc_zeroed(layout);
-        assert!(!va.is_null(), "xhci: device context alloc failed for slot {}", slot_id);
+        if va.is_null() {
+            log::error!("xhci: device context alloc failed for slot {}", slot_id);
+            return None;
+        }
 
         let phys = va as u64;
 

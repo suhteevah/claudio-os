@@ -17,7 +17,7 @@
 use alloc::vec::Vec;
 
 /// Size of one LZNT1 compression unit (uncompressed).
-const COMPRESSION_UNIT_SIZE: usize = 4096;
+pub const COMPRESSION_UNIT_SIZE: usize = 4096;
 
 /// Decompress LZNT1-compressed data.
 ///

@@ -512,16 +512,11 @@ impl ClassicalKexServerState {
     pub fn generate(rng: &mut dyn FnMut(&mut [u8])) -> Self {
         log::info!("kex: generating classical X25519 ephemeral key");
 
-        let mut x25519_secret = [0u8; 32];
-        rng(&mut x25519_secret);
-        // Clamp per RFC 7748
-        x25519_secret[0] &= 248;
-        x25519_secret[31] &= 127;
-        x25519_secret[31] |= 64;
-
-        let mut x25519_public = [0u8; 32];
-        // TODO: x25519_public = x25519_dalek::PublicKey::from(&StaticSecret::from(x25519_secret)).to_bytes();
-        rng(&mut x25519_public);
+        // Generate X25519 keypair using real x25519-dalek
+        let secret = x25519_dalek::StaticSecret::random_from_rng(FnRng(rng));
+        let public = X25519PublicKey::from(&secret);
+        let x25519_secret = secret.to_bytes();
+        let x25519_public = public.to_bytes();
 
         log::debug!("kex: X25519 keypair generated for classical KEX");
 
@@ -548,20 +543,57 @@ impl ClassicalKexServerState {
 
         log::debug!("kex: computing classical X25519 shared secret");
 
-        // TODO: Wire up x25519_dalek
-        // let secret = StaticSecret::from(self.x25519_secret);
-        // let their_public = PublicKey::from(<[u8; 32]>::try_from(client_public)?);
-        // let shared = secret.diffie_hellman(&their_public);
-        let mut hasher = Sha256::new();
-        hasher.update(&self.x25519_secret);
-        hasher.update(client_public);
-        let shared = hasher.finalize();
+        // Real X25519 DH via x25519-dalek
+        let secret = x25519_dalek::StaticSecret::from(self.x25519_secret);
+        let mut pk_bytes = [0u8; 32];
+        pk_bytes.copy_from_slice(client_public);
+        let their_public = X25519PublicKey::from(pk_bytes);
+        let shared = secret.diffie_hellman(&their_public);
+
+        // Check for all-zero output (low-order point attack)
+        if shared.as_bytes().iter().all(|&b| b == 0) {
+            log::error!("kex: X25519 DH produced all-zero output — invalid client public key");
+            return Err(KexError::X25519ZeroOutput);
+        }
 
         log::info!("kex: classical shared secret computed");
 
-        Ok(Vec::from(shared.as_slice()))
+        Ok(Vec::from(shared.as_bytes().as_slice()))
     }
 }
+
+// ---------------------------------------------------------------------------
+// RNG wrapper: adapts `&mut dyn FnMut(&mut [u8])` to `CryptoRng + RngCore`
+// ---------------------------------------------------------------------------
+
+/// Wraps a `&mut dyn FnMut(&mut [u8])` to implement `RngCore + CryptoRng`
+/// so it can be passed to crypto crate APIs that require those traits.
+pub(crate) struct FnRng<'a>(pub(crate) &'a mut dyn FnMut(&mut [u8]));
+
+impl<'a> rand_core::RngCore for FnRng<'a> {
+    fn next_u32(&mut self) -> u32 {
+        let mut buf = [0u8; 4];
+        (self.0)(&mut buf);
+        u32::from_le_bytes(buf)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut buf = [0u8; 8];
+        (self.0)(&mut buf);
+        u64::from_le_bytes(buf)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        (self.0)(dest);
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        (self.0)(dest);
+        Ok(())
+    }
+}
+
+impl<'a> rand_core::CryptoRng for FnRng<'a> {}
 
 // ---------------------------------------------------------------------------
 // KEX message builders
