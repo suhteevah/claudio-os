@@ -123,12 +123,15 @@ pub fn run_windows_binary(pe_data: &[u8]) -> Result<i32, &'static str> {
 fn resolve_imports(loaded: &LoadedPe) -> usize {
     let mut unresolved = 0;
 
-    for import in &loaded.imports {
+    for import in &loaded.imports.entries {
         let dll_name = &import.dll_name;
         log::debug!("[win32-compat] Processing imports for '{}'", dll_name);
 
-        for entry in &import.entries {
-            let func_name = &entry.name;
+        for entry in &import.functions {
+            let func_name = match entry.name() {
+                Some(n) => n,
+                None => continue, // skip ordinal imports
+            };
             match dispatcher::resolve_import(dll_name, func_name) {
                 Some(addr) => {
                     log::trace!(

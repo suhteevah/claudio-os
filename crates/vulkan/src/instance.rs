@@ -195,7 +195,7 @@ pub fn vk_get_physical_device_properties(
         device_id: pd.device_id,
         device_type: VkPhysicalDeviceType::DiscreteGpu,
         device_name: pd.device_name.clone(),
-        pipeline_cache_uuid: [0xCL, 0xAU, 0xDI, 0x0S, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        pipeline_cache_uuid: [0xC1, 0xA0, 0xD1, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], // "CLAUDIOOS" identifier
     })
 }
 
