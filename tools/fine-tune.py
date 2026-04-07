@@ -133,11 +133,14 @@ def setup_model():
         bnb_4bit_use_double_quant=True,       # Double quantization saves ~0.4GB
     )
 
-    # Load model — force fp16 throughout to avoid bf16 issues on 3070 Ti
+    # Pin every weight to GPU 0. device_map="auto" sees ~6.7 GB free and
+    # decides 7B-NF4 won't fit, then tries CPU offload, which BnB rejects.
+    # Forcing {"": 0} skips the planner — if it OOMs we surface a real
+    # OOM instead of a confusing "modules dispatched on CPU" error.
     model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL,
         quantization_config=bnb_config,
-        device_map="auto",
+        device_map={"": 0},
         trust_remote_code=True,
         torch_dtype=torch.float32,
     )
