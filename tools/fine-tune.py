@@ -61,7 +61,7 @@ MAX_SEQ_LEN = 2048             # Context window for training (saves VRAM vs 4096
 BATCH_SIZE = 1                 # Must be 1 for 8GB VRAM
 GRADIENT_ACCUM = 8             # Effective batch size = 8
 LEARNING_RATE = 2e-4           # Standard for QLoRA
-NUM_EPOCHS = 3                 # 3 epochs is usually enough
+NUM_EPOCHS = 4                 # Bumped to 4 for better recall on 7B model
 WARMUP_RATIO = 0.03            # Warm up for 3% of training
 SAVE_STEPS = 200               # Checkpoint every 200 steps
 
@@ -129,16 +129,17 @@ def setup_model():
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",          # Normal Float 4 — best for QLoRA
-        bnb_4bit_compute_dtype=torch.float16, # Compute in fp16
+        bnb_4bit_compute_dtype=torch.float32, # fp32 compute avoids bf16 grad scaler crash
         bnb_4bit_use_double_quant=True,       # Double quantization saves ~0.4GB
     )
 
-    # Load model
+    # Load model — force fp16 throughout to avoid bf16 issues on 3070 Ti
     model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL,
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
+        torch_dtype=torch.float32,
     )
 
     # Load tokenizer
@@ -163,6 +164,11 @@ def setup_model():
     )
     model = get_peft_model(model, lora_config)
 
+    # Cast any bf16 parameters to fp16 to avoid gradient scaler crash on 3070 Ti
+    for name, param in model.named_parameters():
+        if param.dtype == torch.bfloat16:
+            param.data = param.data.to(torch.float16)
+
     # Print trainable parameters
     trainable, total = model.get_nb_trainable_parameters()
     print(f"Trainable: {trainable:,} / {total:,} parameters ({100*trainable/total:.2f}%)")
@@ -186,12 +192,12 @@ def train(model, tokenizer, dataset):
         learning_rate=LEARNING_RATE,
         warmup_ratio=WARMUP_RATIO,
         lr_scheduler_type="cosine",
-        fp16=True,                          # Use fp16 for training on 3070 Ti
-        bf16=False,                         # 3070 Ti doesn't support bf16 well
+        fp16=False,                         # Disabled — bitsandbytes bf16 conflicts with AMP scaler
+        bf16=False,                         # 3070 Ti lacks full bf16 support
         logging_steps=10,
         save_steps=SAVE_STEPS,
         save_total_limit=3,                 # Keep last 3 checkpoints
-        max_seq_length=MAX_SEQ_LEN,
+        max_length=MAX_SEQ_LEN,
         gradient_checkpointing=True,        # Saves ~2GB VRAM at cost of speed
         optim="paged_adamw_8bit",           # 8-bit optimizer saves VRAM
         report_to="none",                   # No wandb/tensorboard
@@ -201,7 +207,7 @@ def train(model, tokenizer, dataset):
     trainer = SFTTrainer(
         model=model,
         train_dataset=dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         args=training_args,
     )
 
@@ -233,8 +239,14 @@ def main():
         print("ERROR: CUDA not available. Need an NVIDIA GPU.")
         sys.exit(1)
 
+    # bitsandbytes 0.49+ uses bf16 internally for NF4 quantized params.
+    # The 3070 Ti's AMP gradient scaler can't unscale bf16 grads.
+    # Workaround: set compute dtype to fp32 and disable AMP entirely.
+    # Slower but actually trains correctly.
+    print("Note: Using fp32 compute (bf16 AMP not supported on 3070 Ti)")
+
     gpu_name = torch.cuda.get_device_name(0)
-    gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+    gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
 
     dataset = load_training_data()

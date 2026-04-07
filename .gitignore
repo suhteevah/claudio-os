@@ -37,6 +37,12 @@ lpt8
 lpt9
 tools/__pycache__/
 
+# Trained model weights (large, not source)
+models/
+
+# Local worktrees (ephemeral)
+.claude/worktrees/
+
 # Session/credentials (NEVER commit)
 target/session.txt
 target/credentials.img

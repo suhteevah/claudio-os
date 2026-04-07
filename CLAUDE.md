@@ -137,6 +137,12 @@ and outbound internet including HTTPS to api.anthropic.com. No bridging needed f
 6. **FAT32 only for persistence.** No ext4, no journaling. Simple, works, the
    `fatfs` crate handles it. Config + tokens + logs.
 
+<!--
+Development phase history is wrapped in HTML comments — Claude Code strips
+block-level comments before injecting CLAUDE.md into context, so this content
+is visible to humans reading the file but doesn't cost session tokens.
+See .claude/USAGE_NOTES.md for the pattern.
+
 ## Development Phases
 
 ### Phase 1: Boot to terminal -- COMPLETE
@@ -230,6 +236,7 @@ and outbound internet including HTTPS to api.anthropic.com. No bridging needed f
 - [ ] GPU LLM inference (run local models on GPU)
 - [ ] Graceful shutdown / token revocation
 - [ ] USB boot image generation
+-->
 
 ## Key Crate Versions & Docs
 
@@ -247,6 +254,7 @@ and outbound internet including HTTPS to api.anthropic.com. No bridging needed f
 | spin | 0.9 | https://docs.rs/spin/0.9 |
 | serde_json (no_std) | 1.x | features = ["alloc"], default-features = false |
 
+<!--
 ## Reference Projects
 
 - **blog_os**: https://os.phil-opp.com — THE tutorial. Follow for kernel basics.
@@ -255,6 +263,7 @@ and outbound internet including HTTPS to api.anthropic.com. No bridging needed f
 - **Redox OS drivers**: https://gitlab.redox-os.org/redox-os/drivers — NIC/NVMe/USB ref.
 - **Hermit OS**: https://hermit-os.org — Unikernel with smoltcp, good kernel structure.
 - **os-terminal**: https://lib.rs/crates/os-terminal — Turnkey bare-metal terminal.
+-->
 
 ## Conventions
 

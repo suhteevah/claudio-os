@@ -1,0 +1,44 @@
+{
+  "hooks": {
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/task-completed-check.sh"
+          }
+        ]
+      }
+    ],
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/cwd-changed.sh"
+          }
+        ]
+      }
+    ],
+    "FileChanged": [
+      {
+        "matcher": "Cargo.lock",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/cargo-lock-changed.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Cargo.toml",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/cargo-lock-changed.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
