@@ -44,10 +44,25 @@ fi
 HOST="$(hostname)"
 FULL_MSG="[$HOST] $MSG"
 
+# Build JSON body in a temp file via Python (preserves UTF-8 across the
+# Win32 cmdline boundary, where curl.exe would otherwise transcode args
+# from UTF-8 to cp1252 and Telegram rejects with 400 "must be UTF-8").
+BODY_FILE="$(mktemp -t telegram-body.XXXXXX.json)"
+trap 'rm -f "$BODY_FILE"' EXIT
+MSG="$FULL_MSG" CHAT="$TELEGRAM_CHAT_ID" python -c '
+import json, os, sys
+sys.stdout.buffer.write(
+    json.dumps(
+        {"chat_id": int(os.environ["CHAT"]), "text": os.environ["MSG"]},
+        ensure_ascii=False,
+    ).encode("utf-8")
+)
+' > "$BODY_FILE"
+
 curl -sS --fail-with-body \
+    -H "Content-Type: application/json" \
+    --data-binary "@${BODY_FILE}" \
     "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    -d chat_id="${TELEGRAM_CHAT_ID}" \
-    -d text="${FULL_MSG}" \
     > /dev/null
 
 echo "telegram: sent (${#FULL_MSG} chars)"
