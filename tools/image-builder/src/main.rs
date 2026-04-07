@@ -63,16 +63,9 @@ fn main() {
         .expect("failed to create UEFI disk image");
     println!("[image] UEFI image: {:?} ({} bytes)", uefi_path, std::fs::metadata(&uefi_path).map(|m| m.len()).unwrap_or(0));
 
-    // Create BIOS disk image (for legacy boot / simpler QEMU invocation)
-    let bios_path = out_dir.join("claudio-os-bios.img");
-    println!("[image] creating BIOS disk image at {:?}", bios_path);
-    let mut bios_builder = bootloader::BiosBoot::new(kernel_path);
-    if let Some(rd) = ramdisk.as_ref() {
-        bios_builder.set_ramdisk(rd);
-    }
-    bios_builder
-        .create_disk_image(&bios_path)
-        .expect("failed to create BIOS disk image");
+    // BIOS image disabled — bootloader's BIOS stages don't build on the
+    // Windows host (build.rs panics in the cargo-install bootstrap of
+    // bootloader-x86_64-bios-*). The kernel only ships UEFI per CLAUDE.md.
     println!("[image] BIOS image: {:?} ({} bytes)", bios_path, std::fs::metadata(&bios_path).map(|m| m.len()).unwrap_or(0));
 
     println!();
@@ -82,10 +75,5 @@ fn main() {
     println!("    qemu-system-x86_64 \\");
     println!("      -bios /usr/share/OVMF/OVMF_CODE.fd \\");
     println!("      -drive format=raw,file={} \\", uefi_path.display());
-    println!("      -serial stdio -m 512M", );
-    println!();
-    println!("  BIOS boot (no OVMF needed):");
-    println!("    qemu-system-x86_64 \\");
-    println!("      -drive format=raw,file={} \\", bios_path.display());
     println!("      -serial stdio -m 512M");
 }

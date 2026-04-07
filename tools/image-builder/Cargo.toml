@@ -7,4 +7,8 @@ edition = "2021"
 # It takes the compiled kernel binary and wraps it in a bootable UEFI disk image.
 
 [dependencies]
-bootloader = "0.11"
+# UEFI only — BIOS stages fail to build on Windows host (bootloader's
+# build.rs panics in the cargo-install bootstrap of the
+# bootloader-x86_64-bios-* crates), and CLAUDE.md only documents the
+# UEFI/OVMF QEMU path anyway.
+bootloader = { version = "0.11", default-features = false, features = ["uefi"] }

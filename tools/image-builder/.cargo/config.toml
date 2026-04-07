@@ -1,3 +1,11 @@
 # Override parent workspace config — this tool runs on the HOST, not bare-metal
 [build]
 target = "x86_64-pc-windows-msvc"
+
+# Disable the workspace's build-std setting. The parent .cargo/config.toml
+# enables build-std=["core","alloc"] for the no_std kernel target, which
+# leaks into this host build and double-defines lang items in `core`.
+# Empty array opts out for this directory.
+[unstable]
+build-std = []
+build-std-features = []
