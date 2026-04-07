@@ -236,6 +236,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Initialize the cryptographically secure RNG (needs PIT + RTC for entropy).
     csprng::init();
 
+    // ── Phase 3c3: Local LLM model from bootloader ramdisk ───────────
+    // If the disk image was built with `--ramdisk <model.gguf>`, the
+    // bootloader exposes it via BootInfo::ramdisk_addr/ramdisk_len.
+    // Hand it to claudio-llm so the local-model tool handler has a real
+    // model to run instead of always erroring out.
+    {
+        let addr = boot_info.ramdisk_addr.into_option();
+        let len = boot_info.ramdisk_len as usize;
+        if let (Some(addr), true) = (addr, len > 0) {
+            log::info!("[boot] ramdisk: addr={:#x} len={} bytes ({:.2} MB)",
+                addr, len, len as f64 / 1024.0 / 1024.0);
+            let bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(addr as *const u8, len)
+            };
+            match agent_loop::init_local_model_from_bytes(bytes) {
+                Ok(()) => log::info!("[boot] local LLM model loaded from ramdisk"),
+                Err(e) => log::warn!("[boot] local LLM init failed: {}", e),
+            }
+        } else {
+            log::info!("[boot] no ramdisk — local LLM tool will return stub error");
+        }
+    }
+
     // ── Phase 3d: ACPI table discovery ───────────────────────────────
     // Parse ACPI tables for hardware discovery: CPU cores (MADT), power
     // management (FADT), precision timer (HPET), PCIe ECAM (MCFG).

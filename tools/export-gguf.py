@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Merge LoRA adapters and export to GGUF format for deployment.
 
-Run after fine-tune.py completes. Produces a Q4_0 quantized GGUF file
-ready for llama.cpp inference or loading into ClaudioOS's bare-metal
-LLM engine.
+Run after fine-tune.py completes. Produces an F16 GGUF (and optionally
+Q4_0 quantized) file ready for llama.cpp inference or loading into
+ClaudioOS's bare-metal LLM engine via init_local_model_from_bytes.
 
 Prerequisites:
     pip install torch transformers peft
     git clone https://github.com/ggerganov/llama.cpp
-    cd llama.cpp && make
+    cd llama.cpp && make   # only needed for Q4_0 quantization
 
 Usage:
-    python tools/export-gguf.py
+    python tools/export-gguf.py                       # 7B (default)
+    python tools/export-gguf.py --size 1.5b           # 1.5B
+    python tools/export-gguf.py --size 1.5b --no-quantize
 """
 
+import argparse
 import os
 import sys
 import subprocess
@@ -28,11 +31,18 @@ except ImportError as e:
     sys.exit(1)
 
 REPO_ROOT = Path(__file__).parent.parent
-BASE_MODEL = "Qwen/Qwen2.5-Coder-7B"
-LORA_DIR = REPO_ROOT / "models" / "claudio-coder-7b-lora"
-MERGED_DIR = REPO_ROOT / "models" / "claudio-coder-7b-merged"
-GGUF_F16 = REPO_ROOT / "models" / "claudio-coder-7b-f16.gguf"
-GGUF_Q4 = REPO_ROOT / "models" / "claudio-coder-7b-q4_0.gguf"
+
+SIZES = {
+    "1.5b": ("Qwen/Qwen2.5-Coder-1.5B", "claudio-coder-1.5b"),
+    "7b":   ("Qwen/Qwen2.5-Coder-7B",   "claudio-coder-7b"),
+}
+
+# Filled in by main() once args are parsed.
+BASE_MODEL = ""
+LORA_DIR = Path()
+MERGED_DIR = Path()
+GGUF_F16 = Path()
+GGUF_Q4 = Path()
 
 # Path to llama.cpp tools (adjust if installed elsewhere)
 LLAMA_CPP = Path(os.environ.get("LLAMA_CPP", str(Path.home() / "llama.cpp")))
@@ -111,13 +121,29 @@ def quantize(gguf_f16: Path):
 
 
 def main():
+    global BASE_MODEL, LORA_DIR, MERGED_DIR, GGUF_F16, GGUF_Q4
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--size", choices=SIZES.keys(), default="7b")
+    ap.add_argument("--no-quantize", action="store_true",
+                    help="skip Q4_0 quantization (useful when llama-quantize is not built)")
+    args = ap.parse_args()
+
+    BASE_MODEL, slug = SIZES[args.size]
+    LORA_DIR   = REPO_ROOT / "models" / f"{slug}-lora"
+    MERGED_DIR = REPO_ROOT / "models" / f"{slug}-merged"
+    GGUF_F16   = REPO_ROOT / "models" / f"{slug}-f16.gguf"
+    GGUF_Q4    = REPO_ROOT / "models" / f"{slug}-q4_0.gguf"
+
     print("=" * 60)
-    print("ClaudioOS Model Export to GGUF")
+    print(f"ClaudioOS Model Export to GGUF — {args.size}")
+    print(f"Base: {BASE_MODEL}")
+    print(f"LoRA: {LORA_DIR}")
     print("=" * 60)
 
     merged = merge_lora()
     convert_to_gguf(merged)
-    quantize(GGUF_F16)
+    if not args.no_quantize:
+        quantize(GGUF_F16)
 
     print(f"\n{'=' * 60}")
     print(f"Done! Your model is ready:")

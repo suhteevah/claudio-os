@@ -12,15 +12,39 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
-    let kernel_path = std::env::args()
-        .nth(1)
-        .expect("usage: claudio-image-builder <kernel-binary-path>");
+    let mut args = std::env::args().skip(1);
+    let kernel_path = args
+        .next()
+        .expect("usage: claudio-image-builder <kernel-binary-path> [--ramdisk <gguf-path>]");
+
+    // Optional --ramdisk <path>: any file baked into the image and exposed
+    // to the kernel via BootInfo::ramdisk_addr/ramdisk_len. We use this to
+    // ship a GGUF model for init_local_model_from_bytes() at boot.
+    let mut ramdisk: Option<PathBuf> = None;
+    while let Some(a) = args.next() {
+        if a == "--ramdisk" {
+            ramdisk = Some(PathBuf::from(
+                args.next().expect("--ramdisk needs a path"),
+            ));
+        } else {
+            eprintln!("warn: unknown arg {:?}", a);
+        }
+    }
 
     let kernel_path = Path::new(&kernel_path);
     if !kernel_path.exists() {
         eprintln!("error: kernel binary not found at {:?}", kernel_path);
         eprintln!("hint: run `cargo build` first to compile the kernel");
         std::process::exit(1);
+    }
+
+    if let Some(rd) = ramdisk.as_ref() {
+        if !rd.exists() {
+            eprintln!("error: ramdisk file not found at {:?}", rd);
+            std::process::exit(1);
+        }
+        let sz = std::fs::metadata(rd).map(|m| m.len()).unwrap_or(0);
+        println!("[image] ramdisk: {:?} ({} bytes, {:.2} MB)", rd, sz, sz as f64 / 1024.0 / 1024.0);
     }
 
     let out_dir = kernel_path
@@ -30,7 +54,10 @@ fn main() {
     // Create UEFI disk image
     let uefi_path = out_dir.join("claudio-os-uefi.img");
     println!("[image] creating UEFI disk image at {:?}", uefi_path);
-    let uefi_builder = bootloader::UefiBoot::new(kernel_path);
+    let mut uefi_builder = bootloader::UefiBoot::new(kernel_path);
+    if let Some(rd) = ramdisk.as_ref() {
+        uefi_builder.set_ramdisk(rd);
+    }
     uefi_builder
         .create_disk_image(&uefi_path)
         .expect("failed to create UEFI disk image");
@@ -39,7 +66,10 @@ fn main() {
     // Create BIOS disk image (for legacy boot / simpler QEMU invocation)
     let bios_path = out_dir.join("claudio-os-bios.img");
     println!("[image] creating BIOS disk image at {:?}", bios_path);
-    let bios_builder = bootloader::BiosBoot::new(kernel_path);
+    let mut bios_builder = bootloader::BiosBoot::new(kernel_path);
+    if let Some(rd) = ramdisk.as_ref() {
+        bios_builder.set_ramdisk(rd);
+    }
     bios_builder
         .create_disk_image(&bios_path)
         .expect("failed to create BIOS disk image");
