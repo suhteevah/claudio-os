@@ -57,13 +57,16 @@ MERGED_DIR = REPO_ROOT / "models" / "claudio-coder-7b-merged"
 LORA_R = 16                    # LoRA rank — 16 is good quality/memory tradeoff
 LORA_ALPHA = 32                # LoRA scaling factor (usually 2x rank)
 LORA_DROPOUT = 0.05            # Small dropout to prevent overfitting
-MAX_SEQ_LEN = 2048             # Context window for training (saves VRAM vs 4096)
+MAX_SEQ_LEN = 1024             # Dropped from 2048 — activation spikes on long
+                               # samples were spilling VRAM→sysRAM and BSOD'd
+                               # the machine at ~step 3 of the 7B run.
 BATCH_SIZE = 1                 # Must be 1 for 8GB VRAM
 GRADIENT_ACCUM = 8             # Effective batch size = 8
 LEARNING_RATE = 2e-4           # Standard for QLoRA
 NUM_EPOCHS = 4                 # Bumped to 4 for better recall on 7B model
 WARMUP_RATIO = 0.03            # Warm up for 3% of training
-SAVE_STEPS = 200               # Checkpoint every 200 steps
+SAVE_STEPS = 25                # Frequent checkpoints — last run BSOD'd before
+                               # the first save and we lost everything.
 
 # LoRA target modules for Qwen2.5
 TARGET_MODULES = [
@@ -129,7 +132,7 @@ def setup_model():
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",          # Normal Float 4 — best for QLoRA
-        bnb_4bit_compute_dtype=torch.float32, # fp32 compute avoids bf16 grad scaler crash
+        bnb_4bit_compute_dtype=torch.float16, # fp16 — works with bnb 0.43.x
         bnb_4bit_use_double_quant=True,       # Double quantization saves ~0.4GB
     )
 
@@ -142,7 +145,7 @@ def setup_model():
         quantization_config=bnb_config,
         device_map={"": 0},
         trust_remote_code=True,
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16,
     )
 
     # Load tokenizer
@@ -195,14 +198,18 @@ def train(model, tokenizer, dataset):
         learning_rate=LEARNING_RATE,
         warmup_ratio=WARMUP_RATIO,
         lr_scheduler_type="cosine",
-        fp16=False,                         # Disabled — bitsandbytes bf16 conflicts with AMP scaler
-        bf16=False,                         # 3070 Ti lacks full bf16 support
+        fp16=False,                         # Disable AMP entirely — bnb still promotes to bf16
+        bf16=False,                         # internally, breaking AMP's grad scaler. Without AMP,
+                                            # bnb_4bit_compute_dtype=fp16 + LoRA-fp16 trains natively.
         logging_steps=10,
         save_steps=SAVE_STEPS,
         save_total_limit=3,                 # Keep last 3 checkpoints
         max_length=MAX_SEQ_LEN,
         gradient_checkpointing=True,        # Saves ~2GB VRAM at cost of speed
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_8bit",           # 8-bit optimizer saves VRAM
+        max_grad_norm=0.3,                  # Tighter clip — keeps grad tensors small
+        dataloader_pin_memory=False,        # Don't pin — we need the sysRAM
         report_to="none",                   # No wandb/tensorboard
         dataset_text_field="text",
     )
@@ -242,11 +249,10 @@ def main():
         print("ERROR: CUDA not available. Need an NVIDIA GPU.")
         sys.exit(1)
 
-    # bitsandbytes 0.49+ uses bf16 internally for NF4 quantized params.
-    # The 3070 Ti's AMP gradient scaler can't unscale bf16 grads.
-    # Workaround: set compute dtype to fp32 and disable AMP entirely.
-    # Slower but actually trains correctly.
-    print("Note: Using fp32 compute (bf16 AMP not supported on 3070 Ti)")
+    # bitsandbytes 0.43.x is the last release before NF4 params get
+    # internally promoted to bf16 — using fp16 compute + AMP fp16 scaler
+    # works correctly on the 3070 Ti at this version. 0.49+ broke this.
+    print("Note: Using fp16 compute (bitsandbytes pinned at 0.43.x)")
 
     gpu_name = torch.cuda.get_device_name(0)
     gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
