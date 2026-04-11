@@ -327,10 +327,15 @@ pub fn hibernate() -> Result<(), &'static str> {
 
     CURRENT_STATE.store(PowerState::Hibernating as u8, Ordering::Release);
 
-    // In a full OS we would snapshot RAM to disk here.
-    // For now, log a warning and attempt S4 entry.
-    log::warn!("[power] RAM snapshot to disk not yet implemented — entering S4 directly");
-    log::warn!("[power] system state will NOT be restored on next boot");
+    // Write a hibernate marker file through the VFS. This is NOT a real
+    // RAM snapshot — full hibernate requires a disk driver, page-table
+    // walk, and contiguous swap-slot allocation. But a marker file lets
+    // the next boot detect that S4 was entered cleanly and log it.
+    let marker_bytes = write_hibernate_marker();
+    log::info!(
+        "[power] wrote hibernate marker to /claudio/hibernate.snapshot ({} bytes). Full RAM snapshot requires disk driver + page table walk.",
+        marker_bytes,
+    );
 
     x86_64::instructions::interrupts::disable();
 
@@ -369,6 +374,101 @@ pub fn hibernate() -> Result<(), &'static str> {
 
     log::info!("[power] returned from S4 (unexpected without RAM restore)");
     Ok(())
+}
+
+/// Path for the hibernate marker file.
+const HIBERNATE_MARKER_PATH: &str = "/claudio/hibernate.snapshot";
+
+/// Write a minimal hibernate marker to the VFS. Returns the number of
+/// bytes written (0 on failure).
+///
+/// Layout (little-endian):
+/// - 16 bytes: magic `"CLAUDIOHIBERN\0\0\0"`
+/// - 8 bytes:  unix timestamp (best effort from RTC)
+/// - 8 bytes:  kernel tick count
+/// - 8 bytes:  heap_used
+/// - 8 bytes:  heap_total
+/// - rest:     zero padding to 1024 bytes total (reserved for future snapshot index)
+fn write_hibernate_marker() -> usize {
+    const MARKER_SIZE: usize = 1024;
+    let mut buf = alloc::vec![0u8; MARKER_SIZE];
+
+    // Magic (16 bytes).
+    let magic = b"CLAUDIOHIBERN\0\0\0";
+    buf[0..16].copy_from_slice(magic);
+
+    // Timestamp from RTC.
+    let ts = crate::rtc::wall_clock().to_unix_timestamp() as u64;
+    buf[16..24].copy_from_slice(&ts.to_le_bytes());
+
+    // Tick count.
+    let ticks = crate::interrupts::tick_count();
+    buf[24..32].copy_from_slice(&ticks.to_le_bytes());
+
+    // Heap stats.
+    let (heap_used, heap_total) = crate::memory::heap_stats();
+    buf[32..40].copy_from_slice(&(heap_used as u64).to_le_bytes());
+    buf[40..48].copy_from_slice(&(heap_total as u64).to_le_bytes());
+
+    match claudio_fs::write_file(HIBERNATE_MARKER_PATH, &buf) {
+        Ok(()) => MARKER_SIZE,
+        Err(e) => {
+            log::warn!(
+                "[power] failed to write hibernate marker {}: {:?}",
+                HIBERNATE_MARKER_PATH, e
+            );
+            0
+        }
+    }
+}
+
+/// Check for a hibernate marker left by a previous S4 cycle.
+///
+/// Called on boot (optional). Logs what was found and (best effort) parses
+/// the embedded timestamp and memory stats. Does NOT perform a real resume
+/// — that would require paging/VMM work.
+pub fn resume_from_snapshot() {
+    match claudio_fs::read_file(HIBERNATE_MARKER_PATH) {
+        Ok(bytes) => {
+            if bytes.len() < 48 {
+                log::warn!(
+                    "[power] hibernate marker too small ({} bytes), ignoring",
+                    bytes.len()
+                );
+                return;
+            }
+            if &bytes[0..13] != b"CLAUDIOHIBERN" {
+                log::warn!("[power] hibernate marker has unexpected magic, ignoring");
+                return;
+            }
+            let ts = u64::from_le_bytes([
+                bytes[16], bytes[17], bytes[18], bytes[19],
+                bytes[20], bytes[21], bytes[22], bytes[23],
+            ]);
+            let ticks = u64::from_le_bytes([
+                bytes[24], bytes[25], bytes[26], bytes[27],
+                bytes[28], bytes[29], bytes[30], bytes[31],
+            ]);
+            let heap_used = u64::from_le_bytes([
+                bytes[32], bytes[33], bytes[34], bytes[35],
+                bytes[36], bytes[37], bytes[38], bytes[39],
+            ]);
+            let heap_total = u64::from_le_bytes([
+                bytes[40], bytes[41], bytes[42], bytes[43],
+                bytes[44], bytes[45], bytes[46], bytes[47],
+            ]);
+            log::info!(
+                "[power] found hibernate marker: ts={} ticks={} heap={}/{} KiB",
+                ts, ticks, heap_used / 1024, heap_total / 1024,
+            );
+            log::info!(
+                "[power] marker present — full RAM restore pending VM subsystem; starting fresh"
+            );
+        }
+        Err(_) => {
+            log::debug!("[power] no hibernate marker found at {}", HIBERNATE_MARKER_PATH);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -3,8 +3,11 @@
 //! Provides a terminal-based file browser with directory listing, navigation,
 //! and file operations. Renders into a dashboard pane using ANSI escape codes.
 //!
-//! Uses the VFS trait from `claudio_shell` — if no filesystem is mounted, shows
-//! a "mount a filesystem first" message.
+//! Populates its entry list from the kernel's global VFS singleton
+//! (see `crate::storage::with_vfs`). Mode-driven operations (rename, copy,
+//! move, delete, mkdir, touch) still run through the `claudio_shell::Vfs`
+//! trait passed in from the dashboard handler, because they share the shell
+//! command path.
 
 extern crate alloc;
 
@@ -78,7 +81,8 @@ pub struct FileManagerState {
     pub pane_id: usize,
     /// Current modal mode.
     mode: Mode,
-    /// Whether a VFS is available (false = show stub message).
+    /// Whether a VFS readdir has succeeded for the current path (false = show
+    /// "no filesystem" guidance in the pane).
     vfs_available: bool,
     /// Active search filter (empty = no filter).
     filter: String,
@@ -100,13 +104,28 @@ impl FileManagerState {
             filter: String::new(),
             status_message: String::new(),
         };
-        // Populate with stub entries (. and ..) since no VFS is mounted yet.
-        state.populate_stub();
+        // Populate from the kernel VFS. If the VFS has not been initialized
+        // (or readdir fails), `populate_from_vfs` will fall back to the stub
+        // listing and leave a status message explaining why.
+        state.populate_from_vfs();
         state
     }
 
-    /// Populate entries from the VFS. Returns true if the VFS had data.
-    pub fn refresh<V: claudio_shell::Vfs>(&mut self, vfs: &V) {
+    /// Refresh the directory listing. The shell VFS parameter is unused for
+    /// population now — entries always come from the kernel VFS singleton —
+    /// but it is kept on the signature so the dashboard handlers can continue
+    /// to call this after shell-scoped mutations (mkdir/touch/rm/rename).
+    pub fn refresh<V: claudio_shell::Vfs>(&mut self, _vfs: &V) {
+        self.populate_from_vfs();
+    }
+
+    /// Populate entries from the kernel VFS singleton at `self.current_path`.
+    ///
+    /// On error — including "VFS not initialized", missing path, or underlying
+    /// filesystem I/O error — falls back to a minimal `.`/`..` listing and
+    /// writes a status message explaining the failure. The pane renderer uses
+    /// `vfs_available` to decide whether to show the guidance message.
+    fn populate_from_vfs(&mut self) {
         self.entries.clear();
 
         // Always add . and ..
@@ -125,30 +144,25 @@ impl FileManagerState {
             });
         }
 
-        match vfs.list_dir(&self.current_path) {
-            Ok(names) => {
+        let path = self.current_path.clone();
+        let result = crate::storage::with_vfs(|vfs| {
+            vfs.readdir(&path).map_err(|e| format!("{}", e))
+        });
+
+        match result {
+            Ok(entries) => {
                 self.vfs_available = true;
-                for name in names {
-                    let full_path = if self.current_path.ends_with('/') {
-                        format!("{}{}", self.current_path, name)
-                    } else {
-                        format!("{}/{}", self.current_path, name)
-                    };
-                    let is_dir = vfs.is_dir(&full_path);
-                    let size = if is_dir {
-                        0
-                    } else {
-                        vfs.read_file(&full_path).map(|d| d.len() as u64).unwrap_or(0)
-                    };
-                    let kind = if is_dir {
-                        EntryKind::Directory
-                    } else {
-                        EntryKind::File
+                for entry in entries {
+                    let kind = match entry.file_type {
+                        claudio_vfs::FileType::Directory => EntryKind::Directory,
+                        claudio_vfs::FileType::Symlink => EntryKind::Symlink,
+                        claudio_vfs::FileType::File => EntryKind::File,
+                        _ => EntryKind::File,
                     };
                     self.entries.push(DirEntry {
-                        name,
+                        name: entry.name,
                         kind,
-                        size,
+                        size: entry.size,
                         modified: String::new(),
                     });
                 }
@@ -160,10 +174,20 @@ impl FileManagerState {
                     });
                 }
                 self.status_message.clear();
+                log::debug!(
+                    "[filemanager] populated {} entries from VFS at {}",
+                    self.entries.len(),
+                    self.current_path
+                );
             }
             Err(e) => {
                 self.vfs_available = false;
-                self.status_message = e;
+                log::warn!(
+                    "[filemanager] VFS readdir({}) failed: {} — falling back to stub",
+                    self.current_path,
+                    e
+                );
+                self.status_message = format!("VFS readdir failed: {}", e);
             }
         }
 
@@ -175,31 +199,6 @@ impl FileManagerState {
                 self.entries.len() - 1
             };
         }
-    }
-
-    /// Populate with stub entries when no VFS is mounted.
-    ///
-    /// This is the fallback used when no block devices are detected (e.g., QEMU
-    /// with only virtio-net). Once a filesystem is mounted via the VFS adapter
-    /// layer, call `refresh(vfs)` to switch to real directory listings.
-    fn populate_stub(&mut self) {
-        self.entries.clear();
-        self.entries.push(DirEntry {
-            name: String::from("."),
-            kind: EntryKind::Directory,
-            size: 0,
-            modified: String::new(),
-        });
-        self.entries.push(DirEntry {
-            name: String::from(".."),
-            kind: EntryKind::Directory,
-            size: 0,
-            modified: String::new(),
-        });
-        self.vfs_available = false;
-        self.status_message = String::from(
-            "No filesystem mounted. Use `mount /dev/sdX /mnt ext4` in a shell pane."
-        );
     }
 
     /// Navigate into a directory or open a file.

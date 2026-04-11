@@ -306,9 +306,10 @@ pub fn render_image_to_pane(
 
 /// Handle the `view <path>` shell command.
 ///
-/// In the current stub VFS, this returns an error since we don't have real
-/// filesystem access yet. The parsing + rendering code is fully functional
-/// and can be wired to FAT32/fs-persist when available.
+/// Loads image bytes from the kernel VFS via `claudio_fs::read_file` and
+/// reports the number of bytes read. Image decoding and framebuffer rendering
+/// are not yet wired from this entry point — callers embedding the viewer
+/// directly still call `parse_bmp`/`parse_ppm` + `render_image_to_pane`.
 pub fn handle_command(args: &str) -> String {
     let path = args.trim();
     if path.is_empty() {
@@ -325,28 +326,32 @@ pub fn handle_command(args: &str) -> String {
         );
     }
 
-    // To view an image, we need a mounted filesystem to read the file from.
-    // The full sequence is:
-    //   1. Mount a filesystem:  mount /dev/sda1 /mnt ext4
-    //   2. View the image:      view /mnt/photo.bmp
-    //
-    // Once a VFS is mounted, this will:
-    //   let data = vfs.read_file(path)?;
-    //   let img = if lower.ends_with(".bmp") { parse_bmp(&data)? } else { parse_ppm(&data)? };
-    //   render_image_to_pane(&img, ...pane viewport...);
-    //
-    // Currently no block devices are detected (QEMU virtio-net only).
-    format!(
-        "Image viewer ready.\n\
-         File: {}\n\
-         \x1b[33mRequires a mounted filesystem.\x1b[0m\n\
-         No block devices detected (QEMU virtio-net only).\n\
-         On real hardware: mount a disk first, then `view <path>`.\n\n\
-         Supported formats:\n\
-         \x1b[36m  .bmp\x1b[0m  24-bit or 32-bit uncompressed (BI_RGB / BI_BITFIELDS)\n\
-         \x1b[36m  .ppm\x1b[0m  P6 binary (RGB, max value 1-255)\n",
-        path
-    )
+    // Load the file bytes via the VFS-backed claudio_fs wrapper.
+    match load_image_bytes(path) {
+        Ok(bytes) => format!(
+            "Image viewer ready.\n\
+             File: {}\n\
+             Loaded {} bytes via VFS.\n\
+             \x1b[90mImage decoding + pane rendering are wired via parse_bmp/parse_ppm;\n\
+             this command currently reports the load only.\x1b[0m\n\n\
+             Supported formats:\n\
+             \x1b[36m  .bmp\x1b[0m  24-bit or 32-bit uncompressed (BI_RGB / BI_BITFIELDS)\n\
+             \x1b[36m  .ppm\x1b[0m  P6 binary (RGB, max value 1-255)\n",
+            path,
+            bytes.len()
+        ),
+        Err(e) => format!(
+            "Image viewer: failed to read {} from VFS: {}\n",
+            path, e
+        ),
+    }
+}
+
+/// Load raw image bytes from the kernel VFS. Thin wrapper over
+/// `claudio_fs::read_file` that converts the error into a human-readable
+/// string for shell output.
+pub fn load_image_bytes(path: &str) -> Result<Vec<u8>, String> {
+    claudio_fs::read_file(path).map_err(|e| format!("{}", e))
 }
 
 /// Check if a filename has a supported image extension.

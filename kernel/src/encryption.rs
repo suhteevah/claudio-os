@@ -12,12 +12,30 @@
 //! - The header (first sector) contains: magic, version, salt, encrypted
 //!   master key verification hash.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use alloc::format;
 use core::fmt;
+use spin::Mutex;
+
+// ── Armed cryptsetup devices ─────────────────────────────────────────
+
+/// Devices for which a passphrase has been captured via `cryptsetup open`.
+///
+/// Maps device path (e.g. `/dev/sda1`) to the mapper name (e.g. `secrets`).
+/// Real decryption is not performed yet — that requires a LUKS2 header parser
+/// and a live block device handle. This static lets us track which devices
+/// the user has "armed" so other commands (e.g. `cryptsetup status`) can
+/// report them.
+///
+/// Production note: a real implementation must (1) disable terminal echo
+/// while reading the passphrase, (2) zero the passphrase buffer with `volatile`
+/// writes as soon as the derived key is computed, and (3) store the derived
+/// key in mlock'd / non-swappable memory. This stub does none of that.
+static ARMED_DEVICES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -990,28 +1008,137 @@ pub fn shell_cryptsetup(args: &str) -> String {
             if parts.len() < 3 {
                 return "usage: cryptsetup open <device> <name>\n".to_string();
             }
+            let device = parts[1].to_string();
+            let name = parts[2].to_string();
+
+            // Prompt for passphrase over the serial console.
+            //
+            // NOTE: This is a plain-text prompt (the typed passphrase IS
+            // echoed by the terminal emulator). Production would need no-echo
+            // mode (clear ECHO bit on the UART / use a raw keyboard mode)
+            // plus secure zero-on-drop for the passphrase buffer.
+            let passphrase = match prompt_passphrase(&device) {
+                Some(p) => p,
+                None => return format!("cryptsetup: failed to read passphrase for {}\n", device),
+            };
+
+            let len = passphrase.len();
+            // Log only the length — never the raw passphrase.
+            log::info!(
+                "[cryptsetup] captured {} byte passphrase for device '{}' -> name '{}'",
+                len, device, name,
+            );
+
+            // Register the device as armed. We don't actually derive the key
+            // here because there's no BlockDevice handle to unlock — the LUKS2
+            // header parser and disk driver wiring are still pending.
+            ARMED_DEVICES.lock().insert(device.clone(), name.clone());
+
             format!(
-                "cryptsetup: would unlock {} as '{}' (passphrase prompt not yet wired)\n",
-                parts[1], parts[2]
+                "cryptsetup: {} armed as '{}' ({} byte passphrase). Decryption pending LUKS2 header parser.\n",
+                device, name, len,
             )
         }
         "close" => {
             if parts.len() < 2 {
                 return "usage: cryptsetup close <name>\n".to_string();
             }
-            format!("cryptsetup: would lock '{}' and zero keys\n", parts[1])
+            let name = parts[1];
+            // Find the device mapped to this name.
+            let mut armed = ARMED_DEVICES.lock();
+            let found_device = armed
+                .iter()
+                .find(|(_, n)| n.as_str() == name)
+                .map(|(d, _)| d.clone());
+            if let Some(d) = found_device {
+                armed.remove(&d);
+                format!("cryptsetup: closed '{}' (device {}), armed entry cleared\n", name, d)
+            } else {
+                format!("cryptsetup: no armed device named '{}'\n", name)
+            }
         }
         "format" => {
             if parts.len() < 2 {
                 return "usage: cryptsetup format <device>\n".to_string();
             }
             format!(
-                "cryptsetup: would format {} with AES-256-XTS encryption\n",
+                "cryptsetup: would format {} with AES-256-XTS encryption (LUKS2 writer pending)\n",
                 parts[1]
             )
         }
-        "status" => "cryptsetup: no encrypted devices currently open\n".to_string(),
+        "status" => {
+            let armed = ARMED_DEVICES.lock();
+            if armed.is_empty() {
+                "cryptsetup: no encrypted devices currently armed\n".to_string()
+            } else {
+                let mut out = String::new();
+                out.push_str(&format!("cryptsetup: {} armed device(s):\n", armed.len()));
+                for (device, name) in armed.iter() {
+                    out.push_str(&format!("  {} -> '{}'\n", device, name));
+                }
+                out
+            }
+        }
         _ => format!("cryptsetup: unknown subcommand '{}'\n", parts[0]),
+    }
+}
+
+/// Read a passphrase from the serial console (0x3F8).
+///
+/// Returns `None` on EOF / error. Echoes characters as-is (see production
+/// note on `ARMED_DEVICES`). A line is terminated by CR or LF.
+fn prompt_passphrase(device: &str) -> Option<String> {
+    use x86_64::instructions::port::Port;
+
+    // Write prompt to serial.
+    let prompt = format!("cryptsetup: enter passphrase for {}: ", device);
+    for b in prompt.as_bytes() {
+        unsafe { Port::<u8>::new(0x3F8).write(*b); }
+    }
+
+    let mut buf = String::new();
+    loop {
+        // Poll the LSR for data-ready (bit 0).
+        let c: u8 = unsafe {
+            let mut lsr = Port::<u8>::new(0x3F8 + 5);
+            loop {
+                if lsr.read() & 1 != 0 { break; }
+                core::hint::spin_loop();
+            }
+            Port::<u8>::new(0x3F8).read()
+        };
+        match c {
+            b'\r' | b'\n' => {
+                // Echo newline.
+                unsafe {
+                    let mut p = Port::<u8>::new(0x3F8);
+                    p.write(b'\r');
+                    p.write(b'\n');
+                }
+                return Some(buf);
+            }
+            0x08 | 0x7f => {
+                // Backspace — remove last char if any.
+                if buf.pop().is_some() {
+                    unsafe {
+                        let mut p = Port::<u8>::new(0x3F8);
+                        p.write(0x08); p.write(b' '); p.write(0x08);
+                    }
+                }
+            }
+            c if c >= 0x20 && c < 0x7f => {
+                buf.push(c as char);
+                // Echo the character. Production: disable echo or print '*'.
+                unsafe { Port::<u8>::new(0x3F8).write(c); }
+                // Cap line length to avoid runaway input.
+                if buf.len() >= 1024 {
+                    return Some(buf);
+                }
+            }
+            _ => {
+                // Ignore other control bytes.
+            }
+        }
     }
 }
 

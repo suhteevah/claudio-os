@@ -254,6 +254,19 @@ pub fn periodic_check(
 
                 // Emit SAVE_SESSION marker so the host script can persist it.
                 log::info!("[oauth] SAVE_SESSION:{}", new_cookie);
+
+                // Also persist the refreshed cookie to the VFS so the next boot
+                // (or a kernel that re-reads /claudio/session.txt) sees it.
+                let conv_id = mgr.conv_id.clone();
+                let blob = alloc::format!("{}\n{}", new_cookie, conv_id);
+                match claudio_fs::write_file("/claudio/session.txt", blob.as_bytes()) {
+                    Ok(()) => log::debug!(
+                        "[session] persisted refreshed cookie to VFS ({} bytes)",
+                        blob.len(),
+                    ),
+                    Err(e) => log::warn!("[session] VFS persist failed: {}", e),
+                }
+
                 log::info!("[session] cookie refreshed ({} bytes) [REDACTED]", new_cookie.len());
                 log::info!("[session] refresh successful — session extended");
             }

@@ -158,6 +158,86 @@ enum PaneType {
     Browser(crate::browser::BrowserState),
     /// Visual file manager pane.
     FileManager(FileManagerState),
+    /// Text editor pane with an in-memory buffer.
+    Editor(EditorPaneState),
+}
+
+/// State for an editor pane. Wraps `claudio_editor::Editor` and binds it
+/// to a specific layout pane id.
+pub struct EditorPaneState {
+    /// Layout pane id this editor is bound to.
+    pub pane_id: usize,
+    /// Path the buffer was loaded from (also displayed in the status bar).
+    pub path: String,
+    /// The underlying editor instance.
+    pub editor: claudio_editor::Editor,
+}
+
+// ---------------------------------------------------------------------------
+// Pane request queue -- external modules push, dashboard drains each tick
+// ---------------------------------------------------------------------------
+
+/// A request from an external module (file manager, SSH server, etc.) to
+/// the dashboard to create or close a pane.
+///
+/// The dashboard owns the `pane_types: Vec<PaneType>` as a local inside its
+/// main loop, so external modules cannot push to it directly. Instead they
+/// push onto this global queue and the dashboard drains it each iteration
+/// of the event loop and materialises the requests into real panes.
+pub enum PaneRequest {
+    /// Open a new editor pane with the given path + initial buffer contents.
+    OpenEditor {
+        path: String,
+        content: String,
+    },
+    /// Open a new shell pane with the given prompt banner (e.g. "ssh[3]> ").
+    OpenShell {
+        prompt: String,
+    },
+    /// Close the pane with the given layout pane id.
+    Close {
+        pane_id: u64,
+    },
+}
+
+/// Global pane request queue.
+///
+/// `spin::Mutex::new` and `Vec::new` are both `const fn`, so no `Once` or
+/// lazy init is required. The queue is drained by the dashboard via
+/// [`drain_pane_requests`] on each tick.
+static PANE_REQUESTS: spin::Mutex<Vec<PaneRequest>> = spin::Mutex::new(Vec::new());
+
+/// Request that the dashboard open a new editor pane.
+///
+/// Returns immediately; the pane is materialised on the next dashboard tick.
+pub fn request_open_editor(path: String, content: String) {
+    PANE_REQUESTS
+        .lock()
+        .push(PaneRequest::OpenEditor { path, content });
+}
+
+/// Request that the dashboard open a new shell pane.
+///
+/// Used by external modules such as the SSH server when a remote client
+/// requests an interactive shell. `prompt` is a banner written into the
+/// pane before the shell takes over.
+pub fn request_open_shell(prompt: String) {
+    PANE_REQUESTS
+        .lock()
+        .push(PaneRequest::OpenShell { prompt });
+}
+
+/// Request that the dashboard close a specific pane.
+pub fn request_close_pane(pane_id: u64) {
+    PANE_REQUESTS
+        .lock()
+        .push(PaneRequest::Close { pane_id });
+}
+
+/// Drain all pending pane requests. Called by the dashboard main loop
+/// once per tick. Replaces the inner `Vec` with an empty one (no realloc).
+pub fn drain_pane_requests() -> Vec<PaneRequest> {
+    core::mem::take(&mut *PANE_REQUESTS.lock())
 }
 
 /// State for a shell pane. Wraps `claudio_shell::Shell` and adapts it to the
@@ -409,8 +489,20 @@ impl Vfs for StubVfs {
 // ---------------------------------------------------------------------------
 
 /// SystemInfo wired to the agent Dashboard for ps/kill. Stubs the rest.
+///
+/// Carries a raw pointer to the network stack and a clock function so that
+/// the shell's `ping`/network builtins can reach the real TCP/DNS stack.
+/// The raw pointer is safe here because the dashboard's single-threaded
+/// executor is the only owner of the stack, and the `SystemInfo` impl is
+/// only used synchronously from `submit_shell_input`, which is already
+/// holding a `&mut NetworkStack` on the call stack above us.
 struct DashboardSystemInfoMut<'a> {
     dashboard: &'a Dashboard,
+    /// Raw pointer to the kernel's `NetworkStack`. Set when the shell is
+    /// invoked from within the executor; `None` / null when unavailable.
+    stack: *mut NetworkStack,
+    /// Monotonic clock used by smoltcp and the nettools helpers.
+    now: fn() -> Instant,
 }
 
 impl<'a> SystemInfo for DashboardSystemInfoMut<'a> {
@@ -453,7 +545,24 @@ impl<'a> SystemInfo for DashboardSystemInfoMut<'a> {
     }
 
     fn ping(&self, host: &str) -> Result<String, String> {
-        Err(format!("ping: {}: not yet implemented", host))
+        // We don't have ICMP sockets wired through claudio-net (smoltcp's
+        // `socket-icmp` feature isn't enabled in our build). Fall back to a
+        // DNS-resolve + TCP SYN probe via `crate::nettools::ping`, which is
+        // the same implementation the shell's `ping` builtin uses. Result
+        // is formatted exactly like `tcping host`.
+        if self.stack.is_null() {
+            return Err(format!(
+                "ping: {}: no network stack available (are we past boot?)",
+                host
+            ));
+        }
+        // SAFETY: `stack` is set by `submit_shell_input` from a live
+        // `&mut NetworkStack` borrowed higher up the call stack. The shell
+        // executor is single-threaded so there's no concurrent access, and
+        // the pointer is only dereferenced for the duration of this call.
+        let stack = unsafe { &mut *self.stack };
+        let output = crate::nettools::ping(stack, host, 4, self.now);
+        Ok(output)
     }
 
     fn date(&self) -> String {
@@ -470,7 +579,53 @@ impl<'a> SystemInfo for DashboardSystemInfoMut<'a> {
     }
 
     fn disk_usage(&self) -> Vec<(String, u64, u64, u64)> {
-        Vec::new()
+        // Query the live block-device registry populated during boot
+        // (`crate::disks::init`, phase 5d). Each `DiskEntry` is one real
+        // AHCI port or NVMe namespace already instantiated and ready for
+        // I/O — no re-probing from here.
+        //
+        // Tuple layout: (name, total, used, avail). We don't have a live
+        // filesystem mounted on these partitions yet (the VFS is still
+        // MemFs at /), so `used` is reported as 0 and `avail` == `total`.
+        // The name column carries the disk label + PCI coordinates + model
+        // string so `df` becomes a useful `lsblk`-style overview.
+        let mut rows: Vec<(String, u64, u64, u64)> = crate::disks::with_disks(|disks| {
+            disks
+                .iter()
+                .map(|d| {
+                    let name = alloc::format!(
+                        "{} {:02x}:{:02x}.{} [{:04x}:{:04x}] {}",
+                        d.label,
+                        d.bus, d.device, d.function,
+                        d.vendor_id, d.device_id,
+                        d.model,
+                    );
+                    // Report full capacity as both total and avail since
+                    // no filesystem is mounted yet.
+                    (name, d.total_bytes, 0u64, d.total_bytes)
+                })
+                .collect()
+        });
+
+        // Always surface the MemFs root so `df` isn't empty on QEMU. We
+        // report the kernel heap as the "disk" because MemFs lives there.
+        let (used, total) = crate::memory::heap_stats();
+        let avail = total.saturating_sub(used) as u64;
+        rows.push((
+            String::from("memfs /"),
+            total as u64,
+            used as u64,
+            avail,
+        ));
+
+        if rows.len() == 1 {
+            // Only the memfs row — registry is empty.
+            log::info!(
+                "[dashboard] disk_usage: registry empty, reporting MemFs heap only"
+            );
+        }
+
+        rows
     }
 }
 
@@ -613,6 +768,147 @@ pub async fn run_dashboard(
     let mut last_sysmon_tick: u64 = crate::interrupts::tick_count();
 
     loop {
+        // -- Drain pane-creation requests from external modules ------------
+        //
+        // File manager, SSH server, etc. push onto PANE_REQUESTS rather
+        // than reaching into this function's local `pane_types`. We
+        // materialise them at the top of each tick so a pane is live
+        // before any input is processed this iteration.
+        let reqs = drain_pane_requests();
+        if !reqs.is_empty() {
+            let mut structural_change = false;
+            for req in reqs {
+                match req {
+                    PaneRequest::OpenEditor { path, content } => {
+                        log::info!(
+                            "[dashboard] pane request: open editor for {} ({} bytes)",
+                            path,
+                            content.len()
+                        );
+                        layout.split(SplitDirection::Horizontal);
+                        let new_pane_id = layout.focused_pane_id();
+                        let (cols, rows) = layout
+                            .pane_by_id_mut(new_pane_id)
+                            .map(|p| (p.cols(), p.rows()))
+                            .unwrap_or((80, 24));
+                        let mut editor = claudio_editor::Editor::new(cols, rows);
+                        editor.load(&path, &content);
+                        // Paint the initial editor frame into the pane.
+                        let rendered = editor.render();
+                        if let Some(pane) = layout.pane_by_id_mut(new_pane_id) {
+                            pane.write_str(&rendered);
+                        }
+                        pane_types.push(PaneType::Editor(EditorPaneState {
+                            pane_id: new_pane_id,
+                            path,
+                            editor,
+                        }));
+                        input_buffers.push(InputBuffer::new(new_pane_id));
+                        structural_change = true;
+                    }
+                    PaneRequest::OpenShell { prompt } => {
+                        log::info!("[dashboard] pane request: open shell ({})", prompt);
+                        layout.split(SplitDirection::Horizontal);
+                        let new_pane_id = layout.focused_pane_id();
+                        let shell_state = ShellPaneState::new(
+                            next_shell_id,
+                            new_pane_id,
+                            stack_send.0,
+                            now,
+                        );
+                        next_shell_id += 1;
+                        pane_types.push(PaneType::Shell(shell_state));
+                        input_buffers.push(InputBuffer::new(new_pane_id));
+                        if let Some(pane) = layout.pane_by_id_mut(new_pane_id) {
+                            pane.write_str("\x1b[96mClaudioOS Shell\x1b[0m\r\n");
+                            pane.write_str(&format!("\x1b[90m{}\x1b[0m\r\n", prompt));
+                        }
+                        structural_change = true;
+                    }
+                    PaneRequest::Close { pane_id } => {
+                        let target = pane_id as usize;
+                        log::info!("[dashboard] pane request: close pane {}", target);
+                        if let Some(idx) = pane_types.iter().position(|pt| match pt {
+                            PaneType::Agent(aid) => {
+                                dashboard.session_by_id(*aid).map(|s| s.pane_id) == Some(target)
+                            }
+                            PaneType::Shell(ss) => ss.pane_id == target,
+                            PaneType::SysMonitor(pid) => *pid == target,
+                            PaneType::Browser(bs) => bs.pane_id == target,
+                            PaneType::FileManager(fm) => fm.pane_id == target,
+                            PaneType::Editor(ep) => ep.pane_id == target,
+                        }) {
+                            if layout.pane_count() > 1 {
+                                pane_types.remove(idx);
+                                input_buffers.retain(|b| b.pane_id != target);
+                                // Close whichever pane is currently focused
+                                // by shifting focus to the target first.
+                                // The layout doesn't expose close-by-id, so
+                                // we focus-cycle until we hit the target.
+                                let start = layout.focused_pane_id();
+                                let mut guard = 0usize;
+                                while layout.focused_pane_id() != target && guard < 32 {
+                                    layout.focus_next();
+                                    guard += 1;
+                                    if layout.focused_pane_id() == start {
+                                        break;
+                                    }
+                                }
+                                if layout.focused_pane_id() == target {
+                                    layout.close_focused();
+                                }
+                                structural_change = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if structural_change {
+                let focused_pane_id = layout.focused_pane_id();
+                render_prompt_for_pane(
+                    &mut layout,
+                    &pane_types,
+                    &input_buffers,
+                    focused_pane_id,
+                    &dashboard,
+                );
+                render_full(&mut layout);
+            }
+        }
+
+        // -- Drain SSH session events (informational; pane creation is
+        //    already handled via PANE_REQUESTS from ssh_server.rs) --------
+        let ssh_events = crate::ssh_server::drain_events();
+        for ev in ssh_events {
+            match ev {
+                crate::ssh_server::SshSessionEvent::ShellOpened {
+                    channel_id,
+                    pane_id,
+                    term,
+                    width,
+                    height,
+                } => {
+                    log::info!(
+                        "[dashboard] ssh ShellOpened: ch={} pane={} term={} {}x{}",
+                        channel_id, pane_id, term, width, height
+                    );
+                }
+                crate::ssh_server::SshSessionEvent::ExecRequested {
+                    channel_id,
+                    pane_id,
+                    command,
+                } => {
+                    log::info!(
+                        "[dashboard] ssh ExecRequested: ch={} pane={} cmd={}",
+                        channel_id, pane_id, command
+                    );
+                }
+                crate::ssh_server::SshSessionEvent::ChannelClosed { channel_id } => {
+                    log::info!("[dashboard] ssh ChannelClosed: ch={}", channel_id);
+                }
+            }
+        }
+
         // -- Screensaver: idle check + animation loop --
         if screensaver.active {
             if let Some(_key) = stream.try_next_key() {
@@ -770,6 +1066,21 @@ pub async fn run_dashboard(
                             continue;
                         }
 
+                        // Editor pane -- route all keys to the editor.
+                        let is_editor = pane_types.iter().any(|pt| {
+                            matches!(pt, PaneType::Editor(ep) if ep.pane_id == focused_pane_id)
+                        });
+                        if is_editor {
+                            handle_editor_char(
+                                c,
+                                &mut layout,
+                                &mut pane_types,
+                                focused_pane_id,
+                            );
+                            render_dirty(&mut layout);
+                            continue;
+                        }
+
                         // Enter key — submit input.
                         if c == '\n' || c == '\r' {
                             submit_input_for_focused(
@@ -829,7 +1140,20 @@ pub async fn run_dashboard(
                             focused_pane_id,
                         );
                     } else {
-                        log::trace!("[dashboard] raw key: {:?}", k);
+                        // Editor pane -- route raw keys (arrow keys, Home, End, etc.).
+                        let is_editor = pane_types.iter().any(|pt| {
+                            matches!(pt, PaneType::Editor(ep) if ep.pane_id == focused_pane_id)
+                        });
+                        if is_editor {
+                            handle_editor_rawkey(
+                                k,
+                                &mut layout,
+                                &mut pane_types,
+                                focused_pane_id,
+                            );
+                        } else {
+                            log::trace!("[dashboard] raw key: {:?}", k);
+                        }
                     }
                 }
             }
@@ -987,6 +1311,7 @@ fn handle_prefix_command(
                 PaneType::SysMonitor(pid) => *pid == focused_pane_id,
                 PaneType::Browser(bs) => bs.pane_id == focused_pane_id,
                 PaneType::FileManager(fm) => fm.pane_id == focused_pane_id,
+                PaneType::Editor(ep) => ep.pane_id == focused_pane_id,
             }) {
                 if let PaneType::Agent(aid) = &pane_types[idx] {
                     let aid = *aid;
@@ -1123,6 +1448,7 @@ async fn submit_input_for_focused(
         PaneType::SysMonitor(pid) => *pid == focused_pane_id,
         PaneType::Browser(bs) => bs.pane_id == focused_pane_id,
         PaneType::FileManager(fm) => fm.pane_id == focused_pane_id,
+        PaneType::Editor(ep) => ep.pane_id == focused_pane_id,
     });
 
     let pane_type_idx = match pane_type_idx {
@@ -1133,8 +1459,16 @@ async fn submit_input_for_focused(
         }
     };
 
-    // SysMonitor, Browser, and FileManager panes don't accept text input — ignore Enter.
-    if matches!(&pane_types[pane_type_idx], PaneType::SysMonitor(_) | PaneType::Browser(_) | PaneType::FileManager(_)) {
+    // SysMonitor, Browser, FileManager, and Editor panes don't accept text
+    // input via the shared input buffer — they have their own key routers
+    // (Editor is currently read-only; full dispatch lands later).
+    if matches!(
+        &pane_types[pane_type_idx],
+        PaneType::SysMonitor(_)
+            | PaneType::Browser(_)
+            | PaneType::FileManager(_)
+            | PaneType::Editor(_)
+    ) {
         return;
     }
 
@@ -1381,6 +1715,7 @@ async fn submit_input_for_focused(
 
         submit_shell_input(
             layout, dashboard, pane_types, pane_type_idx, focused_pane_id, input_text, vfs,
+            stack, now,
         );
     }
 }
@@ -1530,6 +1865,8 @@ fn submit_shell_input(
     pane_id: usize,
     input_text: String,
     vfs: &mut StubVfs,
+    stack: &mut NetworkStack,
+    now: fn() -> Instant,
 ) {
     log::info!("[dashboard] shell input: {}", input_text);
 
@@ -1563,7 +1900,11 @@ fn submit_shell_input(
     // Execute using Shell::execute_input which handles both commands and natural language.
     // We need a dummy LineReader since execute_input takes one for AI confirmation.
     let mut dummy_reader = DummyLineReader;
-    let mut sys = DashboardSystemInfoMut { dashboard };
+    let mut sys = DashboardSystemInfoMut {
+        dashboard,
+        stack: stack as *mut NetworkStack,
+        now,
+    };
 
     let (output, exit_code) = shell_state.shell.execute_input(
         trimmed,
@@ -1844,10 +2185,20 @@ fn render_prompt_for_pane(
         PaneType::SysMonitor(pid) => *pid == pane_id,
         PaneType::Browser(bs) => bs.pane_id == pane_id,
         PaneType::FileManager(fm) => fm.pane_id == pane_id,
+        PaneType::Editor(ep) => ep.pane_id == pane_id,
     });
 
-    // SysMonitor, Browser, and FileManager panes don't show a standard prompt -- skip.
-    if matches!(pane_type, Some(PaneType::SysMonitor(_) | PaneType::Browser(_) | PaneType::FileManager(_))) {
+    // SysMonitor, Browser, FileManager, and Editor panes don't show a
+    // standard prompt -- they paint their own UI.
+    if matches!(
+        pane_type,
+        Some(
+            PaneType::SysMonitor(_)
+                | PaneType::Browser(_)
+                | PaneType::FileManager(_)
+                | PaneType::Editor(_)
+        )
+    ) {
         return;
     }
 
@@ -1870,7 +2221,10 @@ fn render_prompt_for_pane(
         Some(PaneType::Shell(_ss)) => {
             ("shell", "", "$")
         }
-        Some(PaneType::SysMonitor(_)) | Some(PaneType::Browser(_)) | Some(PaneType::FileManager(_)) => unreachable!(),
+        Some(PaneType::SysMonitor(_))
+        | Some(PaneType::Browser(_))
+        | Some(PaneType::FileManager(_))
+        | Some(PaneType::Editor(_)) => unreachable!(),
         None => ("???", "", ">"),
     };
 
@@ -2116,8 +2470,51 @@ fn handle_filemanager_char(
         Some(FileManagerAction::Enter) => {
             let result = fm.enter_selected(vfs);
             if let Some(file_path) = result {
-                // File was selected -- log it (editor integration is future work).
-                fm.status_message = format!("Open: {} (editor not yet wired)", file_path);
+                // Read the file via the global claudio-fs backend, which
+                // is wired to the kernel VFS in `crate::storage`, then
+                // push a pane-open request onto the dashboard queue.
+                // The dashboard drains this queue at the top of the
+                // next tick and creates a real `PaneType::Editor` with
+                // its own layout pane.
+                match claudio_fs::read_file(&file_path) {
+                    Ok(bytes) => {
+                        let size = bytes.len();
+                        // Prefer UTF-8; fall back to printable-ASCII scrub
+                        // for binary files so the editor buffer stays valid.
+                        let text = match core::str::from_utf8(&bytes) {
+                            Ok(s) => alloc::string::String::from(s),
+                            Err(_) => {
+                                let mut s = alloc::string::String::new();
+                                for b in &bytes {
+                                    if *b == b'\n' || *b == b'\r' || *b == b'\t'
+                                        || (*b >= 0x20 && *b < 0x7f)
+                                    {
+                                        s.push(*b as char);
+                                    } else {
+                                        s.push('.');
+                                    }
+                                }
+                                s
+                            }
+                        };
+
+                        log::info!(
+                            "[dashboard] opening {} ({} bytes) in editor pane",
+                            file_path, size
+                        );
+                        request_open_editor(file_path.clone(), text);
+                        fm.status_message =
+                            format!("Opened {} ({} bytes) in editor pane", file_path, size);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[dashboard] failed to open {} in editor: {:?}",
+                            file_path, e
+                        );
+                        fm.status_message =
+                            format!("Failed to open {}: {:?}", file_path, e);
+                    }
+                }
             }
         }
         Some(FileManagerAction::GoParent) => {
@@ -2176,5 +2573,95 @@ fn handle_filemanager_rawkey(
             }
         }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Editor pane input handlers
+// ---------------------------------------------------------------------------
+
+/// Handle a Unicode character input for the focused editor pane.
+///
+/// Dispatches the key to the underlying `claudio_editor::Editor` and repaints
+/// the pane with the editor's ANSI output. Ctrl+S persists the buffer back
+/// to the file it was loaded from (via `claudio_fs::write_file`). Ctrl+Q
+/// pushes a close request onto `PANE_REQUESTS` so the dashboard tears the
+/// pane down on the next tick.
+fn handle_editor_char(
+    c: char,
+    layout: &mut Layout,
+    pane_types: &mut Vec<PaneType>,
+    focused_pane_id: usize,
+) {
+    use claudio_editor::EditorAction;
+
+    let ep = match pane_types.iter_mut().find_map(|pt| match pt {
+        PaneType::Editor(ep) if ep.pane_id == focused_pane_id => Some(ep),
+        _ => None,
+    }) {
+        Some(ep) => ep,
+        None => return,
+    };
+
+    let action = ep.editor.handle_key(DecodedKey::Unicode(c));
+
+    match action {
+        EditorAction::Save(_name) => {
+            let content = ep.editor.content();
+            match claudio_fs::write_file(&ep.path, content.as_bytes()) {
+                Ok(()) => {
+                    log::info!(
+                        "[dashboard] editor saved {} ({} bytes)",
+                        ep.path,
+                        content.len()
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[dashboard] editor save {} failed: {:?}",
+                        ep.path,
+                        e
+                    );
+                }
+            }
+        }
+        EditorAction::Quit => {
+            log::info!("[dashboard] editor quit requested for {}", ep.path);
+            request_close_pane(focused_pane_id as u64);
+            return;
+        }
+        EditorAction::Continue => {}
+    }
+
+    // Re-render the editor into the pane.
+    let rendered = ep.editor.render();
+    if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+        pane.write_str(&rendered);
+    }
+}
+
+/// Handle a raw (non-Unicode) key for the focused editor pane.
+///
+/// Used for arrow keys, Home, End, Page{Up,Down}, Delete, etc. — anything
+/// `pc_keyboard` decodes as `DecodedKey::RawKey`.
+fn handle_editor_rawkey(
+    k: KeyCode,
+    layout: &mut Layout,
+    pane_types: &mut Vec<PaneType>,
+    focused_pane_id: usize,
+) {
+    let ep = match pane_types.iter_mut().find_map(|pt| match pt {
+        PaneType::Editor(ep) if ep.pane_id == focused_pane_id => Some(ep),
+        _ => None,
+    }) {
+        Some(ep) => ep,
+        None => return,
+    };
+
+    let _ = ep.editor.handle_key(DecodedKey::RawKey(k));
+
+    let rendered = ep.editor.render();
+    if let Some(pane) = layout.pane_by_id_mut(focused_pane_id) {
+        pane.write_str(&rendered);
     }
 }

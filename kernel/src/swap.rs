@@ -21,6 +21,32 @@ use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
+// ── Armed swap partition (set by `swapon`, cleared by `swapoff`) ─────
+
+/// Description of a swap partition that has been "armed" via `swapon`.
+///
+/// Armed means: we've located the partition on a real disk, verified its
+/// geometry, and stashed the coordinates here. Real paging I/O still
+/// requires a kernel VM subsystem, so this is metadata-only for now.
+#[derive(Debug, Clone)]
+pub struct SwapPartition {
+    /// Human-readable source (e.g. "pci 0:2.0 ahci disk 0", "pci 0:3.0 nvme ns1").
+    pub source: String,
+    /// Partition index within the disk (0-based).
+    pub partition_index: usize,
+    /// Starting LBA of the partition.
+    pub start_lba: u64,
+    /// Partition size in bytes.
+    pub size_bytes: u64,
+    /// Partition name (GPT, may be empty).
+    pub name: String,
+    /// Whether the partition has the Linux-swap GPT type GUID.
+    pub is_linux_swap: bool,
+}
+
+/// Globally armed swap partition (one slot — there's only ever one swap).
+pub static SWAP_PARTITION: Mutex<Option<SwapPartition>> = Mutex::new(None);
+
 // ── Constants ────────────────────────────────────────────────────────
 
 /// Page size for swap (4 KiB, matching x86_64 page size).
@@ -388,24 +414,205 @@ pub fn is_swap_partition_guid(guid: &[u8; 16]) -> bool {
 
 // ── Shell commands ───────────────────────────────────────────────────
 
+/// Parse GPT partitions on the disk at `disk_index` in the global block
+/// device registry (populated by `crate::disks::init` at boot phase 5d).
+///
+/// Returns `None` if the index is out of range, the block device adapter
+/// cannot be constructed, or the GPT parser fails (disk not partitioned,
+/// no GPT header, I/O error, etc.). Errors are logged at warn/debug level.
+fn try_parse_gpt_for_disk(disk_index: usize) -> Option<Vec<claudio_vfs::PartitionEntry>> {
+    let bd = match crate::disks::as_block_device(disk_index) {
+        Some(bd) => bd,
+        None => {
+            log::debug!(
+                "[swap] try_parse_gpt_for_disk({}): no adapter available",
+                disk_index,
+            );
+            return None;
+        }
+    };
+    match claudio_vfs::device::parse_gpt(&*bd) {
+        Ok(entries) => {
+            log::info!(
+                "[swap] disk #{}: GPT parsed {} partition(s)",
+                disk_index, entries.len(),
+            );
+            Some(entries)
+        }
+        Err(e) => {
+            log::warn!(
+                "[swap] disk #{}: GPT parse failed: {}",
+                disk_index, e,
+            );
+            None
+        }
+    }
+}
+
 /// Handle the `swapon` shell command.
 ///
-/// Usage: `swapon <device>` or `swapon -a` (auto-detect from GPT).
+/// Usage:
+/// - `swapon`          — show status (same as `swapon -s`)
+/// - `swapon -s`       — show armed swap partition
+/// - `swapon -a`       — auto-scan the live disk registry, arm the first
+///                       GPT partition with the Linux-swap type GUID
+/// - `swapon <device>` — arm a specific partition (e.g. `/dev/ahci0p2`,
+///                       `/dev/nvme0n1p3`). The path must match a
+///                       `DiskEntry::label` + trailing `p<index>`.
 pub fn shell_swapon(args: &str) -> String {
     let args = args.trim();
-    if args.is_empty() {
-        return "usage: swapon <device> | swapon -a\n".to_string();
+
+    if args.is_empty() || args == "-s" {
+        return status_string();
     }
 
-    if args == "-a" {
-        return "swapon: scanning GPT for swap partitions... (not yet wired to disk driver)\n"
-            .to_string();
+    let auto = args == "-a";
+
+    // Copy the registry into a lightweight local form so we can drop the
+    // registry lock before doing GPT I/O (which would re-lock the registry
+    // via `as_block_device`).
+    struct DiskMeta {
+        label: alloc::string::String,
+        bus: u8,
+        device: u8,
+        function: u8,
+        vendor_id: u16,
+        device_id: u16,
+        total_bytes: u64,
+        sector_size: u32,
+    }
+    let metas: Vec<DiskMeta> = crate::disks::with_disks(|disks| {
+        disks
+            .iter()
+            .map(|d| DiskMeta {
+                label: d.label.clone(),
+                bus: d.bus,
+                device: d.device,
+                function: d.function,
+                vendor_id: d.vendor_id,
+                device_id: d.device_id,
+                total_bytes: d.total_bytes,
+                sector_size: d.sector_size,
+            })
+            .collect()
+    });
+
+    let mut out = String::new();
+
+    if metas.is_empty() {
+        out.push_str("swapon: no disks in registry (disks::init found no AHCI/NVMe controllers)\n");
+        if !auto {
+            out.push_str(&format!(
+                "swapon: explicit device '{}' requested but no storage hardware is probed\n",
+                args,
+            ));
+        }
+        return out;
     }
 
-    format!(
-        "swapon: would enable swap on {} (disk driver not yet wired)\n",
-        args,
-    )
+    out.push_str(&format!(
+        "swapon: {} disk(s) registered:\n",
+        metas.len(),
+    ));
+    for m in &metas {
+        out.push_str(&format!(
+            "  {} pci {:02x}:{:02x}.{} vendor={:#06x} device={:#06x} size={} MiB\n",
+            m.label, m.bus, m.device, m.function,
+            m.vendor_id, m.device_id,
+            m.total_bytes / (1024 * 1024),
+        ));
+    }
+
+    // Parse the user's explicit device path for match criteria, if any.
+    // Accepts `ahci0p2`, `/dev/ahci0p2`, `nvme0n1p3`, `/dev/nvme0n1p3`.
+    let want_label_partidx: Option<(alloc::string::String, usize)> = if auto {
+        None
+    } else {
+        let raw = args.strip_prefix("/dev/").unwrap_or(args);
+        // Find the last 'p' that introduces a numeric partition suffix.
+        if let Some(pidx) = raw.rfind('p') {
+            let (label, rest) = raw.split_at(pidx);
+            // rest is like "p2"; drop the 'p'
+            let suffix = &rest[1..];
+            match suffix.parse::<usize>() {
+                Ok(n) if !label.is_empty() => Some((label.into(), n)),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
+
+    // Iterate disks, parse GPT on each, and look for a matching partition.
+    let mut armed: Option<SwapPartition> = None;
+    for (disk_idx, m) in metas.iter().enumerate() {
+        let entries = match try_parse_gpt_for_disk(disk_idx) {
+            Some(e) => e,
+            None => {
+                out.push_str(&format!(
+                    "  -> {} no GPT / parse failed\n",
+                    m.label,
+                ));
+                continue;
+            }
+        };
+        out.push_str(&format!(
+            "  -> {} parsed {} GPT partition(s)\n",
+            m.label, entries.len(),
+        ));
+
+        // Prefer a partition that matches an explicit request, else one
+        // with the Linux swap GPT type GUID, else fall through.
+        let mut chosen: Option<&claudio_vfs::PartitionEntry> = None;
+        let mut matched_label = false;
+        if let Some((want_label, want_idx)) = want_label_partidx.as_ref() {
+            if &m.label == want_label {
+                if let Some(e) = entries.iter().find(|e| e.index == *want_idx) {
+                    chosen = Some(e);
+                    matched_label = true;
+                }
+            }
+        }
+        if chosen.is_none() && (auto || !matched_label) {
+            chosen = entries.iter().find(|e| is_swap_partition_guid(&e.type_id));
+        }
+
+        if let Some(entry) = chosen {
+            let source = format!(
+                "{} (pci {:02x}:{:02x}.{} {:#06x}:{:#06x})",
+                m.label, m.bus, m.device, m.function, m.vendor_id, m.device_id,
+            );
+            armed = Some(SwapPartition {
+                source,
+                partition_index: entry.index,
+                start_lba: entry.start_lba,
+                size_bytes: entry.sector_count * m.sector_size as u64,
+                name: entry.name.clone(),
+                is_linux_swap: is_swap_partition_guid(&entry.type_id),
+            });
+            break;
+        }
+    }
+
+    if let Some(p) = armed {
+        let size_mb = p.size_bytes / (1024 * 1024);
+        out.push_str(&format!(
+            "swapon: armed swap on {} ({} MiB), paging activation pending kernel VM work\n",
+            p.source, size_mb,
+        ));
+        log::info!(
+            "[swap] armed: {} partition_index={} start_lba={} size={} MiB linux_swap_guid={}",
+            p.source, p.partition_index, p.start_lba, size_mb, p.is_linux_swap,
+        );
+        *SWAP_PARTITION.lock() = Some(p);
+    } else {
+        out.push_str(
+            "swapon: no matching swap partition found (need a GPT partition with \
+             Linux-swap type GUID 0657FD6D-A4AB-43C4-84E5-0933C84B4F4F)\n",
+        );
+    }
+
+    out
 }
 
 /// Handle the `swapoff` shell command.
@@ -414,8 +621,15 @@ pub fn shell_swapon(args: &str) -> String {
 pub fn shell_swapoff(args: &str) -> String {
     let args = args.trim();
 
+    // Clear the armed partition regardless of the manager state.
+    let armed_cleared = SWAP_PARTITION.lock().take().is_some();
+
     let mut mgr = SWAP_MANAGER.lock();
     if !mgr.enabled {
+        if armed_cleared {
+            return "swapoff: cleared armed swap partition (manager was not yet enabled)\n"
+                .to_string();
+        }
         return "swapoff: no swap is currently enabled\n".to_string();
     }
 
@@ -431,6 +645,22 @@ pub fn shell_swapoff(args: &str) -> String {
         "swapoff: all swap disabled\n".to_string()
     } else {
         format!("swapoff: disabled swap on {}\n", args)
+    }
+}
+
+/// Current armed-swap status string.
+fn status_string() -> String {
+    match SWAP_PARTITION.lock().as_ref() {
+        Some(p) => format!(
+            "swap armed: source={} part_idx={} start_lba={} size={} MiB name={:?} linux_swap_guid={}\n",
+            p.source,
+            p.partition_index,
+            p.start_lba,
+            p.size_bytes / (1024 * 1024),
+            p.name,
+            p.is_linux_swap,
+        ),
+        None => "swap: no partition armed (run `swapon -a` to scan)\n".to_string(),
     }
 }
 
@@ -495,5 +725,5 @@ pub fn shell_free(args: &str) -> String {
 /// Initialize the swap subsystem. Call once at boot.
 pub fn init() {
     log::info!("[swap] subsystem initialized (no swap device configured)");
-    // TODO: Auto-detect swap partition from GPT when disk drivers are wired.
+    log::info!("[swap] run `swapon -a` at the shell to scan PCI mass-storage controllers");
 }

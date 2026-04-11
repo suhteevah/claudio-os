@@ -310,11 +310,14 @@ pub fn shell_crontab(args: &str) -> String {
         let rest = rest.trim();
         if rest == "all" {
             SCHEDULER.lock().clear();
+            persist_after_mutation();
             return "all cron jobs removed\n".to_string();
         }
         match rest.parse::<u32>() {
             Ok(id) => {
-                if SCHEDULER.lock().remove_job(id) {
+                let removed = SCHEDULER.lock().remove_job(id);
+                if removed {
+                    persist_after_mutation();
                     format!("removed job {}\n", id)
                 } else {
                     format!("job {} not found\n", id)
@@ -334,12 +337,21 @@ pub fn shell_crontab(args: &str) -> String {
             Ok(expr) => {
                 let command = tokens[5].to_string();
                 let id = SCHEDULER.lock().add_job(expr, command);
+                persist_after_mutation();
                 format!("added job {}\n", id)
             }
             Err(e) => format!("invalid cron expression: {}\n", e),
         }
     } else {
         "usage: crontab [-l | -e <schedule> <cmd> | -r <id|all>]\n".to_string()
+    }
+}
+
+/// Helper: persist the scheduler state after a successful mutation. Logs on
+/// failure but never panics — persistence is best-effort.
+fn persist_after_mutation() {
+    if let Err(e) = save_jobs_to_vfs() {
+        log::warn!("[cron] failed to persist cron jobs: {}", e);
     }
 }
 
@@ -406,5 +418,121 @@ pub fn deserialize_jobs(data: &str) {
 /// Initialize the cron subsystem. Call once at boot after RTC init.
 pub fn init() {
     log::info!("[cron] scheduler initialized");
-    // TODO: Load persisted jobs from FAT32 config via fs-persist
+    match load_jobs_from_vfs() {
+        Ok(n) => log::info!("[cron] loaded {} persisted job(s) from VFS", n),
+        Err(e) => log::debug!("[cron] no persisted jobs loaded: {}", e),
+    }
+}
+
+// ── VFS-backed persistence ───────────────────────────────────────────
+
+/// Path where cron jobs are persisted, as a JSON array of
+/// [`SerializableCronJob`].
+const CRON_JOBS_PATH: &str = "/claudio/cron.json";
+
+/// On-disk form of a cron job. The cron expression is stored as its
+/// human-readable string form (round-trips via [`CronExpression::parse`]),
+/// which keeps the on-disk layout stable even if `CronField` gains new
+/// variants.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializableCronJob {
+    id: u32,
+    schedule: String,
+    command: String,
+    enabled: bool,
+}
+
+/// Load persisted cron jobs from the VFS. Returns the number of jobs loaded.
+///
+/// Reads `/claudio/cron.json`, parses it as a JSON array, and pushes each
+/// entry into the global [`SCHEDULER`], preserving the original IDs. Missing
+/// files and empty lists are reported as `Ok(0)` and `Ok(0)` respectively.
+pub fn load_jobs_from_vfs() -> Result<usize, String> {
+    log::debug!("[cron] loading persisted jobs from {}", CRON_JOBS_PATH);
+    let data = match claudio_fs::read_file(CRON_JOBS_PATH) {
+        Ok(d) => d,
+        Err(claudio_fs::FsError::NotFound) | Err(claudio_fs::FsError::NotMounted) => {
+            log::debug!("[cron] no persisted cron.json — starting with empty schedule");
+            return Ok(0);
+        }
+        Err(e) => {
+            log::warn!("[cron] failed to read cron.json: {}", e);
+            return Err(format!("read_file failed: {}", e));
+        }
+    };
+
+    let parsed: Vec<SerializableCronJob> = serde_json::from_slice(&data)
+        .map_err(|e| {
+            log::warn!("[cron] failed to parse cron.json: {}", e);
+            format!("parse failed: {}", e)
+        })?;
+
+    let mut sched = SCHEDULER.lock();
+    sched.jobs.clear();
+    let mut max_id = 0u32;
+    let mut loaded = 0usize;
+    for sj in parsed {
+        match CronExpression::parse(&sj.schedule) {
+            Ok(expr) => {
+                sched.jobs.push(CronJob {
+                    id: sj.id,
+                    schedule: expr,
+                    command: sj.command,
+                    enabled: sj.enabled,
+                });
+                if sj.id > max_id {
+                    max_id = sj.id;
+                }
+                loaded += 1;
+            }
+            Err(e) => {
+                log::warn!(
+                    "[cron] skipping persisted job {} with invalid schedule '{}': {}",
+                    sj.id, sj.schedule, e
+                );
+            }
+        }
+    }
+    sched.next_id = max_id.saturating_add(1).max(1);
+    log::info!("[cron] loaded {} job(s) from VFS", loaded);
+    Ok(loaded)
+}
+
+/// Save the current set of cron jobs to the VFS as JSON.
+pub fn save_jobs_to_vfs() -> Result<(), String> {
+    let snapshot: Vec<SerializableCronJob> = {
+        let sched = SCHEDULER.lock();
+        sched
+            .jobs
+            .iter()
+            .map(|j| SerializableCronJob {
+                id: j.id,
+                schedule: format!("{}", j.schedule),
+                command: j.command.clone(),
+                enabled: j.enabled,
+            })
+            .collect()
+    };
+
+    let data = serde_json::to_vec(&snapshot)
+        .map_err(|e| {
+            log::error!("[cron] failed to serialize jobs: {}", e);
+            format!("serialize failed: {}", e)
+        })?;
+
+    // Best-effort ensure parent dir exists.
+    let _ = claudio_fs::mkdir("/claudio");
+
+    claudio_fs::write_file(CRON_JOBS_PATH, &data).map_err(|e| {
+        log::warn!("[cron] failed to write cron.json: {}", e);
+        format!("write_file failed: {}", e)
+    })?;
+
+    log::debug!(
+        "[cron] saved {} job(s) to {} ({} bytes)",
+        snapshot.len(),
+        CRON_JOBS_PATH,
+        data.len()
+    );
+    Ok(())
 }

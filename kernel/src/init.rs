@@ -465,70 +465,62 @@ pub fn hostname() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Filesystem mounting (stub)
+// Filesystem mounting
 // ---------------------------------------------------------------------------
 
-/// Mount a filesystem via the VFS adapter layer.
+/// Legacy auto-mount entry point.
 ///
-/// Attempts to locate the block device specified in the mount entry and mount
-/// it using the appropriate filesystem adapter from `claudio_vfs::adapters`.
-///
-/// On QEMU with only virtio-net, no block devices are present and the mount
-/// will be skipped with a warning. On real hardware (AHCI/NVMe), the storage
-/// driver would have registered the device during PCI enumeration.
+/// Historically this tried to walk a PCI-enumerated block device list and
+/// mount real on-disk filesystems here. Since Phase 2b of kernel boot,
+/// the root VFS (a MemFs at `/`) is initialized directly in
+/// `crate::storage::init()` during `main.rs` startup, and additional mounts
+/// are expected to be driven by the storage subsystem on real hardware. This
+/// function now only logs the intent so that config-driven auto_mount entries
+/// remain visible in the boot log.
 fn mount_filesystem(entry: &MountEntry) {
-    // Validate fstype is supported before attempting anything.
-    let fs_driver = match entry.fstype.as_str() {
-        "fat32" | "vfat" => "claudio-fs (fatfs)",
-        "ext4" => "claudio-ext4",
-        "btrfs" => "claudio-btrfs",
-        "ntfs" => "claudio-ntfs",
-        other => {
-            log::warn!(
-                "[init] unsupported filesystem type '{}' for {} -> {}",
-                other, entry.device, entry.path
-            );
-            return;
-        }
-    };
-
     log::info!(
-        "[init] auto_mount: {} -> {} ({}) via {}",
-        entry.device, entry.path, entry.fstype, fs_driver
-    );
-
-    // Attempt to resolve the block device from PCI-enumerated storage.
-    //
-    // The full mount sequence (when block devices are available) is:
-    //   1. Look up block device by path (e.g., /dev/sda1, /dev/nvme0n1p1)
-    //   2. Create partition-scoped adapter (VfsToExt4BlockDevice, etc.)
-    //   3. Call the filesystem's mount (e.g., Ext4Fs::mount(device))
-    //   4. Wrap in the VFS Filesystem adapter (Ext4FilesystemAdapter, etc.)
-    //   5. Register with the global VFS mount table
-    //
-    // See crates/vfs/src/adapters.rs for:
-    //   - AhciBlockDeviceAdapter / NvmeBlockDeviceAdapter (step 1-2)
-    //   - VfsToExt4BlockDevice / VfsToBtrfsBlockDevice (step 2)
-    //   - Ext4FilesystemAdapter / BtrfsFilesystemAdapter / NtfsFilesystemAdapter (step 4)
-    //   - detect_filesystem() for auto-detection when fstype is "auto"
-
-    // Currently no block devices are registered (QEMU with virtio-net only).
-    // On real hardware, this is where we'd call into the storage subsystem.
-    log::warn!(
-        "[init] mount skipped: no block devices detected for '{}' \
-         (QEMU virtio-net only). On real hardware with AHCI/NVMe disks, \
-         this mount will proceed automatically.",
-        entry.device
+        "[init] VFS mounted by kernel boot phase 2b (storage::init); \
+         auto_mount entry {} -> {} ({}) deferred to storage subsystem",
+        entry.device, entry.path, entry.fstype
     );
 }
 
 // ---------------------------------------------------------------------------
-// Startup script (stub)
+// Startup script
 // ---------------------------------------------------------------------------
 
-/// Run a startup script. Currently logs the intent — actual execution requires
-/// the shell crate to interpret the script.
+/// Run a startup script. Reads the script from the VFS via `claudio_fs` and
+/// logs its contents line-by-line. Actual shell execution is not yet wired —
+/// when the shell crate is integrated, this will hand the lines off to it.
 fn run_startup_script(path: &str) {
-    // TODO: Read script from VFS, pass to claudio-shell for execution.
-    log::info!("[init] startup script '{}' — shell execution not yet wired", path);
+    log::info!("[init] reading startup script '{}' from VFS", path);
+    match claudio_fs::read_file(path) {
+        Ok(bytes) => {
+            match core::str::from_utf8(&bytes) {
+                Ok(text) => {
+                    log::info!(
+                        "[init] startup script '{}' loaded ({} bytes)",
+                        path,
+                        bytes.len()
+                    );
+                    for (i, line) in text.lines().enumerate() {
+                        log::info!("[init] startup[{}]: {}", i + 1, line);
+                    }
+                    log::info!(
+                        "[init] startup script '{}' — shell execution not yet wired",
+                        path
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[init] startup script '{}' is not valid UTF-8: {}",
+                        path, e
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("[init] startup script '{}' could not be read: {}", path, e);
+        }
+    }
 }

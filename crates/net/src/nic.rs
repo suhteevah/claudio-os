@@ -15,10 +15,39 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr;
-use core::sync::atomic::{self, Ordering};
+use core::sync::atomic::{self, AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
 
 use crate::{NicDriver, NicError};
+
+// ---------------------------------------------------------------------------
+// Global packet counters
+// ---------------------------------------------------------------------------
+//
+// Maintained across all VirtioNet instances (we only ever have one, but this
+// avoids threading the driver reference through nettools / shell builtins).
+// Incremented on every successful frame transmit and receive.
+
+static RX_PACKETS: AtomicU64 = AtomicU64::new(0);
+static RX_BYTES: AtomicU64 = AtomicU64::new(0);
+static TX_PACKETS: AtomicU64 = AtomicU64::new(0);
+static TX_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Returns `(rx_packets, rx_bytes, tx_packets, tx_bytes)` counted since boot.
+///
+/// These counters are incremented inside the [`NicDriver`] impl for
+/// [`VirtioNet`] so they reflect every frame that actually made it onto or
+/// off of the wire (TX counts a successful hand-off to the NIC; RX counts a
+/// frame the device DMA-ed into a receive buffer and that we delivered to
+/// smoltcp).
+pub fn packet_counters() -> (u64, u64, u64, u64) {
+    (
+        RX_PACKETS.load(Ordering::Relaxed),
+        RX_BYTES.load(Ordering::Relaxed),
+        TX_PACKETS.load(Ordering::Relaxed),
+        TX_BYTES.load(Ordering::Relaxed),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // PCI vendor/device for VirtIO transitional network device
@@ -741,6 +770,12 @@ impl NicDriver for VirtioNet {
         self.tx_queue.push_avail(desc_idx);
         self.notify_queue(1); // queue 1 = TX
 
+        // Update global TX counters now that the frame is queued for
+        // transmission. We count the Ethernet frame length, not the VirtIO
+        // header overhead.
+        TX_PACKETS.fetch_add(1, Ordering::Relaxed);
+        TX_BYTES.fetch_add(frame.len() as u64, Ordering::Relaxed);
+
         log::trace!(
             "[virtio-net] TX: queued {} byte frame (desc {}, phys {:#x}, free: {})",
             frame.len(), desc_idx, buf_phys, self.tx_queue.num_free
@@ -781,6 +816,10 @@ impl NicDriver for VirtioNet {
 
         // Recycle the descriptor back into the RX ring.
         self.recycle_rx_desc(desc_idx);
+
+        // Update global RX counters for the frame we just delivered.
+        RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+        RX_BYTES.fetch_add(frame_len as u64, Ordering::Relaxed);
 
         log::trace!(
             "[virtio-net] RX: received {} byte frame (desc {})",

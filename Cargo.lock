@@ -334,6 +334,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "spin",
 ]
 
 [[package]]
@@ -447,6 +448,7 @@ dependencies = [
  "claudio-cpp-lite",
  "claudio-dotnet-clr",
  "claudio-dxvk-bridge",
+ "claudio-editor",
  "claudio-elf-loader",
  "claudio-ext4",
  "claudio-fs",
@@ -479,6 +481,7 @@ dependencies = [
  "linked_list_allocator",
  "log",
  "pc-keyboard",
+ "serde",
  "serde_json",
  "smoltcp",
  "spin",

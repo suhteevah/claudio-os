@@ -34,6 +34,7 @@ use claudio_net::NetworkStack;
 use spin::Mutex;
 
 use crate::keyboard;
+use crate::storage;
 
 /// RNG seed counter — each TLS connection needs a unique seed for its
 /// handshake nonces.  We use an incrementing counter rather than true
@@ -271,41 +272,121 @@ fn local_model_handler(prompt: &str, max_tokens: usize, temperature: f32) -> Res
     model.generate(prompt, max_tokens, &cfg)
 }
 
-/// file_read handler — reads from the kernel's VFS (fs-persist).
-///
-/// Currently stubs with a log message since FAT32 is not yet mounted.
+/// file_read handler — reads a file through the kernel VFS and returns the
+/// contents as a (lossy) UTF-8 string.
 fn file_read_handler(path: &str) -> Result<String, String> {
     log::info!("[tool_handler] file_read: {}", path);
-    // TODO: delegate to fs-persist once FAT32 is mounted
-    Err(String::from("VFS not mounted — FAT32 filesystem not yet available"))
+    storage::with_vfs(|vfs| {
+        // stat to get size
+        let info = vfs
+            .stat(path)
+            .map_err(|e| alloc::format!("stat failed: {}", e))?;
+        if info.file_type != claudio_vfs::FileType::File {
+            return Err(alloc::format!("{} is not a regular file", path));
+        }
+        let size = info.size as usize;
+        // open
+        let fd = vfs
+            .open(path, claudio_vfs::OpenFlags::read_only())
+            .map_err(|e| alloc::format!("open failed: {}", e))?;
+        let mut buf = alloc::vec![0u8; size];
+        let mut total = 0usize;
+        while total < size {
+            let n = vfs
+                .read(fd, &mut buf[total..])
+                .map_err(|e| alloc::format!("read failed: {}", e))?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        let _ = vfs.close(fd);
+        buf.truncate(total);
+        Ok(String::from_utf8(buf).unwrap_or_else(|e| {
+            String::from_utf8_lossy(&e.into_bytes()).into_owned()
+        }))
+    })
 }
 
-/// file_write handler — writes to the kernel's VFS (fs-persist).
-///
-/// Currently stubs with a log message since FAT32 is not yet mounted.
+/// file_write handler — creates/truncates the file through the kernel VFS and
+/// writes the content bytes.
 fn file_write_handler(path: &str, content: &str) -> Result<(), String> {
     log::info!("[tool_handler] file_write: {} ({} bytes)", path, content.len());
-    // TODO: delegate to fs-persist once FAT32 is mounted
-    Err(String::from("VFS not mounted — FAT32 filesystem not yet available"))
+    storage::with_vfs(|vfs| {
+        let fd = vfs
+            .open(path, claudio_vfs::OpenFlags::create_truncate())
+            .map_err(|e| alloc::format!("open failed: {}", e))?;
+        let bytes = content.as_bytes();
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let n = vfs
+                .write(fd, &bytes[written..])
+                .map_err(|e| alloc::format!("write failed: {}", e))?;
+            if n == 0 {
+                return Err(String::from("short write"));
+            }
+            written += n;
+        }
+        let _ = vfs.close(fd);
+        Ok(())
+    })
 }
 
-/// list_directory handler — lists directory contents from the kernel's VFS.
-///
-/// Currently stubs with a log message since FAT32 is not yet mounted.
+/// list_directory handler — enumerates directory contents through the VFS and
+/// formats them as `<type> <size> <name>` lines.
 fn list_directory_handler(path: &str) -> Result<String, String> {
     log::info!("[tool_handler] list_directory: {}", path);
-    // TODO: delegate to fs-persist once FAT32 is mounted
-    Err(String::from("VFS not mounted — FAT32 filesystem not yet available"))
+    storage::with_vfs(|vfs| {
+        let entries = vfs
+            .readdir(path)
+            .map_err(|e| alloc::format!("readdir failed: {}", e))?;
+        let mut out = alloc::string::String::new();
+        use core::fmt::Write;
+        for entry in entries {
+            let kind = if entry.is_dir() { "d" } else { "f" };
+            let _ = writeln!(out, "{} {:>10} {}", kind, entry.size, entry.name);
+        }
+        Ok(out)
+    })
 }
 
-/// execute_command handler — executes a command via the kernel's shell.
+/// execute_command handler — minimal built-in command interpreter.
 ///
-/// ClaudioOS has no POSIX shell. This handler interprets a limited set of
-/// built-in commands. Currently stubs with a log message.
+/// ClaudioOS has no POSIX shell and no process model. This handler supports a
+/// small set of built-ins backed by the VFS: `ls`, `cat`, `echo`, `pwd`,
+/// `mkdir`. Unknown commands return an error.
 fn execute_command_handler(command: &str) -> Result<String, String> {
     log::info!("[tool_handler] execute_command: {}", command);
-    // TODO: implement a minimal command interpreter for built-in ops
-    Err(String::from("shell not available — ClaudioOS has no process model yet"))
+    let trimmed = command.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("").trim();
+    match cmd {
+        "pwd" => Ok(alloc::string::String::from("/")),
+        "echo" => Ok(alloc::format!("{}\n", rest)),
+        "ls" => {
+            let path = if rest.is_empty() { "/" } else { rest };
+            list_directory_handler(path)
+        }
+        "cat" => {
+            if rest.is_empty() {
+                return Err(alloc::string::String::from("cat: missing path"));
+            }
+            file_read_handler(rest)
+        }
+        "mkdir" => {
+            if rest.is_empty() {
+                return Err(alloc::string::String::from("mkdir: missing path"));
+            }
+            storage::with_vfs(|vfs| {
+                vfs.mkdir(rest)
+                    .map_err(|e| alloc::format!("mkdir failed: {}", e))?;
+                Ok(alloc::format!("created {}\n", rest))
+            })
+        }
+        "" => Ok(alloc::string::String::new()),
+        other => Err(alloc::format!("unknown command: {}", other)),
+    }
 }
 
 // ---------------------------------------------------------------------------

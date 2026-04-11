@@ -386,12 +386,123 @@ pub async fn authenticate() -> Result<Credentials, AuthError> {
     )))
 }
 
-/// Background token refresh loop (no-op stub).
+/// Callback hooks for [`token_refresh_loop`].
 ///
-/// Token refresh is now handled by the kernel's `session_manager`. This
-/// function exists only for API compatibility and returns immediately.
-pub async fn token_refresh_loop(_creds: Credentials) {
-    log::warn!(
-        "[auth] token_refresh_loop() called but refresh is handled by session_manager — returning"
-    );
+/// The auth crate has no access to the network stack or the filesystem
+/// (adding `claudio-fs` as a dep would create a cycle, since `claudio-fs`
+/// already depends on `claudio-auth` for the `Credentials` type). So the
+/// refresh loop drives the *timing* and the caller injects whatever glue
+/// it needs for network I/O, wall-clock time, async sleeping, and
+/// persistence.
+///
+/// All methods are sync. The loop itself is `async` and calls them
+/// between `await` points on a caller-supplied sleep future.
+pub trait RefreshHooks {
+    /// Return the current time as Unix seconds.
+    fn now_unix(&self) -> u64;
+
+    /// Perform an OAuth token refresh with the given refresh token and
+    /// return the new `TokenResponse`, or `None` if the caller has not
+    /// wired up a network path.
+    fn refresh_token(&mut self, refresh_token: &str) -> Option<TokenResponse>;
+
+    /// Persist freshly-minted credentials (e.g. via
+    /// `claudio_fs::write_credentials`). The default no-op implementation
+    /// is suitable for observer-only loops.
+    fn persist(&mut self, _creds: &Credentials) {}
+}
+
+/// Background token refresh driver.
+///
+/// Polls the credential's expiry every `poll_interval_secs` and logs
+/// time-to-expiry. When the token is within 5 minutes of expiring, the
+/// loop calls [`RefreshHooks::refresh_token`] and, on success, hands the
+/// new credentials to [`RefreshHooks::persist`] before looping.
+///
+/// For `Credentials::ApiKey` the loop still runs but only logs — API keys
+/// don't expire.
+///
+/// The caller is responsible for driving the loop via `await`. Between
+/// iterations this function calls the `sleep` future returned by the
+/// provided `sleeper`, which lets the caller bridge to whatever async
+/// timer source they have (e.g. the kernel executor's `Delay`). If
+/// `sleeper` is `None` the function returns after a single iteration so
+/// the caller can choose an external poll strategy.
+pub async fn token_refresh_loop<H, S, F>(
+    mut creds: Credentials,
+    hooks: &mut H,
+    mut sleeper: Option<S>,
+) where
+    H: RefreshHooks,
+    S: FnMut(u64) -> F,
+    F: core::future::Future<Output = ()>,
+{
+    /// Buffer in seconds before the actual expiry at which we trigger a
+    /// refresh. Five minutes is the industry-standard skew.
+    const REFRESH_BUFFER_SECS: u64 = 300;
+    /// How often we wake up to check.
+    const POLL_INTERVAL_SECS: u64 = 60;
+
+    log::info!("[auth] token_refresh_loop started");
+
+    loop {
+        let now = hooks.now_unix();
+        match &creds {
+            Credentials::ApiKey(_) => {
+                log::trace!("[auth] refresh loop: API key, no expiry");
+            }
+            Credentials::OAuth {
+                access_token: _,
+                refresh_token,
+                expires_at,
+            } => {
+                if *expires_at <= now {
+                    log::warn!(
+                        "[auth] OAuth token already expired (expires_at={}, now={})",
+                        expires_at, now,
+                    );
+                } else {
+                    let remaining = *expires_at - now;
+                    log::debug!(
+                        "[auth] OAuth token valid for {} more seconds (expires_at={})",
+                        remaining, expires_at,
+                    );
+
+                    if remaining <= REFRESH_BUFFER_SECS {
+                        log::warn!(
+                            "[auth] OAuth token expires in {}s — attempting refresh",
+                            remaining,
+                        );
+
+                        let rt = refresh_token.clone();
+                        match hooks.refresh_token(&rt) {
+                            Some(token) => {
+                                let new_creds = token_to_credentials(token, now);
+                                log::info!(
+                                    "[auth] OAuth token refreshed successfully",
+                                );
+                                hooks.persist(&new_creds);
+                                creds = new_creds;
+                            }
+                            None => {
+                                log::warn!(
+                                    "[auth] refresher returned None — network path not wired",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        match sleeper.as_mut() {
+            Some(sleep_fn) => sleep_fn(POLL_INTERVAL_SECS).await,
+            None => {
+                log::info!(
+                    "[auth] no sleeper injected — returning after one iteration",
+                );
+                return;
+            }
+        }
+    }
 }

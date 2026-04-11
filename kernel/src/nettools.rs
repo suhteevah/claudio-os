@@ -206,8 +206,17 @@ pub fn ifconfig(stack: &NetworkStack) -> String {
         output.push_str("          DOWN (no IP)\n");
     }
 
-    // Note: VirtIO device stats not yet tracked — would need counters in SmoltcpDevice.
-    output.push_str("          (packet counters not yet implemented)\n");
+    // Packet counters from the VirtIO-net driver (global atomics updated on
+    // every successful TX/RX in claudio_net::nic).
+    let (rx_pkts, rx_bytes, tx_pkts, tx_bytes) = claudio_net::nic::packet_counters();
+    output.push_str(&format!(
+        "          RX packets:{}  bytes:{}\n",
+        rx_pkts, rx_bytes
+    ));
+    output.push_str(&format!(
+        "          TX packets:{}  bytes:{}\n",
+        tx_pkts, tx_bytes
+    ));
 
     output
 }

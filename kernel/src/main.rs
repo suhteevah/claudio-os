@@ -35,6 +35,7 @@ mod acpi_init;
 mod agent_loop;
 mod conversations;
 mod dashboard;
+mod disks;
 mod executor;
 mod filemanager;
 mod framebuffer;
@@ -51,6 +52,7 @@ mod rtc;
 mod serial;
 mod smp_init;
 mod ssh_server;
+mod storage;
 mod sysmon;
 mod terminal;
 mod boot_sound;
@@ -222,6 +224,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     memory::init(phys_mem_offset, memory_map);
     log::info!("[boot] heap allocator initialized");
 
+    // ── Phase 2b: Storage / VFS (needs heap; must precede anything that
+    // reads credentials or config through claudio-fs) ───────────────────
+    storage::init();
+
     // ── Phase 3: Interrupts (needs heap for keyboard queue allocs) ────
     interrupts::init();
     log::info!("[boot] IDT loaded, PIC initialized (interrupts still disabled)");
@@ -255,7 +261,36 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 Err(e) => log::warn!("[boot] local LLM init failed: {}", e),
             }
         } else {
-            log::info!("[boot] no ramdisk — local LLM tool will return stub error");
+            // No ramdisk — fall back to VFS lookup at a well-known path.
+            // This lets deployments ship a model on the FAT32 data partition
+            // instead of baking it into the boot image.
+            const VFS_MODEL_PATH: &str = "/claudio/models/default.gguf";
+            match claudio_fs::read_file(VFS_MODEL_PATH) {
+                Ok(bytes) => {
+                    log::info!(
+                        "[boot] loaded model from VFS at {} ({} bytes, {:.2} MB)",
+                        VFS_MODEL_PATH,
+                        bytes.len(),
+                        bytes.len() as f64 / 1024.0 / 1024.0,
+                    );
+                    match agent_loop::init_local_model_from_bytes(&bytes) {
+                        Ok(()) => log::info!(
+                            "[boot] local LLM model loaded from {}",
+                            VFS_MODEL_PATH,
+                        ),
+                        Err(e) => log::warn!(
+                            "[boot] local LLM init from VFS failed: {}",
+                            e,
+                        ),
+                    }
+                }
+                Err(_) => {
+                    log::info!(
+                        "[boot] no ramdisk and no {} — local LLM tool will return stub error",
+                        VFS_MODEL_PATH,
+                    );
+                }
+            }
         }
     }
 
@@ -308,6 +343,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Local APIC on the BSP, install AP trampoline at 0x8000, and boot
     // all APs via INIT-SIPI-SIPI. After this, all cores are running.
     smp_init::init();
+
+    // ── Phase 5d: Block device registry ──────────────────────────────
+    // Walk PCI for mass-storage controllers (AHCI / NVMe), instantiate
+    // them, and stash owned handles in `disks::REGISTRY`. Must run after
+    // PCI enumeration (Phase 5) but before anything that wants live
+    // storage: the swap scanner, the dashboard `df` command, and any
+    // VFS mount adapters. Under QEMU with no `-drive` this finds zero
+    // controllers and the registry stays empty — all consumers handle
+    // that gracefully.
+    disks::init();
 
     // ── Phase 6: Enable interrupts + async executor ──────────────────
     // The bootloader's kernel stack is nearly exhausted after all the init
@@ -483,10 +528,52 @@ async fn main_async() {
 
                     // ── Step 2: Authentication ────────────────────────────────
 
-                    // Check for saved session via QEMU fw_cfg, then compile-time, then OAuth
+                    // Check for saved session via VFS (/claudio/session.txt), then
+                    // QEMU fw_cfg, then compile-time, then OAuth.
                     let mut api_key_buf = alloc::string::String::new();
                     let mut session_cookie_buf = alloc::string::String::new();
                     let mut saved_conv_id = alloc::string::String::new();
+
+                    // Try reading a persisted API-key credential first.
+                    if let Some(creds) = claudio_fs::read_credentials() {
+                        if let claudio_auth::Credentials::ApiKey(k) = &creds {
+                            if !k.is_empty() {
+                                api_key_buf = k.clone();
+                                log::info!(
+                                    "[auth] loaded API key from VFS ({} chars) [REDACTED]",
+                                    api_key_buf.len(),
+                                );
+                            }
+                        }
+                    }
+
+                    // Try reading session from the VFS first. When ext4-on-AHCI is
+                    // mounted this survives reboots; on the current MemFs it only
+                    // survives within a session (still useful for hot-reloads).
+                    match claudio_fs::read_file("/claudio/session.txt") {
+                        Ok(data) => {
+                            if let Ok(s) = core::str::from_utf8(&data) {
+                                let trimmed = s.trim();
+                                if !trimmed.is_empty() {
+                                    let mut lines = trimmed.splitn(2, '\n');
+                                    if let Some(cookie) = lines.next() {
+                                        session_cookie_buf = alloc::string::String::from(cookie.trim());
+                                    }
+                                    if let Some(conv) = lines.next() {
+                                        saved_conv_id = alloc::string::String::from(conv.trim());
+                                    }
+                                    log::info!(
+                                        "[auth] loaded session from VFS ({} bytes, conv_id={})",
+                                        trimmed.len(),
+                                        if saved_conv_id.is_empty() { "none" } else { saved_conv_id.as_str() },
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("[auth] no session in VFS: {}", e);
+                        }
+                    }
 
                     // Try reading session from QEMU fw_cfg (opt/claudio/session)
                     {
@@ -1014,6 +1101,19 @@ async fn main_async() {
                     let api_key: &str = &api_key_buf;
                     let session_cookie: &str = &session_cookie_buf;
 
+                    // Persist an API-key credential through claudio-fs/claudio-auth
+                    // so the token refresh path and future reboots can pick it up.
+                    // Only runs when we actually have an API key (email+code flow).
+                    if !api_key.is_empty() {
+                        let creds = claudio_auth::Credentials::ApiKey(
+                            alloc::string::String::from(api_key),
+                        );
+                        match claudio_fs::write_credentials(&creds) {
+                            Ok(()) => log::info!("[auth] persisted API key credentials to VFS"),
+                            Err(e) => log::warn!("[auth] failed to persist credentials: {}", e),
+                        }
+                    }
+
                     if !session_cookie.is_empty() {
                         // ── claude.ai Max mode: use session cookie ──────────────
                         log::info!("[claude.ai] ============================================");
@@ -1075,6 +1175,18 @@ async fn main_async() {
                             // Save conv_id for reuse across reboots
                             if saved_conv_id.is_empty() {
                                 log::info!("[oauth] SAVE_CONV:{}", conv_id);
+                            }
+
+                            // Persist cookie + conv_id to the VFS so token refresh
+                            // and next-boot reuse can pick it up. Format matches the
+                            // fw_cfg/VFS loader: "<cookie>\n<conv_id>".
+                            let session_blob = alloc::format!("{}\n{}", session_cookie, conv_id);
+                            match claudio_fs::write_file("/claudio/session.txt", session_blob.as_bytes()) {
+                                Ok(()) => log::info!(
+                                    "[auth] persisted session to VFS ({} bytes)",
+                                    session_blob.len(),
+                                ),
+                                Err(e) => log::warn!("[auth] failed to persist session: {}", e),
                             }
 
                             // Skip the boot test message — it consumes a rate-limit

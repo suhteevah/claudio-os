@@ -45,6 +45,7 @@ pub mod fs_trait;
 pub mod device;
 pub mod vfs;
 pub mod adapters;
+pub mod memfs;
 
 pub use path::Path;
 pub use mount::{MountPoint, MountTable, MountOptions};
@@ -53,3 +54,4 @@ pub use dir::DirEntry;
 pub use fs_trait::{Filesystem, FsType};
 pub use device::{BlockDevice, Partition, PartitionScheme, PartitionEntry};
 pub use vfs::{Vfs, VfsError};
+pub use memfs::MemFs;

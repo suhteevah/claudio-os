@@ -45,16 +45,78 @@ const TCP_BUF_SIZE: usize = 16384;
 const READ_BUF_SIZE: usize = 4096;
 
 // ---------------------------------------------------------------------------
-// PaneCallback stub -- creates panes in the dashboard
+// Session event queue -- drained by the dashboard to create real panes
 // ---------------------------------------------------------------------------
 
-/// Callback implementation that logs shell/exec requests.
+/// A lifecycle event from the SSH server that the dashboard may act on.
+///
+/// The dashboard owns the pane layout, input buffers, and render state, so
+/// it is the only place panes can be created. The SSH server is polled from
+/// inside the dashboard loop but cannot reach back into its local state —
+/// instead it pushes events here and the dashboard drains them on the next
+/// tick.
+#[derive(Debug, Clone)]
+pub enum SshSessionEvent {
+    /// A new interactive shell was requested on an SSH channel.
+    /// `pane_id` is the synthetic ID the SSH callback handed back to the
+    /// session state machine; the dashboard can use it to correlate output
+    /// routing later.
+    ShellOpened {
+        channel_id: u32,
+        pane_id: u32,
+        term: alloc::string::String,
+        width: u32,
+        height: u32,
+    },
+    /// A non-interactive command execution was requested.
+    ExecRequested {
+        channel_id: u32,
+        pane_id: u32,
+        command: alloc::string::String,
+    },
+    /// An SSH channel was closed by either side.
+    ChannelClosed { channel_id: u32 },
+}
+
+/// Global queue of SSH session events awaiting dashboard pickup.
+///
+/// Wrapped in a `spin::Mutex` so both the SSH poll path and the dashboard
+/// event loop (same thread today, but semantically cross-subsystem) can
+/// access it safely.
+static SSH_EVENTS: spin::Mutex<Vec<SshSessionEvent>> = spin::Mutex::new(Vec::new());
+
+/// Push an event onto the queue from the SSH poll path.
+fn push_event(ev: SshSessionEvent) {
+    let mut q = SSH_EVENTS.lock();
+    q.push(ev);
+}
+
+/// Drain all pending SSH session events.
+///
+/// Called by the dashboard once per tick. Each event should be translated
+/// into a real pane action (create terminal pane, forward data, close
+/// pane). Until the dashboard grows a public pane-creation API this is
+/// mostly informational, but the queue guarantees no events are lost.
+pub fn drain_events() -> Vec<SshSessionEvent> {
+    let mut q = SSH_EVENTS.lock();
+    core::mem::take(&mut *q)
+}
+
+// ---------------------------------------------------------------------------
+// PaneCallback -- routes SSH channel events to the session-event queue
+// ---------------------------------------------------------------------------
+
+/// Callback implementation that translates SSH session events into
+/// [`SshSessionEvent`]s on the global queue and also writes a placeholder
+/// status banner back to the client so the SSH user sees a clear "session
+/// active" message even before real pane wiring exists.
 ///
 /// In the current architecture the dashboard owns the layout and pane state,
-/// so we cannot directly create panes from the SSH polling path. Instead we
-/// record requested actions and provide a basic echo shell. Full pane
-/// integration (routing SSH channel I/O to dashboard terminal panes) can
-/// be added later via a shared action queue.
+/// so we cannot directly create panes from the SSH polling path. The event
+/// queue is the handoff point: the dashboard drains it on each tick and can
+/// later create real terminal panes and forward I/O. Until that wiring lands
+/// the SSH user still gets a functioning echo shell driven by
+/// [`handle_action`] below.
 struct SshPaneCallback {
     /// Channel-to-pane mapping (channel_id -> pane_id).
     channel_panes: Vec<(u32, u32)>,
@@ -83,9 +145,26 @@ impl PaneCallback for SshPaneCallback {
         self.next_pane_id += 1;
         self.channel_panes.push((channel_id, pane_id));
         log::info!(
-            "[sshd] shell requested on channel {} (term={}, {}x{}) -> pane {}",
-            channel_id, term, width, height, pane_id,
+            "[sshd] SSH session {} active (terminal wiring pending) - \
+             shell on channel {} (term={}, {}x{}) -> pane {}",
+            pane_id, channel_id, term, width, height, pane_id,
         );
+        push_event(SshSessionEvent::ShellOpened {
+            channel_id,
+            pane_id,
+            term: alloc::string::String::from(term),
+            width,
+            height,
+        });
+        // Ask the dashboard to create a real shell pane for this SSH
+        // session. The dashboard drains the pane-request queue each tick
+        // and will spin up a new `PaneType::Shell` with this banner as
+        // the welcome line. Full bidirectional SSH<->shell I/O is still
+        // future work, but the pane will be visible and logged as active.
+        crate::dashboard::request_open_shell(format!(
+            "ssh[{}]> session active (ch={}, term={}, {}x{})",
+            pane_id, channel_id, term, width, height
+        ));
         Some(pane_id)
     }
 
@@ -97,6 +176,11 @@ impl PaneCallback for SshPaneCallback {
             "[sshd] exec requested on channel {}: '{}' -> pane {}",
             channel_id, command, pane_id,
         );
+        push_event(SshSessionEvent::ExecRequested {
+            channel_id,
+            pane_id,
+            command: alloc::string::String::from(command),
+        });
         Some(pane_id)
     }
 
@@ -111,6 +195,7 @@ impl PaneCallback for SshPaneCallback {
     fn on_channel_close(&mut self, channel_id: u32) {
         log::info!("[sshd] channel {} closed", channel_id);
         self.channel_panes.retain(|(ch, _)| *ch != channel_id);
+        push_event(SshSessionEvent::ChannelClosed { channel_id });
     }
 }
 
@@ -156,20 +241,28 @@ fn handle_action(conn: &mut SshConnection, action: ChannelAction) {
     match action {
         ChannelAction::None => {}
         ChannelAction::StartShell { channel_id } => {
-            // Create a pane via callback.
-            let _pane_id = conn.callback.on_shell_request(
+            // Create a pane via callback (also pushes a ShellOpened event
+            // onto the SSH_EVENTS queue for the dashboard to consume).
+            let pane_id = conn.callback.on_shell_request(
                 channel_id,
                 "xterm-256color",
                 80,
                 24,
             );
 
-            // Send a welcome message on the channel (ASCII only).
-            let welcome = b"\x1b[96mClaudioOS SSH Shell\x1b[0m\r\n\
-                            \x1b[90m----------------------------------------\x1b[0m\r\n\
-                            \r\nWelcome to ClaudioOS. Type 'help' for commands.\r\n\r\n\
-                            claudio$ ";
-            if let Err(e) = conn.session.send_channel_data(channel_id, welcome) {
+            // Send a welcome message on the channel (ASCII only). The status
+            // line echoes the synthetic pane id so the SSH user knows their
+            // session is live even before the dashboard wires a real pane.
+            let pid = pane_id.unwrap_or(0);
+            let banner = format!(
+                "\x1b[96mClaudioOS SSH Shell\x1b[0m\r\n\
+                 \x1b[90m----------------------------------------\x1b[0m\r\n\
+                 SSH session {} active (terminal wiring pending)\r\n\
+                 Type 'help' for commands.\r\n\r\n\
+                 claudio$ ",
+                pid,
+            );
+            if let Err(e) = conn.session.send_channel_data(channel_id, banner.as_bytes()) {
                 log::error!("[sshd] failed to send welcome: {}", e);
             }
         }
