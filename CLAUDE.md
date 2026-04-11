@@ -11,6 +11,11 @@ a single-address-space async Rust application that manages its own hardware.
 **Target hardware**: x86_64 UEFI machines (dev on QEMU, prod on production hardware,
 dedicated servers, laptops)
 
+## Handoff Protocol
+- ALWAYS read HANDOFF.md and recent memory/vault notes BEFORE diagnosing any issue
+- Trust prior session findings - do not re-diagnose bugs already patched
+- Update HANDOFF.md at end of session with current state, blockers, and next steps
+
 ## Architecture Overview
 
 ```
@@ -273,6 +278,25 @@ See .claude/USAGE_NOTES.md for the pattern.
 - Verbose logging: every network event, every API call, every auth state change
 - Test in QEMU first, always. `cargo test` runs host-side unit tests for pure logic.
 - Kernel panics print a red backtrace to framebuffer + serial before halting
+
+## Debugging
+
+### Diagnosis Discipline
+- Investigate the actual error before suggesting reinstalls or generic fixes
+- For Windows spawn/ENOENT errors: check shim file extensions (.exe vs shell scripts) FIRST
+- Do not assume a dependency is missing until you've verified with `where`/`which`
+
+## Tooling Preferences
+- DO NOT use Playwright unless explicitly requested or no alternative exists
+- Prefer Wraith browser MCP for scraping/browser automation
+- For Unraid deployments: use plain `docker run`, not docker-compose (busybox shell limitation)
+
+## Output Discipline
+- Keep responses concise; avoid long explanations after task completion
+- When hitting token limits, summarize and offer to continue rather than retrying full output
+- Write verbose logs, detailed analysis, and long output to `scratch/` files instead of chat
+- Chat responses should be short blurbs; user reviews `scratch/` logs when they want detail
+- Checkpoint progress to HANDOFF.md every 10 tool calls during long autonomous runs
 
 ## Environment Variables (build-time)
 

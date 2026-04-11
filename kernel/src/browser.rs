@@ -47,6 +47,8 @@ pub enum BrowserInputMode {
     UrlInput,
     /// Link number input — typing a number to follow a link.
     LinkInput,
+    /// Search input — keys are typed into a search query.
+    SearchInput,
 }
 
 /// State for a text-mode web browser pane.
@@ -69,6 +71,8 @@ pub struct BrowserState {
     pub url_input: String,
     /// Link number input buffer (used during LinkInput mode).
     pub link_input: String,
+    /// Search query input buffer (used during SearchInput mode).
+    pub search_input: String,
     /// Layout pane id this browser is bound to.
     pub pane_id: usize,
 }
@@ -78,14 +82,17 @@ impl BrowserState {
     pub fn new(pane_id: usize) -> Self {
         let mut page_lines = Vec::new();
         page_lines.push(String::from(""));
-        page_lines.push(String::from("  \x1b[96mClaudioOS Web Browser\x1b[0m"));
-        page_lines.push(String::from("  \x1b[90m──────────────────────────────\x1b[0m"));
+        page_lines.push(String::from("  \x1b[96m╔═══════════════════════════════════════════╗\x1b[0m"));
+        page_lines.push(String::from("  \x1b[96m║         ClaudioOS Web Browser             ║\x1b[0m"));
+        page_lines.push(String::from("  \x1b[96m╚═══════════════════════════════════════════╝\x1b[0m"));
         page_lines.push(String::from(""));
-        page_lines.push(String::from("  Type \x1b[93mg\x1b[0m to navigate to a URL"));
+        page_lines.push(String::from("  \x1b[97m  Press \x1b[93ms\x1b[97m to search the web\x1b[0m"));
+        page_lines.push(String::from("  \x1b[97m  Press \x1b[93mg\x1b[97m to navigate to a URL\x1b[0m"));
         page_lines.push(String::from(""));
-        page_lines.push(String::from("  \x1b[90mKeys: g=go  b=back  r=reload  q=close\x1b[0m"));
-        page_lines.push(String::from("  \x1b[90m      Up/Down/PgUp/PgDn=scroll\x1b[0m"));
-        page_lines.push(String::from("  \x1b[90m      f=follow link (enter number)\x1b[0m"));
+        page_lines.push(String::from("  \x1b[90m──────────────────────────────────────────\x1b[0m"));
+        page_lines.push(String::from("  \x1b[90mKeys: s=search  g=go  b=back  r=reload\x1b[0m"));
+        page_lines.push(String::from("  \x1b[90m      f=follow link  q=close\x1b[0m"));
+        page_lines.push(String::from("  \x1b[90m      j/k=scroll  Space=page down\x1b[0m"));
 
         Self {
             current_url: String::from("about:blank"),
@@ -97,6 +104,7 @@ impl BrowserState {
             input_mode: BrowserInputMode::Normal,
             url_input: String::new(),
             link_input: String::new(),
+            search_input: String::new(),
             pane_id,
         }
     }
@@ -311,6 +319,12 @@ impl BrowserState {
                     self.url_input
                 ));
             }
+            BrowserInputMode::SearchInput => {
+                output.push_str(&format!(
+                    "\x1b[42m\x1b[30m Search: {}\x1b[K\x1b[0m\r\n",
+                    self.search_input
+                ));
+            }
             BrowserInputMode::LinkInput => {
                 output.push_str(&format!(
                     "\x1b[44m\x1b[37m Link #: {}\x1b[K\x1b[0m\r\n",
@@ -357,7 +371,7 @@ impl BrowserState {
             format!(" | {} links", self.links.len())
         };
         output.push_str(&format!(
-            "\x1b[7m g=go b=back r=reload f=follow q=close | {}{} \x1b[K\x1b[0m",
+            "\x1b[7m s=search g=go b=back r=reload f=follow q=close | {}{} \x1b[K\x1b[0m",
             scroll_info, links_info
         ));
 
@@ -464,8 +478,41 @@ impl BrowserState {
                     BrowserKeyResult::Consumed
                 }
             }
+            BrowserInputMode::SearchInput => {
+                if c == '\n' || c == '\r' {
+                    let query = core::mem::replace(&mut self.search_input, String::new());
+                    self.input_mode = BrowserInputMode::Normal;
+                    if !query.is_empty() {
+                        // URL-encode the query (minimal: spaces → +).
+                        let encoded: String = query.chars().map(|ch| match ch {
+                            ' ' => '+',
+                            _ => ch,
+                        }).collect();
+                        let url = format!("https://html.duckduckgo.com/html/?q={}", encoded);
+                        self.navigate(&url, stack, now);
+                    }
+                    BrowserKeyResult::Consumed
+                } else if c == '\x1b' {
+                    self.search_input.clear();
+                    self.input_mode = BrowserInputMode::Normal;
+                    BrowserKeyResult::Consumed
+                } else if c == '\x08' || c == '\x7f' {
+                    self.search_input.pop();
+                    BrowserKeyResult::Consumed
+                } else if !c.is_control() {
+                    self.search_input.push(c);
+                    BrowserKeyResult::Consumed
+                } else {
+                    BrowserKeyResult::Consumed
+                }
+            }
             BrowserInputMode::Normal => {
                 match c {
+                    's' => {
+                        self.input_mode = BrowserInputMode::SearchInput;
+                        self.search_input.clear();
+                        BrowserKeyResult::Consumed
+                    }
                     'g' => {
                         self.input_mode = BrowserInputMode::UrlInput;
                         self.url_input.clear();
