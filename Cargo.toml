@@ -54,6 +54,7 @@ members = [
 ]
 exclude = [
     "tools/image-builder",  # Host-side tool, must NOT inherit x86_64-unknown-none target
+    "tools/claudio-mux",    # Host-side std binary, must NOT inherit x86_64-claudio target
 ]
 
 [workspace.package]

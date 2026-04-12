@@ -1,0 +1,5 @@
+# claudio-mux is a HOST-side std binary (Windows x86_64).
+# Override the workspace-root .cargo/config.toml which sets the bare-metal
+# x86_64-claudio target and build-std — neither is valid for a std binary.
+[build]
+target = "x86_64-pc-windows-gnu"

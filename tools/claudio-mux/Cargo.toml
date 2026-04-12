@@ -1,0 +1,26 @@
+[package]
+name = "claudio-mux"
+version = "0.1.0"
+edition = "2024"
+authors = ["Matt Gates <ridgecellrepair@gmail.com>"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/suhteevah/claudio-os"
+description = "Terminal multiplexer for Windows — shares terminal-core with ClaudioOS"
+
+[[bin]]
+name = "claudio-mux"
+path = "src/main.rs"
+
+[dependencies]
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "signal"] }
+crossterm    = "0.28"
+portable-pty = "0.9"
+bytes        = "1"
+tracing              = "0.1"
+tracing-subscriber   = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender     = "0.2"
+serde        = { version = "1", features = ["derive"] }
+toml         = "0.8"
+directories  = "5"
+anyhow       = "1"
+clap         = { version = "4", features = ["derive"] }
