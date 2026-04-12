@@ -12,6 +12,9 @@ name = "claudio-mux"
 path = "src/main.rs"
 
 [dependencies]
+terminal-core = { path = "../../crates/terminal-core" }
+terminal-ansi = { path = "../../crates/terminal-ansi" }
+
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "signal"] }
 crossterm    = "0.28"
 portable-pty = "0.9"
