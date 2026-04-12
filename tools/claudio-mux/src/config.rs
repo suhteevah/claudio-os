@@ -48,7 +48,7 @@ impl Default for Config {
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
-            shell: "pwsh.exe".into(),
+            shell: "powershell.exe".into(),
             shell_args: vec!["-NoLogo".into()],
             agent: "claude".into(),
             agent_args: vec![],
