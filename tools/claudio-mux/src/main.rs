@@ -2,6 +2,8 @@ mod cli;
 mod config;
 mod conpty;
 mod host;
+mod pane_state;
+mod session;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
