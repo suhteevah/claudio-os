@@ -35,12 +35,14 @@ impl Session {
         // Spawn initial shell in the first pane.
         let first_id = session.layout.focused_pane_id();
         let pane = session.layout.focused_pane();
+        tracing::info!("spawning shell: {}x{} cmd={:?}", pane.viewport.cols, pane.viewport.rows, session.config.general.shell);
         let pty = conpty::spawn_shell(
             pane.viewport.cols,
             pane.viewport.rows,
             &session.config.general.shell,
             &session.config.general.shell_args,
         )?;
+        tracing::info!("shell spawned, starting reader");
 
         Self::start_pty_reader(first_id, &pty, pty_tx.clone());
 
@@ -77,6 +79,20 @@ impl Session {
     }
 
     pub fn feed_pane(&mut self, pane_id: PaneId, bytes: &[u8]) {
+        // Check for DSR (Device Status Report) request: ESC[6n
+        // The shell asks "where is the cursor?" and blocks until we respond.
+        // We must respond with ESC[row;colR (1-based).
+        if bytes.windows(4).any(|w| w == b"\x1b[6n") {
+            if let Some(ps) = self.pane_states.iter_mut().find(|s| s.id == pane_id) {
+                if let Some(pane) = self.layout.panes().iter().find(|p| p.id == pane_id) {
+                    let (row, col) = pane.cursor_pos();
+                    let response = format!("\x1b[{};{}R", row + 1, col + 1);
+                    tracing::debug!("responding to DSR: {}", response.escape_default());
+                    let _ = ps.pty.writer.write_all(response.as_bytes());
+                }
+            }
+        }
+
         if let Some(pane) = self.layout.pane_by_id_mut(pane_id) {
             pane.write_bytes(bytes);
         }
@@ -86,6 +102,19 @@ impl Session {
         if let Some(ps) = self.pane_states.iter_mut().find(|s| s.id == pane_id) {
             ps.exited = true;
         }
+        // Auto-close exited panes (unless it's the last one).
+        if self.layout.pane_count() > 1 {
+            // If the exited pane was focused, close it.
+            if self.layout.focused_pane_id() == pane_id {
+                self.pane_states.retain(|s| s.id != pane_id);
+                self.layout.close_focused();
+            }
+        }
+    }
+
+    /// Check if all panes have exited (for exit condition).
+    pub fn all_exited(&self) -> bool {
+        self.pane_states.iter().all(|s| s.exited)
     }
 
     pub async fn forward_to_focused(&mut self, key: KeyEvent) -> Result<()> {
@@ -172,9 +201,8 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
     use terminal_core::{KeyCode, Modifiers};
     match key.code {
         KeyCode::Char(c) => {
-            if key.mods.contains(Modifiers::CTRL) {
-                let code = (c as u8).wrapping_sub(b'a').wrapping_add(1);
-                vec![code]
+            if key.mods.contains(Modifiers::CTRL) && c.is_ascii_alphabetic() {
+                vec![(c.to_ascii_lowercase() as u8) - b'a' + 1]
             } else {
                 let mut buf = [0u8; 4];
                 let s = c.encode_utf8(&mut buf);
@@ -200,6 +228,14 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
             2 => b"\x1bOQ".to_vec(),
             3 => b"\x1bOR".to_vec(),
             4 => b"\x1bOS".to_vec(),
+            5 => b"\x1b[15~".to_vec(),
+            6 => b"\x1b[17~".to_vec(),
+            7 => b"\x1b[18~".to_vec(),
+            8 => b"\x1b[19~".to_vec(),
+            9 => b"\x1b[20~".to_vec(),
+            10 => b"\x1b[21~".to_vec(),
+            11 => b"\x1b[23~".to_vec(),
+            12 => b"\x1b[24~".to_vec(),
             _ => vec![],
         },
         _ => vec![],

@@ -48,8 +48,8 @@ impl Default for Config {
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
-            shell: "powershell.exe".into(),
-            shell_args: vec!["-NoLogo".into()],
+            shell: if which_shell("pwsh.exe") { "pwsh.exe" } else { "cmd.exe" }.into(),
+            shell_args: vec![],
             agent: "claude".into(),
             agent_args: vec![],
             require_windows_terminal: true,
@@ -98,4 +98,14 @@ pub fn log_dir() -> PathBuf {
     directories::ProjectDirs::from("", "ridge-cell", "claudio-mux")
         .map(|d| d.data_local_dir().join("logs"))
         .unwrap_or_else(|| PathBuf::from("logs"))
+}
+
+fn which_shell(name: &str) -> bool {
+    std::process::Command::new("where")
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }

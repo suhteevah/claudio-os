@@ -17,7 +17,8 @@ impl Host {
         let mut stdout = io::stdout();
         terminal::enable_raw_mode()?;
         stdout.execute(EnterAlternateScreen)?;
-        stdout.execute(crossterm::cursor::Hide)?;
+        // Don't hide cursor — the renderer positions it in the focused pane
+        // so users can see where they're typing.
         Ok(Self { stdout })
     }
 
@@ -60,9 +61,9 @@ impl Host {
 
 impl Drop for Host {
     fn drop(&mut self) {
-        let _ = self.stdout.execute(crossterm::cursor::Show);
-        let _ = self.stdout.execute(LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
+        let _ = self.stdout.execute(LeaveAlternateScreen);
+        let _ = self.stdout.execute(crossterm::cursor::Show);
     }
 }
 

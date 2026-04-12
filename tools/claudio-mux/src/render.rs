@@ -18,6 +18,7 @@ pub fn flush(session: &Session, renderer: &mut AnsiRenderer, host: &mut Host) ->
 
     let bytes = renderer.render(&scene);
     if !bytes.is_empty() {
+        tracing::debug!("render: {} bytes", bytes.len());
         host.write_all(&bytes)?;
     }
     Ok(())

@@ -26,10 +26,8 @@ pub async fn run(config: Config, session_name: String) -> Result<()> {
         tokio::select! {
             biased;
 
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("ctrl-c received, exiting");
-                break;
-            }
+            // No ctrl_c handler — Ctrl+C is delivered as a key event by crossterm
+            // in raw mode and forwarded to the focused shell pane. Use Ctrl+B q to quit.
 
             Some(key) = key_rx.recv() => {
                 match session.router.handle_key(key) {
@@ -49,12 +47,14 @@ pub async fn run(config: Config, session_name: String) -> Result<()> {
 
             Some(evt) = pty_rx.recv() => {
                 match evt {
-                    PtyEvent::Output { pane_id, bytes } => {
-                        session.feed_pane(pane_id, &bytes);
+                    PtyEvent::Output { pane_id, ref bytes } => {
+                        tracing::debug!("pty output: pane={} len={} first={:?}", pane_id, bytes.len(), &bytes[..bytes.len().min(40)]);
+                        session.feed_pane(pane_id, bytes);
                     }
                     PtyEvent::Exited { pane_id } => {
+                        tracing::info!("pty exited: pane={}", pane_id);
                         session.mark_pane_exited(pane_id);
-                        if session.pane_count() == 0 {
+                        if session.all_exited() {
                             break;
                         }
                     }
