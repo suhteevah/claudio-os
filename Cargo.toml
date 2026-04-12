@@ -50,6 +50,7 @@ members = [
     "crates/llm",
     "crates/terminal-core",
     "crates/terminal-fb",
+    "crates/terminal-ansi",
 ]
 exclude = [
     "tools/image-builder",  # Host-side tool, must NOT inherit x86_64-unknown-none target

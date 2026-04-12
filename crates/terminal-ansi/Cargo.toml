@@ -1,0 +1,8 @@
+[package]
+name = "terminal-ansi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+terminal-core = { path = "../terminal-core" }
+log = "0.4"
