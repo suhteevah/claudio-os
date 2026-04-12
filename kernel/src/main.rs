@@ -103,6 +103,16 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// buffer address translation.
 static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
+/// Return the bootloader-supplied physical memory offset.
+///
+/// Physical addresses are mapped at `virtual = physical + phys_mem_offset()`,
+/// so any MMIO driver that wants to dereference a physical BAR must add
+/// this offset first. Populated in `kernel_main` Phase 2 from
+/// `boot_info.physical_memory_offset`.
+pub fn phys_mem_offset() -> u64 {
+    PHYS_MEM_OFFSET.load(Ordering::Relaxed)
+}
+
 /// Bootloader configuration — tells the bootloader what we need before it
 /// hands off to kernel_main.  Key settings:
 /// - Physical memory mapping (Dynamic) so we can access any physical address
@@ -227,6 +237,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // ── Phase 2b: Storage / VFS (needs heap; must precede anything that
     // reads credentials or config through claudio-fs) ───────────────────
     storage::init();
+
+    // Drain any log lines buffered before the VFS was online and arm the
+    // logger's file sink so subsequent log::* calls land in
+    // /claudio/logs/kernel.log.
+    logger::flush_ring_buffer_to_vfs();
 
     // ── Phase 3: Interrupts (needs heap for keyboard queue allocs) ────
     interrupts::init();
@@ -353,6 +368,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // controllers and the registry stays empty — all consumers handle
     // that gracefully.
     disks::init();
+
+    // ── Phase 5e: Mount ext4 filesystems from disks ──────────────────
+    // Walk the disk registry, parse GPT on each disk, and mount the first
+    // Linux-filesystem partition as ext4 at /diskNpN. No-op under QEMU
+    // without `-drive`; real hardware exercises the full path.
+    storage::mount_disks();
 
     // ── Phase 6: Enable interrupts + async executor ──────────────────
     // The bootloader's kernel stack is nearly exhausted after all the init

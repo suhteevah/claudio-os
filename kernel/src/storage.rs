@@ -15,13 +15,17 @@
 //! otherwise relies on `claudio-fs` having a backend installed.
 
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
 use spin::{Mutex, Once};
 
-use claudio_vfs::{MemFs, MountOptions, OpenFlags, Vfs, VfsError};
+use claudio_vfs::{BlockDevice, MemFs, MountOptions, OpenFlags, Vfs, VfsError};
+use claudio_vfs::adapters::Ext4FilesystemAdapter;
+use claudio_vfs::device::{parse_gpt, GPT_GUID_LINUX_FS};
+use claudio_vfs::fs_trait::Filesystem;
 use claudio_fs::{FsBackend, FsError};
 
 /// The kernel's single VFS instance. Populated by [`init`] on boot.
@@ -157,6 +161,199 @@ impl FsBackend for VfsBackend {
         let vfs = vfs_mutex.lock();
         vfs.mkdir(path).map_err(vfs_err_to_fs_err)
     }
+}
+
+// ============================================================================
+// Ext4 disk mounting
+// ============================================================================
+
+/// Owned adapter that implements `claudio_ext4::BlockDevice` over a boxed
+/// VFS `BlockDevice`, with a partition byte offset.
+///
+/// `claudio_vfs::adapters::VfsToExt4BlockDevice` exists but borrows the
+/// underlying device with a lifetime — Ext4Fs<D> needs `D: 'static`, so we
+/// can't use it for a long-lived mount. This owned version takes the
+/// boxed device and lives for the program lifetime.
+struct OwnedExt4BlockDevice {
+    device: Box<dyn BlockDevice + Send + Sync>,
+    partition_offset: u64,
+}
+
+impl claudio_ext4::BlockDevice for OwnedExt4BlockDevice {
+    fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), claudio_ext4::Ext4Error> {
+        self.device
+            .read_bytes(self.partition_offset + offset, buf)
+            .map(|_| ())
+            .map_err(|_| claudio_ext4::Ext4Error::IoError)
+    }
+
+    fn write_bytes(&self, offset: u64, buf: &[u8]) -> Result<(), claudio_ext4::Ext4Error> {
+        self.device
+            .write_bytes(self.partition_offset + offset, buf)
+            .map(|_| ())
+            .map_err(|_| claudio_ext4::Ext4Error::IoError)
+    }
+}
+
+/// Walk the disk registry, parse GPT on each disk, and mount the first
+/// Linux-filesystem partition on each disk as an ext4 filesystem at
+/// `/disk<n>p<m>`. Must be called AFTER `crate::disks::init()`.
+///
+/// Returns the number of partitions successfully mounted.
+pub fn mount_disks() -> usize {
+    let disk_count = crate::disks::len();
+    log::info!("[storage] mount_disks: scanning {} disk(s)", disk_count);
+
+    // Snapshot disk metadata (label + sector size) up front so we don't hold
+    // the disks lock while parsing GPT / opening filesystems.
+    let snapshots: Vec<(usize, String, u32)> = crate::disks::with_disks(|disks| {
+        disks
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, e.label.clone(), e.sector_size))
+            .collect()
+    });
+
+    let mut mounted = 0usize;
+    for (idx, label, sector_size) in snapshots {
+        // Get a fresh block device adapter for GPT parsing.
+        let bd = match crate::disks::as_block_device(idx) {
+            Some(bd) => bd,
+            None => continue,
+        };
+
+        let partitions = match parse_gpt(&*bd) {
+            Ok(parts) => parts,
+            Err(e) => {
+                log::warn!(
+                    "[storage] disk {} ({}): parse_gpt failed: {:?}",
+                    idx, label, e,
+                );
+                continue;
+            }
+        };
+
+        if partitions.is_empty() {
+            log::info!("[storage] disk {} ({}): no GPT partitions", idx, label);
+            continue;
+        }
+
+        log::info!(
+            "[storage] disk {} ({}): {} partition(s) found",
+            idx, label, partitions.len(),
+        );
+
+        for part in &partitions {
+            if part.type_id != GPT_GUID_LINUX_FS {
+                log::debug!(
+                    "[storage]   p{}: non-Linux-FS partition, skipping",
+                    part.index,
+                );
+                continue;
+            }
+
+            // ── Mount safety allowlist ────────────────────────────────────
+            //
+            // CRITICAL: ClaudioOS is not a production-ready OS. When it boots
+            // on real hardware, `crate::disks::init` enumerates EVERY attached
+            // mass-storage controller (AHCI/NVMe/USB). Without this filter,
+            // `mount_disks` would happily mount any ext4 partition it finds
+            // — including the host OS's root filesystem, a dual-boot Linux
+            // install, a neighbour's data disk, etc. That's a footgun the
+            // size of a filesystem.
+            //
+            // Policy: only auto-mount partitions whose GPT partition label
+            // contains the substring "claudio" (case-insensitive). To prepare
+            // a disk for use with ClaudioOS, label its data partition with
+            // something like:
+            //     sgdisk -c <N>:'claudio-data' /dev/sdX
+            // or the parted equivalent. Any disk without such a label is
+            // enumerated (visible via `df`, `lsblk`, etc.) but NOT mounted,
+            // so writes through the VFS cannot reach it.
+            //
+            // This is deliberately coarse and conservative. Override options:
+            //   - set a compile-time env `CLAUDIO_MOUNT_ANY=1` (not yet
+            //     implemented, add when genuinely needed)
+            //   - add a runtime shell command `mount <device> <mount_point>`
+            //     that bypasses the allowlist (not yet implemented)
+            //
+            // Until those exist, the ONLY way to get a partition mounted is
+            // to label it with "claudio" in its name.
+            let label_lower = part.name.to_lowercase();
+            if !label_lower.contains("claudio") {
+                log::info!(
+                    "[storage]   p{}: skipping — GPT label '{}' is not in the \
+                     mount allowlist (must contain 'claudio')",
+                    part.index, part.name,
+                );
+                continue;
+            }
+            log::info!(
+                "[storage]   p{}: label '{}' matches allowlist — attempting ext4 mount",
+                part.index, part.name,
+            );
+
+            // Get an owned block device adapter for this partition — each
+            // ext4 mount consumes its own D, so we can't share with parse_gpt.
+            let part_bd = match crate::disks::as_block_device(idx) {
+                Some(bd) => bd,
+                None => continue,
+            };
+
+            let partition_offset = part.start_offset(sector_size);
+            let ext4_device = OwnedExt4BlockDevice {
+                device: part_bd,
+                partition_offset,
+            };
+
+            match claudio_ext4::Ext4Fs::mount(ext4_device) {
+                Ok(fs) => {
+                    let mount_point = format!("/disk{}p{}", idx, part.index);
+                    // Box-leak the adapter to get a 'static reference (Vfs::mount
+                    // requires `&'static dyn Filesystem`). We never unmount
+                    // these in the current kernel, so the leak is acceptable.
+                    let adapter: &'static dyn Filesystem = Box::leak(Box::new(
+                        Ext4FilesystemAdapter::new(fs),
+                    ));
+
+                    let result = with_vfs(|vfs| {
+                        let _ = vfs.mkdir(&mount_point);
+                        vfs.mount(&mount_point, adapter, MountOptions::default())
+                            .map_err(|e| format!("{}", e))?;
+                        Ok(())
+                    });
+
+                    match result {
+                        Ok(()) => {
+                            log::info!(
+                                "[storage]   p{}: mounted ext4 at {}",
+                                part.index, mount_point,
+                            );
+                            mounted += 1;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[storage]   p{}: ext4 mount into VFS failed: {}",
+                                part.index, e,
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[storage]   p{}: ext4 Ext4Fs::mount failed: {:?}",
+                        part.index, e,
+                    );
+                }
+            }
+        }
+    }
+
+    log::info!(
+        "[storage] mount_disks: {} ext4 partition(s) mounted",
+        mounted,
+    );
+    mounted
 }
 
 /// Map a `VfsError` into the `claudio-fs` `FsError` space.

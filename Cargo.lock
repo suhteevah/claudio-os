@@ -223,6 +223,7 @@ name = "claudio-ahci"
 version = "0.1.0"
 dependencies = [
  "log",
+ "x86_64",
 ]
 
 [[package]]
@@ -429,6 +430,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "spin",
+ "x86_64",
 ]
 
 [[package]]

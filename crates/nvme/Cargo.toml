@@ -9,3 +9,4 @@ description = "Bare-metal NVMe driver for ClaudioOS — no_std, volatile MMIO, s
 [dependencies]
 log = { workspace = true }
 spin = { workspace = true }
+x86_64 = { workspace = true }

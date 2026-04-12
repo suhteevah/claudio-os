@@ -66,7 +66,6 @@ fn main() {
     // BIOS image disabled — bootloader's BIOS stages don't build on the
     // Windows host (build.rs panics in the cargo-install bootstrap of
     // bootloader-x86_64-bios-*). The kernel only ships UEFI per CLAUDE.md.
-    println!("[image] BIOS image: {:?} ({} bytes)", bios_path, std::fs::metadata(&bios_path).map(|m| m.len()).unwrap_or(0));
 
     println!();
     println!("[image] done! To boot in QEMU:");

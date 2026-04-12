@@ -8,3 +8,4 @@ description = "no_std AHCI (SATA) driver for ClaudioOS bare-metal OS"
 
 [dependencies]
 log = { workspace = true }
+x86_64 = { workspace = true }

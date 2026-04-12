@@ -212,16 +212,48 @@ pub fn init() {
                     );
                     continue;
                 }
-                log::info!(
-                    "[disks] initializing AHCI controller {:02x}:{:02x}.{} ABAR={:#x}",
+                // TODO: AHCI init is currently disabled. The crate at
+                // `crates/ahci/` was written assuming identity-mapped MMIO
+                // AND identity-mapped DMA buffers, but ClaudioOS uses a
+                // dynamic bootloader mapping (virtual = physical + offset)
+                // and a separate heap region. MMIO access was fixed above
+                // (pass virtual address), but the crate also writes
+                // virtual heap pointers (command list, FIS, PRDT) into
+                // hardware DMA registers, which the hardware cannot
+                // translate — DMA commands hang forever waiting for
+                // completion.
+                //
+                // To re-enable: teach the AHCI crate to translate virtual
+                // heap addresses to physical (see `claudio-net`'s
+                // `virt_to_phys` in `crates/net/src/nic.rs` for the
+                // pattern), or give AHCI its own identity-mapped DMA pool.
+                // The disk registry, mount_disks path, and downstream
+                // consumers (dashboard disk_usage, swap scanner) are all
+                // ready and will Just Work once AHCI init returns real
+                // disks.
+                log::warn!(
+                    "[disks] skipping AHCI {:02x}:{:02x}.{} ABAR={:#x} — \
+                     AHCI crate needs virt→phys DMA translation (TODO)",
                     hit.bus, hit.device, hit.function, abar_phys,
                 );
-                // SAFETY: `abar_phys` is the BAR5 of a PCI device whose class
-                // code is 0x01 / subclass 0x06 (Mass Storage / AHCI). ClaudioOS
-                // identity-maps all physical memory (Phase 2 memory init), so
-                // this address is a valid, identity-mapped MMIO region. No
-                // other code in the kernel touches this ABAR before us.
-                let ctrl_result = unsafe { AhciController::init(abar_phys) };
+                continue;
+                // Unreachable until the TODO above is resolved. Kept as
+                // documentation of the intended init path.
+                #[allow(unreachable_code)]
+                let phys_offset = crate::phys_mem_offset();
+                #[allow(unreachable_code)]
+                let abar_virt = abar_phys + phys_offset;
+                #[allow(unreachable_code)]
+                log::info!(
+                    "[disks] initializing AHCI controller {:02x}:{:02x}.{} ABAR phys={:#x} virt={:#x}",
+                    hit.bus, hit.device, hit.function, abar_phys, abar_virt,
+                );
+                // SAFETY: `abar_virt` = BAR5 physical + PHYS_MEM_OFFSET, and
+                // the bootloader has mapped all physical memory into that
+                // window, so dereferencing this address is sound. No other
+                // code in the kernel touches this ABAR before us.
+                #[allow(unreachable_code)]
+                let ctrl_result = unsafe { AhciController::init(abar_virt) };
                 let ctrl = match ctrl_result {
                     Ok(c) => c,
                     Err(e) => {
@@ -240,10 +272,9 @@ pub fn init() {
                 // that one, but both handles point at the same MMIO base
                 // and MMIO access is inherently safe at the hardware level.
                 //
-                // SAFETY: same ABAR physical address, same identity-mapping
-                // invariants as above.
+                // SAFETY: same virtual ABAR and mapping invariants as above.
                 let hba_box: Box<HbaRegs> =
-                    Box::new(unsafe { HbaRegs::from_base_addr(abar_phys) });
+                    Box::new(unsafe { HbaRegs::from_base_addr(abar_virt) });
 
                 let ctrl_idx = reg.ahci_controllers.len();
                 let hba_idx = reg.ahci_hbas.len();
@@ -312,15 +343,29 @@ pub fn init() {
                     );
                     continue;
                 }
-                log::info!(
-                    "[disks] initializing NVMe controller {:02x}:{:02x}.{} BAR0={:#x}",
+                // TODO: Same issue as AHCI — NVMe is untested end-to-end
+                // and almost certainly has the same virt→phys DMA
+                // translation gap. See AHCI TODO above.
+                log::warn!(
+                    "[disks] skipping NVMe {:02x}:{:02x}.{} BAR0={:#x} — \
+                     NVMe crate needs virt→phys DMA translation (TODO)",
                     hit.bus, hit.device, hit.function, bar0_phys,
                 );
-                // SAFETY: `bar0_phys` is the BAR0 of a PCI device whose class
-                // code is 0x01 / subclass 0x08 (Mass Storage / NVMe). ClaudioOS
-                // identity-maps all physical memory, so this address is a
-                // valid, identity-mapped MMIO region.
-                let ctrl_result = unsafe { NvmeController::init(bar0_phys) };
+                continue;
+                #[allow(unreachable_code)]
+                let phys_offset = crate::phys_mem_offset() as usize;
+                #[allow(unreachable_code)]
+                let bar0_virt = bar0_phys + phys_offset;
+                #[allow(unreachable_code)]
+                log::info!(
+                    "[disks] initializing NVMe controller {:02x}:{:02x}.{} BAR0 phys={:#x} virt={:#x}",
+                    hit.bus, hit.device, hit.function, bar0_phys, bar0_virt,
+                );
+                // SAFETY: `bar0_virt` = BAR0 physical + PHYS_MEM_OFFSET,
+                // which the bootloader maps for us. Dereferencing the
+                // resulting address is sound.
+                #[allow(unreachable_code)]
+                let ctrl_result = unsafe { NvmeController::init(bar0_virt) };
                 let mut ctrl = match ctrl_result {
                     Ok(c) => c,
                     Err(e @ NvmeError::NvmCssNotSupported) => {
