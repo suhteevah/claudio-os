@@ -1,6 +1,10 @@
 [build]
 target = "x86_64-claudio.json"
 
+[env]
+# VS 2022 Community only has onecore libs — point lld-link at them for build scripts
+LIB = "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.43.34808/lib/onecore/x64;C:/Program Files (x86)/Windows Kits/10/Lib/10.0.22621.0/ucrt/x64;C:/Program Files (x86)/Windows Kits/10/Lib/10.0.22621.0/um/x64"
+
 [unstable]
 build-std = ["core", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
