@@ -66,6 +66,7 @@ mod nettools;
 mod power;
 mod touchpad;
 mod usb;
+mod usb_storage;
 mod users;
 mod vconsole;
 mod clipboard;
@@ -146,6 +147,53 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 /// - A memory map from UEFI
 /// - Interrupts disabled
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    // ── Phase -2: Visual proof-of-life on framebuffer ──────────────────
+    // Write colored pixels directly to the bootloader's framebuffer mapping
+    // BEFORE any other init. This is the only way to get visible output on
+    // real hardware (no serial port). If you see colored bars, kernel_main
+    // was reached. If screen stays black, the bootloader didn't jump here.
+    if let Some(fb) = boot_info.framebuffer.as_mut() {
+        let info = fb.info();
+        let buf = fb.buffer_mut();
+        let bpp = info.bytes_per_pixel;
+        let stride = info.stride * bpp;
+        // Draw 3 colored bars at the top: red, green, blue (10 pixels tall each)
+        for y in 0..10 {
+            for x in 0..info.width.min(400) {
+                let offset = y * stride + x * bpp;
+                if offset + 3 <= buf.len() {
+                    // BGR format (UEFI GOP default)
+                    buf[offset] = 0;        // B
+                    buf[offset + 1] = 0;    // G
+                    buf[offset + 2] = 255;  // R
+                    if bpp > 3 { buf[offset + 3] = 0; }
+                }
+            }
+        }
+        for y in 10..20 {
+            for x in 0..info.width.min(400) {
+                let offset = y * stride + x * bpp;
+                if offset + 3 <= buf.len() {
+                    buf[offset] = 0;
+                    buf[offset + 1] = 255;  // G
+                    buf[offset + 2] = 0;
+                    if bpp > 3 { buf[offset + 3] = 0; }
+                }
+            }
+        }
+        for y in 20..30 {
+            for x in 0..info.width.min(400) {
+                let offset = y * stride + x * bpp;
+                if offset + 3 <= buf.len() {
+                    buf[offset] = 255;      // B
+                    buf[offset + 1] = 0;
+                    buf[offset + 2] = 0;
+                    if bpp > 3 { buf[offset + 3] = 0; }
+                }
+            }
+        }
+    }
+
     // ── Phase -1: Bare minimum proof-of-life (VGA text mode + raw serial) ──
     // Write directly to serial port 0x3F8 WITHOUT full UART init to prove
     // we actually reached kernel_main. VGA text buffer at 0xB8000 too.
