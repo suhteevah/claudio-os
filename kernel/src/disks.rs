@@ -49,7 +49,10 @@ use claudio_ahci::hba::HbaRegs;
 use claudio_ahci::{AhciController, AhciError};
 use claudio_nvme::{NvmeController, NvmeError};
 use claudio_vfs::adapters::{AhciBlockDeviceAdapter, NvmeBlockDeviceAdapter};
+use claudio_usb_storage::UsbStorageDevice;
 use claudio_vfs::BlockDevice;
+
+use crate::usb_storage::XhciBulkTransport;
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -73,6 +76,10 @@ enum DiskBackendRef {
         ctrl_idx: usize,
         /// Namespace ID (1-based).
         nsid: u32,
+    },
+    Usb {
+        /// Index into `Registry::usb_devices`.
+        dev_idx: usize,
     },
 }
 
@@ -109,6 +116,10 @@ struct Registry {
     ahci_hbas: Vec<Box<HbaRegs>>,
     /// Owned NVMe controllers.
     nvme_controllers: Vec<Box<NvmeController>>,
+    /// Owned USB mass storage devices. Each `Box` gives a stable heap
+    /// address for the `BlockDevice` trait object returned by
+    /// `as_block_device`. Only pushed during `init`, never modified after.
+    usb_devices: Vec<Box<UsbStorageDevice<XhciBulkTransport>>>,
     /// All disks discovered across all controllers.
     disks: Vec<DiskEntry>,
 }
@@ -119,6 +130,7 @@ impl Registry {
             ahci_controllers: Vec::new(),
             ahci_hbas: Vec::new(),
             nvme_controllers: Vec::new(),
+            usb_devices: Vec::new(),
             disks: Vec::new(),
         }
     }
@@ -423,10 +435,80 @@ pub fn init() {
         }
     }
 
+    // ── USB Mass Storage ─────────────────────────────────────────────
+    //
+    // After xHCI enumeration (usb::init), MASS_STORAGE_DEVICES holds
+    // (slot_id, MassStorageInfo) tuples for every BOT device found on
+    // the bus. We create a XhciBulkTransport adapter for each, feed it
+    // into UsbStorageDevice::init (INQUIRY + TEST UNIT READY + READ
+    // CAPACITY + MODE SENSE), and register the resulting block device.
+    let usb_ms = crate::usb::MASS_STORAGE_DEVICES.lock().clone();
+    let mut usb_count = 0usize;
+    for (slot_id, info) in usb_ms {
+        log::info!(
+            "[disks] initializing USB mass storage: slot={} if={} bulk_in_dci={} bulk_out_dci={}",
+            slot_id, info.interface_num, info.bulk_in_dci, info.bulk_out_dci,
+        );
+
+        let transport = XhciBulkTransport::new(slot_id, info);
+        let mut device = UsbStorageDevice::new(transport, 0);
+
+        match device.init() {
+            Ok(()) => {
+                let sector_size = device.sector_size();
+                let total_size = device.total_size();
+                let sector_count = if sector_size > 0 {
+                    total_size / sector_size as u64
+                } else {
+                    0
+                };
+                let model = device
+                    .inquiry()
+                    .map(|inq| {
+                        alloc::format!("{} {}", inq.vendor, inq.product)
+                    })
+                    .unwrap_or_else(|| alloc::format!("USB slot {}", slot_id));
+
+                let dev_idx = reg.usb_devices.len();
+                let label = alloc::format!("usb{}", dev_idx);
+                let total_bytes = total_size;
+
+                log::info!(
+                    "[disks]   -> {}: {} ({} sectors x {} B = {} MiB)",
+                    label, model, sector_count, sector_size,
+                    total_bytes / (1024 * 1024),
+                );
+
+                reg.usb_devices.push(Box::new(device));
+                usb_count += 1;
+
+                reg.disks.push(DiskEntry {
+                    label,
+                    bus: 0,
+                    device: slot_id,
+                    function: 0,
+                    vendor_id: 0,
+                    device_id: 0,
+                    sector_size,
+                    sector_count,
+                    total_bytes,
+                    model,
+                    backend: DiskBackendRef::Usb { dev_idx },
+                });
+            }
+            Err(e) => {
+                log::error!(
+                    "[disks] USB mass storage init failed for slot {}: {:?}",
+                    slot_id, e,
+                );
+            }
+        }
+    }
+
     let total_disks = reg.disks.len();
     log::info!(
-        "[boot] disks: initialized {} controller(s) ({} AHCI + {} NVMe), {} disk(s) total",
-        ahci_count + nvme_count, ahci_count, nvme_count, total_disks,
+        "[boot] disks: initialized {} controller(s) ({} AHCI + {} NVMe + {} USB), {} disk(s) total",
+        ahci_count + nvme_count + usb_count, ahci_count, nvme_count, usb_count, total_disks,
     );
 
     // Suppress unused-variable warnings if the AHCI error type grows new
@@ -523,5 +605,66 @@ pub fn as_block_device(index: usize) -> Option<Box<dyn BlockDevice + Send + Sync
             };
             Some(Box::new(adapter))
         }
+        DiskBackendRef::Usb { dev_idx } => {
+            let usb_box = reg.usb_devices.get(dev_idx)?;
+            // UsbStorageDevice<XhciBulkTransport> already implements
+            // BlockDevice + Send + Sync. We create a thin wrapper that
+            // holds a raw pointer to the heap-boxed device (stable for
+            // program lifetime, same invariant as AHCI/NVMe above).
+            let dev_ptr: *const UsbStorageDevice<XhciBulkTransport> =
+                &**usb_box as *const UsbStorageDevice<XhciBulkTransport>;
+            // SAFETY: `dev_ptr` points at the heap-`Box`ed
+            // UsbStorageDevice owned by REGISTRY. The registry is a
+            // `Once` singleton that outlives all callers. The
+            // `usb_devices` vec is never mutated after `init`.
+            let adapter = UsbBlockDeviceAdapter { ptr: dev_ptr };
+            Some(Box::new(adapter))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// USB block device adapter
+// ---------------------------------------------------------------------------
+
+/// Thin adapter that delegates `BlockDevice` calls to an owned
+/// `UsbStorageDevice<XhciBulkTransport>` via a raw pointer into the
+/// registry. Follows the same stable-address pattern as AHCI/NVMe adapters.
+struct UsbBlockDeviceAdapter {
+    ptr: *const UsbStorageDevice<XhciBulkTransport>,
+}
+
+// SAFETY: The pointee lives in a heap `Box` inside the global `REGISTRY`
+// singleton. The registry is never deallocated and `usb_devices` is never
+// mutated after `init`. `UsbStorageDevice` serialises transport access
+// through its internal `Mutex<XhciBulkTransport>`.
+unsafe impl Send for UsbBlockDeviceAdapter {}
+unsafe impl Sync for UsbBlockDeviceAdapter {}
+
+impl BlockDevice for UsbBlockDeviceAdapter {
+    fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<usize, claudio_vfs::device::DeviceError> {
+        // SAFETY: pointer validity guaranteed by registry lifetime invariant.
+        let dev = unsafe { &*self.ptr };
+        dev.read_bytes(offset, buf)
+    }
+
+    fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<usize, claudio_vfs::device::DeviceError> {
+        let dev = unsafe { &*self.ptr };
+        dev.write_bytes(offset, data)
+    }
+
+    fn flush(&self) -> Result<(), claudio_vfs::device::DeviceError> {
+        let dev = unsafe { &*self.ptr };
+        dev.flush()
+    }
+
+    fn sector_size(&self) -> u32 {
+        let dev = unsafe { &*self.ptr };
+        dev.sector_size()
+    }
+
+    fn total_size(&self) -> u64 {
+        let dev = unsafe { &*self.ptr };
+        dev.total_size()
     }
 }
