@@ -1,11 +1,6 @@
-# Override parent workspace config — this tool runs on the HOST, not bare-metal
+# Override parent workspace config — this tool runs on the HOST, not bare-metal.
 [build]
 target = "x86_64-pc-windows-msvc"
 
-# Disable the workspace's build-std setting. The parent .cargo/config.toml
-# enables build-std=["core","alloc"] for the no_std kernel target, which
-# leaks into this host build and double-defines lang items in `core`.
-# Empty array opts out for this directory.
-[unstable]
-build-std = []
-build-std-features = []
+[env]
+LIB = "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.43.34808/lib/onecore/x64;C:/Program Files (x86)/Windows Kits/10/Lib/10.0.22621.0/ucrt/x64;C:/Program Files (x86)/Windows Kits/10/Lib/10.0.22621.0/um/x64"

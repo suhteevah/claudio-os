@@ -40,10 +40,11 @@ use crate::context::{
 };
 use crate::device::{
     alloc_dma_buffer, read_dma_buffer, DeviceDescriptor, EndpointDescriptor,
-    ParsedConfiguration, UsbDevice, UsbSpeed,
+    MassStorageInfo, ParsedConfiguration, UsbDevice, UsbSpeed,
     USB_DESC_CONFIGURATION, USB_DESC_DEVICE,
-    USB_DIR_IN, USB_DIR_OUT, USB_RECIP_DEVICE, USB_RECIP_INTERFACE,
-    USB_REQ_GET_DESCRIPTOR, USB_REQ_SET_CONFIGURATION,
+    USB_DIR_IN, USB_DIR_OUT, USB_RECIP_DEVICE, USB_RECIP_ENDPOINT,
+    USB_RECIP_INTERFACE,
+    USB_REQ_CLEAR_FEATURE, USB_REQ_GET_DESCRIPTOR, USB_REQ_SET_CONFIGURATION,
     USB_TYPE_CLASS, USB_TYPE_STANDARD,
 };
 use crate::hid::{
@@ -1106,6 +1107,198 @@ impl XhciController {
 
         log::warn!("xhci: transfer event timeout");
         None
+    }
+
+    // -----------------------------------------------------------------------
+    // Bulk transfer API (for mass storage, etc.)
+    // -----------------------------------------------------------------------
+
+    /// Perform a bulk OUT transfer (host to device).
+    ///
+    /// Enqueues a Normal TRB on the transfer ring for the given slot/DCI,
+    /// rings the doorbell, and waits for the transfer completion event.
+    /// Returns the number of bytes actually transferred.
+    pub fn bulk_out(&mut self, slot_id: u8, dci: u8, data: &[u8]) -> Result<usize, XhciError> {
+        log::trace!("xhci: bulk_out slot={} dci={} len={}", slot_id, dci, data.len());
+
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        // Allocate a DMA buffer and copy data into it
+        let (buf_va, buf_phys) = unsafe { alloc_dma_buffer(data.len(), self.virt_to_phys) }
+            .ok_or(XhciError::AllocFailed("bulk_out DMA buffer"))?;
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), buf_va, data.len());
+        }
+
+        let ring = self.transfer_rings
+            .get_mut(slot_id as usize)
+            .and_then(|rings| rings.get_mut(dci as usize))
+            .and_then(|r| r.as_mut())
+            .ok_or(XhciError::ControllerError("no transfer ring for bulk_out endpoint"))?;
+
+        let trb = Trb::normal(buf_phys, data.len() as u32, true, false);
+        ring.enqueue(trb);
+        self.db.ring_endpoint(slot_id, dci);
+
+        let evt = self.wait_transfer_event(slot_id)
+            .ok_or(XhciError::Timeout("bulk_out transfer event"))?;
+
+        let code = evt.completion_code();
+        if code != TRB_COMPLETION_SUCCESS && code != TRB_COMPLETION_SHORT_PACKET {
+            log::warn!("xhci: bulk_out failed: completion code={}", code);
+            return Err(XhciError::ControllerError("bulk_out transfer failed"));
+        }
+
+        let residual = evt.transfer_length() as usize;
+        let transferred = data.len().saturating_sub(residual);
+        log::trace!("xhci: bulk_out complete: {} bytes transferred", transferred);
+        Ok(transferred)
+    }
+
+    /// Perform a bulk IN transfer (device to host).
+    ///
+    /// Enqueues a Normal TRB on the transfer ring for the given slot/DCI,
+    /// rings the doorbell, and waits for the transfer completion event.
+    /// Returns the number of bytes actually received.
+    pub fn bulk_in(&mut self, slot_id: u8, dci: u8, buf: &mut [u8]) -> Result<usize, XhciError> {
+        log::trace!("xhci: bulk_in slot={} dci={} len={}", slot_id, dci, buf.len());
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let (dma_va, dma_phys) = unsafe { alloc_dma_buffer(buf.len(), self.virt_to_phys) }
+            .ok_or(XhciError::AllocFailed("bulk_in DMA buffer"))?;
+
+        let ring = self.transfer_rings
+            .get_mut(slot_id as usize)
+            .and_then(|rings| rings.get_mut(dci as usize))
+            .and_then(|r| r.as_mut())
+            .ok_or(XhciError::ControllerError("no transfer ring for bulk_in endpoint"))?;
+
+        let trb = Trb::normal(dma_phys, buf.len() as u32, true, false);
+        ring.enqueue(trb);
+        self.db.ring_endpoint(slot_id, dci);
+
+        let evt = self.wait_transfer_event(slot_id)
+            .ok_or(XhciError::Timeout("bulk_in transfer event"))?;
+
+        let code = evt.completion_code();
+        if code != TRB_COMPLETION_SUCCESS && code != TRB_COMPLETION_SHORT_PACKET {
+            log::warn!("xhci: bulk_in failed: completion code={}", code);
+            return Err(XhciError::ControllerError("bulk_in transfer failed"));
+        }
+
+        let residual = evt.transfer_length() as usize;
+        let transferred = buf.len().saturating_sub(residual);
+
+        // Copy received data from DMA buffer
+        let dma_data = unsafe { read_dma_buffer(dma_va, transferred) };
+        buf[..transferred].copy_from_slice(&dma_data);
+
+        log::trace!("xhci: bulk_in complete: {} bytes received", transferred);
+        Ok(transferred)
+    }
+
+    /// Send a class-specific or standard control request on EP0.
+    ///
+    /// Used for BOT Mass Storage Reset (class request 0xFF to interface)
+    /// and Clear Feature HALT (standard request to endpoint).
+    pub fn class_control_request(
+        &mut self,
+        slot_id: u8,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+    ) -> Result<(), XhciError> {
+        log::debug!(
+            "xhci: control request slot={} reqtype={:#x} req={:#x} val={:#x} idx={:#x}",
+            slot_id, request_type, request, value, index
+        );
+
+        let ring = self.transfer_rings
+            .get_mut(slot_id as usize)
+            .and_then(|rings| rings.get_mut(1)) // DCI 1 = EP0
+            .and_then(|r| r.as_mut())
+            .ok_or(XhciError::ControllerError("no EP0 transfer ring for control request"))?;
+
+        ring.enqueue_control_transfer(request_type, request, value, index, 0, 0);
+        self.db.ring_endpoint(slot_id, 1);
+
+        let evt = self.wait_transfer_event(slot_id)
+            .ok_or(XhciError::Timeout("control request transfer event"))?;
+
+        let code = evt.completion_code();
+        if code != TRB_COMPLETION_SUCCESS {
+            log::warn!("xhci: control request failed: completion code={}", code);
+            return Err(XhciError::ControllerError("control request failed"));
+        }
+
+        Ok(())
+    }
+
+    /// Issue a Bulk-Only Mass Storage Reset on a device's interface.
+    ///
+    /// bmRequestType = 0x21 (class, interface, host-to-device), bRequest = 0xFF.
+    pub fn mass_storage_reset(&mut self, slot_id: u8, interface: u8) -> Result<(), XhciError> {
+        log::debug!("xhci: BOT mass storage reset slot={} iface={}", slot_id, interface);
+        self.class_control_request(
+            slot_id,
+            USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+            0xFF,
+            0,
+            interface as u16,
+        )
+    }
+
+    /// Issue a Clear Feature HALT on a specific endpoint.
+    ///
+    /// bmRequestType = 0x02 (standard, endpoint, host-to-device),
+    /// bRequest = CLEAR_FEATURE, wValue = 0 (ENDPOINT_HALT), wIndex = endpoint address.
+    pub fn clear_endpoint_halt(&mut self, slot_id: u8, endpoint_addr: u8) -> Result<(), XhciError> {
+        log::debug!("xhci: clear HALT slot={} endpoint={:#x}", slot_id, endpoint_addr);
+        self.class_control_request(
+            slot_id,
+            USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_ENDPOINT,
+            USB_REQ_CLEAR_FEATURE,
+            0, // ENDPOINT_HALT feature selector = 0
+            endpoint_addr as u16,
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Mass storage device enumeration
+    // -----------------------------------------------------------------------
+
+    /// Return all enumerated devices that have a Mass Storage BOT interface.
+    ///
+    /// Each entry is `(slot_id, MassStorageInfo)`.
+    pub fn mass_storage_devices(&self) -> Vec<(u8, MassStorageInfo)> {
+        let mut result = Vec::new();
+
+        for (slot_id, dev_opt) in self.devices.iter().enumerate() {
+            if let Some(dev) = dev_opt {
+                if !dev.configured {
+                    continue;
+                }
+                if let Some(ref config) = dev.config {
+                    if let Some(info) = config.find_mass_storage() {
+                        log::info!(
+                            "xhci: mass storage device: slot={} iface={} bulk_in_dci={} bulk_out_dci={}",
+                            slot_id, info.interface_num, info.bulk_in_dci, info.bulk_out_dci,
+                        );
+                        result.push((slot_id as u8, info));
+                    }
+                }
+            }
+        }
+
+        log::info!("xhci: found {} mass storage device(s)", result.len());
+        result
     }
 
     // -----------------------------------------------------------------------

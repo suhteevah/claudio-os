@@ -20,7 +20,7 @@ use spin::Mutex;
 /// deallocation). We only access the controller through a `Mutex`, so
 /// there is no concurrent access. This is safe in our single-address-space,
 /// cooperative-multitasking kernel.
-struct SendableXhci(claudio_xhci::XhciController);
+pub(crate) struct SendableXhci(pub(crate) claudio_xhci::XhciController);
 
 // SAFETY: XhciController contains raw pointers to MMIO registers and DMA
 // buffers that are permanently mapped and never freed. Access is serialised
@@ -29,7 +29,12 @@ struct SendableXhci(claudio_xhci::XhciController);
 unsafe impl Send for SendableXhci {}
 
 /// Global xHCI controller instance, initialised by `init()`.
-static XHCI: Mutex<Option<SendableXhci>> = Mutex::new(None);
+pub(crate) static XHCI: Mutex<Option<SendableXhci>> = Mutex::new(None);
+
+/// Discovered USB mass storage devices, populated during `init()`.
+/// Each entry is `(slot_id, MassStorageInfo)`.
+pub(crate) static MASS_STORAGE_DEVICES: Mutex<alloc::vec::Vec<(u8, claudio_xhci::MassStorageInfo)>> =
+    Mutex::new(alloc::vec::Vec::new());
 
 /// Whether a USB keyboard was detected during enumeration.
 static USB_KEYBOARD_PRESENT: AtomicBool = AtomicBool::new(false);
@@ -119,6 +124,19 @@ pub fn init() {
     } else {
         log::info!("[usb] no USB keyboard found on any port");
     }
+
+    // Check for USB mass storage devices
+    let mass_storage = controller.mass_storage_devices();
+    for (slot_id, info) in &mass_storage {
+        log::info!(
+            "[usb] mass storage device found: slot={} iface={} bulk_in_dci={} bulk_out_dci={}",
+            slot_id, info.interface_num, info.bulk_in_dci, info.bulk_out_dci,
+        );
+    }
+    if mass_storage.is_empty() {
+        log::info!("[usb] no USB mass storage devices found");
+    }
+    *MASS_STORAGE_DEVICES.lock() = mass_storage;
 
     *XHCI.lock() = Some(SendableXhci(controller));
     log::info!("[usb] xHCI initialisation complete");

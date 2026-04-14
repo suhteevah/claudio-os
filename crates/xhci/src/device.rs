@@ -66,6 +66,9 @@ pub const USB_RECIP_ENDPOINT: u8 = 0x02;
 // ---------------------------------------------------------------------------
 
 pub const USB_CLASS_HID: u8 = 0x03;
+pub const USB_CLASS_MASS_STORAGE: u8 = 0x08;
+pub const USB_SUBCLASS_SCSI: u8 = 0x06;
+pub const USB_PROTOCOL_BOT: u8 = 0x50;
 
 // ---------------------------------------------------------------------------
 // USB Device Descriptor (18 bytes)
@@ -252,6 +255,14 @@ impl InterfaceDescriptor {
     /// Is this a HID interface?
     pub fn is_hid(&self) -> bool {
         self.b_interface_class == USB_CLASS_HID
+    }
+
+    /// Is this a Mass Storage Bulk-Only Transport interface?
+    /// (class=0x08, subclass=0x06 SCSI, protocol=0x50 BOT)
+    pub fn is_mass_storage_bot(&self) -> bool {
+        self.b_interface_class == USB_CLASS_MASS_STORAGE
+            && self.b_interface_sub_class == USB_SUBCLASS_SCSI
+            && self.b_interface_protocol == USB_PROTOCOL_BOT
     }
 }
 
@@ -490,6 +501,56 @@ impl ParsedConfiguration {
         })
     }
 
+    /// Find the first Mass Storage BOT interface and return its bulk endpoint info.
+    pub fn find_mass_storage(&self) -> Option<MassStorageInfo> {
+        for iface in &self.interfaces {
+            if iface.is_mass_storage_bot() {
+                log::info!(
+                    "xhci: found mass storage BOT on interface {}",
+                    iface.b_interface_number
+                );
+
+                let mut bulk_in: Option<&EndpointDescriptor> = None;
+                let mut bulk_out: Option<&EndpointDescriptor> = None;
+
+                for (iface_num, ep) in &self.endpoints {
+                    if *iface_num == iface.b_interface_number && ep.is_bulk() {
+                        if ep.is_in() {
+                            bulk_in = Some(ep);
+                        } else {
+                            bulk_out = Some(ep);
+                        }
+                    }
+                }
+
+                match (bulk_in, bulk_out) {
+                    (Some(bin), Some(bout)) => {
+                        let info = MassStorageInfo {
+                            interface_num: iface.b_interface_number,
+                            bulk_in_dci: bin.dci(),
+                            bulk_out_dci: bout.dci(),
+                            bulk_in_max_packet: bin.w_max_packet_size,
+                            bulk_out_max_packet: bout.w_max_packet_size,
+                        };
+                        log::info!(
+                            "xhci: mass storage endpoints: bulk_in DCI={} (max_pkt={}), bulk_out DCI={} (max_pkt={})",
+                            info.bulk_in_dci, info.bulk_in_max_packet,
+                            info.bulk_out_dci, info.bulk_out_max_packet,
+                        );
+                        return Some(info);
+                    }
+                    _ => {
+                        log::warn!(
+                            "xhci: mass storage interface {} missing bulk IN or OUT endpoint",
+                            iface.b_interface_number
+                        );
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Find the first HID keyboard interface (class=3, subclass=1, protocol=1).
     /// Returns (interface_number, interrupt IN endpoint).
     pub fn find_hid_keyboard(&self) -> Option<(u8, &EndpointDescriptor)> {
@@ -521,6 +582,21 @@ impl ParsedConfiguration {
         }
         None
     }
+}
+
+/// Information about a USB Mass Storage BOT interface discovered during enumeration.
+#[derive(Debug, Clone)]
+pub struct MassStorageInfo {
+    /// The USB interface number for this mass storage function.
+    pub interface_num: u8,
+    /// Device Context Index for the bulk IN endpoint.
+    pub bulk_in_dci: u8,
+    /// Device Context Index for the bulk OUT endpoint.
+    pub bulk_out_dci: u8,
+    /// Max packet size of the bulk IN endpoint.
+    pub bulk_in_max_packet: u16,
+    /// Max packet size of the bulk OUT endpoint.
+    pub bulk_out_max_packet: u16,
 }
 
 // ---------------------------------------------------------------------------

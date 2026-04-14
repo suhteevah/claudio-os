@@ -32,6 +32,7 @@ pub mod hid;
 pub mod driver;
 
 pub use driver::XhciController;
+pub use device::MassStorageInfo;
 pub use hid::KeyEvent;
 
 /// Callback to translate a virtual address to a physical DMA address.
