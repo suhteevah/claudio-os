@@ -57,3 +57,7 @@ target/credentials.img
 
 # Build artifacts that shouldn't be tracked
 target/
+
+# Session scratch — never commit
+scratch/
+!scratch/README.md
