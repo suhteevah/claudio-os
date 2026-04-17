@@ -679,15 +679,18 @@ async fn main_async() {
     log::info!("[main] ClaudioOS — Boot to Dashboard");
 
     splash::show_splash(splash::BootStage::Network);
+    fb_checkpoint(40, (255, 128, 0)); // orange: main_async / network phase entered
 
     // ── Step 1: Network stack initialization ──────────────────────────
 
     // Detect NIC: try VirtIO-net first (QEMU), then Intel NIC (real hardware).
     let virtio_dev = pci::find_device(0x1AF4, 0x1000);
+    fb_checkpoint(41, (255, 128, 0)); // orange: virtio probe done
 
     // Try Intel NIC if no VirtIO-net found.
     let intel_stack = if virtio_dev.is_none() {
         log::info!("[main] no VirtIO-net found, probing for Intel NIC...");
+        fb_checkpoint(42, (255, 128, 0)); // orange: starting intel_nic::init_intel_network
         match intel_nic::init_intel_network(now) {
             Some(Ok(istack)) => {
                 log::info!("[main] Intel NIC active — DHCP complete");
@@ -714,12 +717,14 @@ async fn main_async() {
     } else {
         None
     };
+    fb_checkpoint(43, (255, 128, 0)); // orange: NIC detection phase done
 
     let nic_dev = virtio_dev;
 
     match nic_dev {
         None if intel_stack.is_none() => {
             log::warn!("[main] no supported NIC found — skipping networking");
+            fb_checkpoint(44, (255, 128, 0)); // orange: no NIC, continuing without net
         }
         None => {
             // Intel NIC path — network is up via IntelNetworkStack.
@@ -1599,15 +1604,18 @@ async fn main_async() {
         }
     }
 
+    fb_checkpoint(45, (255, 128, 0)); // orange: match exited, about to fall back
     // ── Fallback: simple keyboard echo loop (no networking) ──────────
     log::info!("[main] falling back to simple keyboard echo loop");
 
     let fb_w = framebuffer::width();
     let fb_h = framebuffer::height();
     log::info!("[main] setting up terminal layout ({}x{} pixels)", fb_w, fb_h);
+    fb_checkpoint(46, (255, 128, 0)); // orange: got fb size
 
     let mut draw_target = terminal::FramebufferDrawTarget;
     let mut layout = claudio_terminal::Layout::new(fb_w, fb_h);
+    fb_checkpoint(47, (255, 128, 0)); // orange: terminal layout created
 
     {
         let pane = layout.focused_pane_mut();
@@ -1622,6 +1630,8 @@ async fn main_async() {
     }
 
     layout.render_all(&mut draw_target);
+    framebuffer::blit_full(); // flush back buffer to the visible front buffer
+    fb_checkpoint(48, (255, 128, 0)); // orange: terminal rendered — screen should now show prompt
 
     let stream = keyboard::ScancodeStream::new();
     loop {
@@ -1640,6 +1650,7 @@ async fn main_async() {
                     pane.write_str(s);
                 }
                 layout.render_all(&mut draw_target);
+                framebuffer::blit_full();
             }
             pc_keyboard::DecodedKey::RawKey(k) => {
                 log::trace!("[kbd] raw key: {:?}", k);
